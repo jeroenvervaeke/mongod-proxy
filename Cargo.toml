@@ -7,5 +7,8 @@ edition = "2024"
 thiserror = "2.0.12"
 tokio-util = { version = "0.7.14", features = ["codec"] }
 
+[dev-dependencies]
+rstest = "0.25.0"
+
 [workspace]
 members = [".", "logger"]

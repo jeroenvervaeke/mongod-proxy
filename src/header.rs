@@ -1,28 +1,47 @@
+use std::num::NonZeroI32;
+
 use tokio_util::bytes::BytesMut;
 
-#[derive(Debug)]
+use crate::op_code::{OPCode, OPCodeParseError};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MessageHeader {
     pub message_length: i32,
     pub request_id: i32,
-    pub response_to: i32,
-    pub op_code: i32,
+    pub response_to: Option<NonZeroI32>,
+    pub op_code: OPCode,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum MessageHeaderParseError {
+    #[error("size is too short, expected 4 bytes, got {0}")]
+    TooFewBytes(usize),
+    #[error("invalid opcode: {0}")]
+    InvalidOPCode(#[from] OPCodeParseError),
 }
 
 impl MessageHeader {
-    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        (bytes.len() >= 16).then(|| MessageHeader {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, MessageHeaderParseError> {
+        let len = bytes.len();
+        if len < 16 {
+            return Err(MessageHeaderParseError::TooFewBytes(len));
+        }
+
+        Ok(MessageHeader {
             message_length: i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
             request_id: i32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
-            response_to: i32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
-            op_code: i32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]),
+            response_to: NonZeroI32::new(i32::from_le_bytes([
+                bytes[8], bytes[9], bytes[10], bytes[11],
+            ])),
+            op_code: OPCode::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]])?,
         })
     }
 
     pub fn write_bytes(&self, dst: &mut BytesMut) {
         let message_length_bytes = i32::to_le_bytes(self.message_length);
         let request_id_bytes = i32::to_le_bytes(self.request_id);
-        let response_to_bytes = i32::to_le_bytes(self.response_to);
-        let op_code_bytes = i32::to_le_bytes(self.op_code);
+        let response_to_bytes = i32::to_le_bytes(self.response_to.map_or(0, i32::from));
+        let op_code_bytes = self.op_code.to_le_bytes();
 
         dst.extend_from_slice(&message_length_bytes);
         dst.extend_from_slice(&request_id_bytes);
@@ -34,44 +53,68 @@ impl MessageHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::*;
 
-    const MESSAGE_HEADER_1_BYTES: [u8; 16] = [
-        0x73, 0x1, 0x0, 0x0, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0xd4, 0x7, 0x0, 0x0,
-    ];
+    mod op_msg_01 {
+        use super::*;
 
-    #[test]
-    fn decode_message_header_1() {
-        // Decode the message
-        let message_header = MessageHeader::from_bytes(&MESSAGE_HEADER_1_BYTES).unwrap();
+        pub fn header() -> MessageHeader {
+            MessageHeader {
+                message_length: 163,
+                request_id: 25,
+                response_to: None,
+                op_code: OPCode::Msg,
+            }
+        }
 
-        // Check the message header
-        assert_eq!(message_header.message_length, 371);
-        assert_eq!(message_header.request_id, 1);
-        assert_eq!(message_header.response_to, 0);
-        assert_eq!(message_header.op_code, 2004);
+        pub fn bytes() -> &'static [u8] {
+            include_bytes!("./fixtures/headers/OP_MSG_01_request.bin")
+        }
     }
 
-    #[test]
-    fn encode_message_header_1() {
-        // Decode the message
-        let mut dst = BytesMut::new();
-        let message_header = MessageHeader {
-            message_length: 371,
-            request_id: 1,
-            response_to: 0,
-            op_code: 2004,
-        };
-        message_header.write_bytes(&mut dst);
+    mod op_msg_02 {
+        use super::*;
 
-        // Check the message header
-        assert_eq!(dst.as_ref(), MESSAGE_HEADER_1_BYTES);
+        pub fn header() -> MessageHeader {
+            MessageHeader {
+                message_length: 240,
+                request_id: 26,
+                response_to: NonZeroI32::new(25),
+                op_code: OPCode::Compressed,
+            }
+        }
+
+        pub fn bytes() -> &'static [u8] {
+            include_bytes!("./fixtures/headers/OP_MSG_02_response.bin")
+        }
     }
 
-    #[test]
-    fn encode_decode() {
-        let message_header = MessageHeader::from_bytes(&MESSAGE_HEADER_1_BYTES).unwrap();
+    #[rstest]
+    #[case::plain_request_message(op_msg_01::bytes(), Ok(op_msg_01::header()))]
+    #[case::conpressed_response_message(op_msg_02::bytes(), Ok(op_msg_02::header()))]
+    fn decode(
+        #[case] bytes: &[u8],
+        #[case] expected: Result<MessageHeader, MessageHeaderParseError>,
+    ) {
+        assert_eq!(expected, MessageHeader::from_bytes(bytes));
+    }
+
+    #[rstest]
+    #[case::plain_request_message(op_msg_01::header(), op_msg_01::bytes())]
+    #[case::conpressed_response_message(op_msg_02::header(), op_msg_02::bytes())]
+    fn encode(#[case] message: MessageHeader, #[case] expected: &[u8]) {
         let mut dst = BytesMut::new();
-        message_header.write_bytes(&mut dst);
-        assert_eq!(dst.as_ref(), MESSAGE_HEADER_1_BYTES);
+        message.write_bytes(&mut dst);
+        assert_eq!(expected, dst.as_ref());
+    }
+
+    #[rstest]
+    #[case::plain_request_message(op_msg_01::bytes())]
+    #[case::conpressed_response_message(op_msg_02::bytes())]
+    fn encode_decode(#[case] bytes: &[u8]) {
+        let header = MessageHeader::from_bytes(bytes).expect("encode should succeed");
+        let mut dst = BytesMut::new();
+        header.write_bytes(&mut dst);
+        assert_eq!(dst.as_ref(), bytes);
     }
 }

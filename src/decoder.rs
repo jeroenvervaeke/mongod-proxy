@@ -1,6 +1,7 @@
 use tokio_util::{bytes::BytesMut, codec::Decoder};
 
 use crate::{
+    ByteDeSerializer,
     header::{MessageHeader, MessageHeaderParseError},
     message::Message,
     op_code::OPCodeParseError,

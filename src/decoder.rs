@@ -1,9 +1,8 @@
 use tokio_util::{bytes::BytesMut, codec::Decoder};
 
 use crate::{
-    ByteDeSerializer,
     header::{MessageHeader, MessageHeaderParseError},
-    message::Message,
+    message::{Message, MessageParseError},
     op_code::OPCodeParseError,
 };
 
@@ -18,6 +17,8 @@ pub enum WireDecoderError {
     IoError(#[from] std::io::Error),
     #[error("invalid opcode: {0}")]
     InvalidOpcode(#[from] OPCodeParseError),
+    #[error("failed to parse message: {0}")]
+    MessageParse(#[from] MessageParseError),
 }
 
 impl Decoder for WireDecoder {
@@ -56,7 +57,11 @@ impl Decoder for WireDecoder {
         // remove the entire message from the buffer
         let message_bytes = buf.split_to(header.message_length as usize);
 
-        Ok(Some(Message::new(header, message_bytes)))
+        // Parse message based on header and bytes
+        Ok(Some(Message::from_headers_and_bytes(
+            header,
+            &message_bytes,
+        )?))
     }
 }
 

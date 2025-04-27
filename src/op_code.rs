@@ -4,7 +4,7 @@ pub enum OPCode {
     Msg,
 }
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum OPCodeParseError {
     #[error("invalid opcode: {0}")]
     UnsupportedOpCode(i32),

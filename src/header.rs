@@ -2,10 +2,7 @@ use std::num::NonZeroI32;
 
 use tokio_util::bytes::BytesMut;
 
-use crate::{
-    ByteDeSerializer,
-    op_code::{OPCode, OPCodeParseError},
-};
+use crate::op_code::{OPCode, OPCodeParseError};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MessageHeader {
@@ -23,12 +20,14 @@ pub enum MessageHeaderParseError {
     InvalidOPCode(#[from] OPCodeParseError),
 }
 
-impl ByteDeSerializer for MessageHeader {
-    type ParseError = MessageHeaderParseError;
+impl MessageHeader {
+    pub fn size() -> usize {
+        16
+    }
 
-    fn from_bytes(bytes: &[u8]) -> Result<Self, Self::ParseError> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, MessageHeaderParseError> {
         let len = bytes.len();
-        if len < 16 {
+        if len < Self::size() {
             return Err(MessageHeaderParseError::TooFewBytes(len));
         }
 
@@ -42,7 +41,7 @@ impl ByteDeSerializer for MessageHeader {
         })
     }
 
-    fn write_bytes(&self, dst: &mut BytesMut) {
+    pub fn write_bytes(&self, dst: &mut BytesMut) {
         let message_length_bytes = i32::to_le_bytes(self.message_length);
         let request_id_bytes = i32::to_le_bytes(self.request_id);
         let response_to_bytes = i32::to_le_bytes(self.response_to.map_or(0, i32::from));

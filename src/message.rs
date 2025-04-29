@@ -4,7 +4,7 @@ use tokio_util::bytes::BytesMut;
 
 use crate::{
     header::{MessageHeader, MessageHeaderParseError},
-    operation::{Operation, OperationParseError},
+    operation::{Operation, OperationParseError, OperationWriteError},
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -28,6 +28,12 @@ pub enum MessageAndHeaderParseError {
     NotEnoughBytes { actual: usize, expected: usize },
     #[error("failed to parse operation: {0}")]
     FailedToParseOperation(#[from] OperationParseError),
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum MessageWriteError {
+    #[error("failed to write operation: {0}")]
+    FailedToWriteOperation(#[from] OperationWriteError),
 }
 
 impl Message {
@@ -73,13 +79,17 @@ impl Message {
         })
     }
 
-    fn write_bytes(&self, dst: &mut BytesMut) {
-        self.operation.write_bytes(dst);
+    pub fn write_bytes(&self, dst: &mut BytesMut) -> Result<(), MessageWriteError> {
+        self.operation
+            .write_bytes(dst, self.request_id, self.response_to)?;
+
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
     use rstest::rstest;
 
     use super::*;
@@ -95,5 +105,18 @@ mod tests {
         let actual = Message::from_bytes(bytes);
 
         assert_eq!(expected, actual);
+    }
+
+    #[rstest]
+    #[case::plain_query_request(msg_00_query_request::message(), Ok(msg_00_query_request::bytes()))]
+    #[case::plain_query_response(
+        msg_00_query_response::message(),
+        Ok(msg_00_query_response::bytes())
+    )]
+    fn serialize(#[case] message: Message, #[case] expected: Result<&[u8], &MessageWriteError>) {
+        let mut bytes = BytesMut::new();
+        let actual = message.write_bytes(&mut bytes).map(|_| bytes.to_vec());
+
+        assert_eq!(expected, actual.as_deref());
     }
 }

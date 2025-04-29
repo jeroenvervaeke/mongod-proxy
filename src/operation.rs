@@ -1,7 +1,9 @@
-use bitflags::bitflags;
-use tokio_util::bytes::BytesMut;
+use std::num::NonZeroI32;
 
-use crate::op_code::OPCode;
+use bitflags::bitflags;
+use tokio_util::bytes::{BufMut, BytesMut};
+
+use crate::{header::MessageHeader, op_code::OPCode};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Operation {
@@ -15,6 +17,31 @@ pub enum OperationParseError {
     FailedToParseMessage(#[from] OperationMessageParseError),
 }
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum OperationWriteError {
+    #[error("failed to write operation: {0}")]
+    FailedToWriteOperationMessage(#[from] OperationMessageWriteError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum OperationMessageWriteError {
+    #[error("failed to serialize sections: {0}")]
+    SerializeError(#[from] bson::ser::Error),
+}
+
+impl Eq for OperationMessageWriteError {}
+
+impl PartialEq for OperationMessageWriteError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                OperationMessageWriteError::SerializeError(_),
+                OperationMessageWriteError::SerializeError(_),
+            ) => true,
+        }
+    }
+}
+
 impl Operation {
     pub fn from_bytes(op_code: OPCode, bytes: &[u8]) -> Result<Self, OperationParseError> {
         Ok(match op_code {
@@ -23,8 +50,19 @@ impl Operation {
         })
     }
 
-    pub fn write_bytes(&self, _dst: &mut BytesMut) {
-        todo!()
+    pub fn write_bytes(
+        &self,
+        dst: &mut BytesMut,
+        request_id: i32,
+        response_to: Option<NonZeroI32>,
+    ) -> Result<(), OperationWriteError> {
+        match self {
+            Operation::Compressed => todo!(),
+            Operation::Message(operation_message) => {
+                operation_message.write_bytes(dst, request_id, response_to)?;
+                Ok(())
+            }
+        }
     }
 }
 
@@ -133,5 +171,45 @@ impl OperationMessage {
         })
     }
 
-    pub fn write_bytes(&self, dst: &mut BytesMut) {}
+    pub fn write_bytes(
+        &self,
+        dst: &mut BytesMut,
+        request_id: i32,
+        response_to: Option<NonZeroI32>,
+    ) -> Result<(), OperationMessageWriteError> {
+        // Serialize sections
+        let body_bytes = bson::to_vec(&self.sections)?;
+
+        // Calculate the size of the message
+        // - size of header (4 * i32 = 16 bytes)
+        // - size of flags (i32 = 4 bytes)
+        // - size of kind (u8 = 1 byte)
+        // - size of body bytes
+        // - no checksum => 0 bytes
+        let message_length =
+            MessageHeader::size() + size_of::<i32>() + size_of::<u8>() + body_bytes.len();
+
+        // Allocate memory
+        dst.reserve(message_length);
+
+        // Write the header
+        let header = MessageHeader {
+            message_length: message_length as i32,
+            op_code: OPCode::Msg,
+            request_id,
+            response_to,
+        };
+
+        header.write_bytes(dst);
+
+        // Write the rest of the message
+        // Flags
+        dst.put_u32_le(OperationMessageFlags::empty().bits());
+        // Kind
+        dst.put_u8(0);
+        // Data
+        dst.put(body_bytes.as_slice());
+
+        Ok(())
+    }
 }

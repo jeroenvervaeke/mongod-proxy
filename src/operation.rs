@@ -23,7 +23,7 @@ impl Operation {
         })
     }
 
-    pub fn write_bytes(&self, dst: &mut BytesMut) {
+    pub fn write_bytes(&self, _dst: &mut BytesMut) {
         todo!()
     }
 }
@@ -89,7 +89,7 @@ impl OperationMessage {
         .ok_or_else(|| OperationMessageParseError::InvalidBitflags)?;
 
         // get the message kind
-        let kind = bytes[5];
+        let kind = bytes[4];
 
         // make sure the message kind is 0
         if kind != 0 {
@@ -133,17 +133,5 @@ impl OperationMessage {
         })
     }
 
-    pub fn write_bytes(&self, dst: &mut BytesMut) {
-        todo!()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn deserialize() {
-        let bytes = include_bytes!("./fixtures/messages/00_QUERY_request.bin");
-    }
+    pub fn write_bytes(&self, dst: &mut BytesMut) {}
 }

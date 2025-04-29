@@ -56,42 +56,10 @@ impl MessageHeader {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rstest::*;
 
-    mod op_msg_01 {
-        use super::*;
-
-        pub fn header() -> MessageHeader {
-            MessageHeader {
-                message_length: 163,
-                request_id: 25,
-                response_to: None,
-                op_code: OPCode::Msg,
-            }
-        }
-
-        pub fn bytes() -> &'static [u8] {
-            include_bytes!("./fixtures/headers/OP_MSG_01_request.bin")
-        }
-    }
-
-    mod op_msg_02 {
-        use super::*;
-
-        pub fn header() -> MessageHeader {
-            MessageHeader {
-                message_length: 240,
-                request_id: 26,
-                response_to: NonZeroI32::new(25),
-                op_code: OPCode::Compressed,
-            }
-        }
-
-        pub fn bytes() -> &'static [u8] {
-            include_bytes!("./fixtures/headers/OP_MSG_02_response.bin")
-        }
-    }
+    use super::*;
+    use crate::fixtures::headers::*;
 
     #[rstest]
     #[case::plain_request_message(op_msg_01::bytes(), Ok(op_msg_01::header()))]

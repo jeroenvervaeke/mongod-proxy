@@ -10,6 +10,7 @@ thiserror = "2.0.12"
 tokio-util = { version = "0.7.14", features = ["codec"] }
 
 [dev-dependencies]
+pretty_assertions = "1.4.1"
 rstest = "0.25.0"
 
 [workspace]

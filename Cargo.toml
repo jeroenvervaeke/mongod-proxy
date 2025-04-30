@@ -7,7 +7,7 @@ edition = "2024"
 bitflags = "2.9.0"
 bson = "2.14.0"
 thiserror = "2.0.12"
-tokio-util = { version = "0.7.14", features = ["codec"] }
+tokio-util = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = "1.4.1"
@@ -15,3 +15,6 @@ rstest = "0.25.0"
 
 [workspace]
 members = [".", "logger"]
+
+[workspace.dependencies]
+tokio-util = { version = "0.7.14", features = ["codec"] }

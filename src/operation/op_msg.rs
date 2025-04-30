@@ -5,67 +5,6 @@ use tokio_util::bytes::{BufMut, BytesMut};
 
 use crate::{header::MessageHeader, op_code::OPCode};
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum Operation {
-    Compressed,
-    Message(OperationMessage),
-}
-
-#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
-pub enum OperationParseError {
-    #[error("failed to parse message: {0}")]
-    FailedToParseMessage(#[from] OperationMessageParseError),
-}
-
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum OperationWriteError {
-    #[error("failed to write operation: {0}")]
-    FailedToWriteOperationMessage(#[from] OperationMessageWriteError),
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum OperationMessageWriteError {
-    #[error("failed to serialize sections: {0}")]
-    SerializeError(#[from] bson::ser::Error),
-}
-
-impl Eq for OperationMessageWriteError {}
-
-impl PartialEq for OperationMessageWriteError {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (
-                OperationMessageWriteError::SerializeError(_),
-                OperationMessageWriteError::SerializeError(_),
-            ) => true,
-        }
-    }
-}
-
-impl Operation {
-    pub fn from_bytes(op_code: OPCode, bytes: &[u8]) -> Result<Self, OperationParseError> {
-        Ok(match op_code {
-            OPCode::Compressed => todo!(),
-            OPCode::Msg => Operation::Message(OperationMessage::from_bytes(bytes)?),
-        })
-    }
-
-    pub fn write_bytes(
-        &self,
-        dst: &mut BytesMut,
-        request_id: i32,
-        response_to: Option<NonZeroI32>,
-    ) -> Result<(), OperationWriteError> {
-        match self {
-            Operation::Compressed => todo!(),
-            Operation::Message(operation_message) => {
-                operation_message.write_bytes(dst, request_id, response_to)?;
-                Ok(())
-            }
-        }
-    }
-}
-
 bitflags! {
     /// The flagBits integer is a bitmask encoding flags that modify the format and behavior of OP_MSG.
     /// The first 16 bits (0-15) are required and parsers MUST error if an unknown bit is set.
@@ -101,6 +40,12 @@ pub enum OperationMessageParseError {
     MissingChecksum,
     #[error("failed to parse bson: {0}")]
     InvalidBson(String),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum OperationMessageWriteError {
+    #[error("failed to serialize sections: {0}")]
+    SerializeError(#[from] bson::ser::Error),
 }
 
 impl OperationMessage {

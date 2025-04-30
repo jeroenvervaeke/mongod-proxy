@@ -1,4 +1,4 @@
-use crate::operation::{OperationMessage, OperationMessageFlags};
+use crate::operation::op_msg::{OperationMessage, OperationMessageFlags};
 use crate::{message::Message, operation::Operation};
 
 use bson::{DateTime, Uuid, doc, oid::ObjectId};
@@ -35,7 +35,7 @@ pub mod msg_00_query_request {
     }
 
     pub fn bytes() -> &'static [u8] {
-        include_bytes!("./00_QUERY_request.bin")
+        include_bytes!("./00_OP_MSG_request.bin")
     }
 }
 
@@ -147,6 +147,51 @@ pub mod msg_00_query_response {
     }
 
     pub fn bytes() -> &'static [u8] {
-        include_bytes!("./00_QUERY_response.bin")
+        include_bytes!("./00_OP_MSG_response.bin")
+    }
+}
+
+pub mod msg_01_legacy_op_query {
+    use crate::operation::op_query::{OperationQuery, OperationQueryFlags};
+
+    use super::*;
+
+    pub fn message() -> Message {
+        Message {
+            request_id: 1,
+            response_to: None,
+            operation: Operation::Query(OperationQuery {
+                flags: OperationQueryFlags::empty(),
+                full_collection_name: "admin.$cmd".into(),
+                number_to_skip: 0,
+                number_to_return: -1,
+                query: doc! {
+                    "ismaster": 1,
+                    "helloOk": true,
+                    "client": {
+                        "driver": {
+                            "name": "nodejs",
+                            "version": "5.1.0",
+                        },
+                        "os": {
+                            "type": "Linux",
+                            "name": "linux",
+                            "architecture": "x64",
+                            "version": "6.14.3-arch1-1",
+                        },
+                        "platform": "Node.js v16.17.1, LE (unified)|Node.js v16.17.1, LE (unified)",
+                        "application": {
+                            "name": "MongoDB Compass",
+                        }
+                    },
+                    "compression": [ "none" ],
+                },
+                return_fields_selector: None,
+            }),
+        }
+    }
+
+    pub fn bytes() -> &'static [u8] {
+        include_bytes!("./01_LEGACY_OP_QUERY.bin")
     }
 }

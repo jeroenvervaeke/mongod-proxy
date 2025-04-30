@@ -16,7 +16,7 @@ pub mod op_msg_01 {
     }
 
     pub fn bytes() -> &'static [u8] {
-        include_bytes!("./OP_MSG_01_request.bin")
+        include_bytes!("./OP_MSG.bin")
     }
 }
 
@@ -29,11 +29,11 @@ pub mod op_msg_02 {
             message_length: 240,
             request_id: 26,
             response_to: NonZeroI32::new(25),
-            op_code: OPCode::Compressed,
+            op_code: OPCode::Query,
         }
     }
 
     pub fn bytes() -> &'static [u8] {
-        include_bytes!("./OP_MSG_02_response.bin")
+        include_bytes!("./OP_QUERY.bin")
     }
 }

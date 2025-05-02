@@ -2,17 +2,20 @@ use std::num::NonZeroI32;
 
 use op_msg::{OperationMessage, OperationMessageParseError, OperationMessageWriteError};
 use op_query::{OperationQuery, OperationQueryParseError, OperationQueryWriteError};
+use op_reply::{OperationReply, OperationReplyParseError, OperationReplyWriteError};
 use tokio_util::bytes::BytesMut;
 
 use crate::op_code::OPCode;
 
 pub mod op_msg;
 pub mod op_query;
+pub mod op_reply;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Operation {
     Query(OperationQuery),
     Message(OperationMessage),
+    Reply(OperationReply),
 }
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
@@ -21,6 +24,8 @@ pub enum OperationParseError {
     FailedToParseMessage(#[from] OperationMessageParseError),
     #[error("failed to parse query: {0}")]
     FailedToParseQuery(#[from] OperationQueryParseError),
+    #[error("failed to reply query: {0}")]
+    FailedToParseReply(#[from] OperationReplyParseError),
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -29,6 +34,8 @@ pub enum OperationWriteError {
     FailedToWriteOperationMessage(#[from] OperationMessageWriteError),
     #[error("failed to write query operation: {0}")]
     FailedToWriteOperationQuery(#[from] OperationQueryWriteError),
+    #[error("failed to write reply operation: {0}")]
+    FailedToWriteOperationReply(#[from] OperationReplyWriteError),
 }
 
 impl Eq for OperationMessageWriteError {}
@@ -49,6 +56,7 @@ impl Operation {
         Ok(match op_code {
             OPCode::Msg => Operation::Message(OperationMessage::from_bytes(bytes)?),
             OPCode::Query => Operation::Query(OperationQuery::from_bytes(bytes)?),
+            OPCode::Replay => Operation::Reply(OperationReply::from_bytes(bytes)?),
         })
     }
 
@@ -65,6 +73,10 @@ impl Operation {
             }
             Operation::Query(query_message) => {
                 query_message.write_bytes(dst, request_id, response_to)?;
+                Ok(())
+            }
+            Operation::Reply(operation_reply) => {
+                operation_reply.write_bytes(dst, request_id, response_to)?;
                 Ok(())
             }
         }

@@ -102,6 +102,7 @@ mod tests {
         Ok(msg_00_query_response::message())
     )]
     #[case::legacy_op_query(msg_01_legacy_op_query::bytes(), Ok(msg_01_legacy_op_query::message()))]
+    #[case::legacy_op_query(msg_01_legacy_op_reply::bytes(), Ok(msg_01_legacy_op_reply::message()))]
     fn deserialize(#[case] bytes: &[u8], #[case] expected: Result<Message, MessageParseError>) {
         let actual = Message::from_bytes(bytes);
 
@@ -115,6 +116,7 @@ mod tests {
         Ok(msg_00_query_response::bytes())
     )]
     #[case::legacy_op_query(msg_01_legacy_op_query::message(), Ok(msg_01_legacy_op_query::bytes()))]
+    #[case::legacy_op_query(msg_01_legacy_op_reply::message(), Ok(msg_01_legacy_op_reply::bytes()))]
     fn serialize(#[case] message: Message, #[case] expected: Result<&[u8], &MessageWriteError>) {
         let mut bytes = BytesMut::new();
         let actual = message.write_bytes(&mut bytes).map(|_| bytes.to_vec());

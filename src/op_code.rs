@@ -2,6 +2,7 @@
 pub enum OPCode {
     Msg,
     Query,
+    Replay,
 }
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
@@ -10,6 +11,7 @@ pub enum OPCodeParseError {
     UnsupportedOpCode(i32),
 }
 
+const OP_REPLY: [u8; 4] = i32::to_le_bytes(1);
 const OP_QUERY: [u8; 4] = i32::to_le_bytes(2004);
 const OP_MSG: [u8; 4] = i32::to_le_bytes(2013);
 
@@ -18,6 +20,7 @@ impl OPCode {
         match bytes {
             OP_MSG => Ok(OPCode::Msg),
             OP_QUERY => Ok(OPCode::Query),
+            OP_REPLY => Ok(OPCode::Replay),
             _ => Err(OPCodeParseError::UnsupportedOpCode(i32::from_le_bytes(
                 bytes,
             ))),
@@ -28,6 +31,7 @@ impl OPCode {
         match self {
             OPCode::Msg => OP_MSG,
             OPCode::Query => OP_QUERY,
+            OPCode::Replay => OP_REPLY,
         }
     }
 }
@@ -38,7 +42,8 @@ mod tests {
     use rstest::*;
 
     #[rstest]
-    #[case::unsupported_opcode([0x01, 0x00, 0x00, 0x00], Err(OPCodeParseError::UnsupportedOpCode(1)))]
+    #[case::unsupported_opcode([0xAA, 0x00, 0x00, 0x00], Err(OPCodeParseError::UnsupportedOpCode(0xAA)))]
+    #[case::msg([0x01, 0x00, 0x00, 0x00], Ok(OPCode::Replay))]
     #[case::query([0xD4, 0x07, 0x00, 0x00], Ok(OPCode::Query))]
     #[case::msg([0xDD, 0x07, 0x00, 0x00], Ok(OPCode::Msg))]
     fn decode(#[case] bytes: [u8; 4], #[case] expected: Result<OPCode, OPCodeParseError>) {
@@ -46,6 +51,7 @@ mod tests {
     }
 
     #[rstest]
+    #[case::msg(OPCode::Replay, [0x01, 0x00, 0x00, 0x00])]
     #[case::query(OPCode::Query, [0xD4, 0x07, 0x00, 0x00])]
     #[case::msg(OPCode::Msg, [0xDD, 0x07, 0x00, 0x00])]
     fn encode(#[case] code: OPCode, #[case] expected: [u8; 4]) {

@@ -1,4 +1,8 @@
-use crate::operation::op_msg::{OperationMessage, OperationMessageFlags};
+use crate::operation::{
+    op_msg::{OperationMessage, OperationMessageFlags},
+    op_query::{OperationQuery, OperationQueryFlags},
+    op_reply::{OperationReply, OperationReplyFlags},
+};
 use crate::{message::Message, operation::Operation};
 
 use bson::{DateTime, Uuid, doc, oid::ObjectId};
@@ -152,7 +156,6 @@ pub mod msg_00_query_response {
 }
 
 pub mod msg_01_legacy_op_query {
-    use crate::operation::op_query::{OperationQuery, OperationQueryFlags};
 
     use super::*;
 
@@ -193,5 +196,45 @@ pub mod msg_01_legacy_op_query {
 
     pub fn bytes() -> &'static [u8] {
         include_bytes!("./01_LEGACY_OP_QUERY.bin")
+    }
+}
+
+pub mod msg_01_legacy_op_reply {
+
+    use super::*;
+
+    pub fn message() -> Message {
+        Message {
+            request_id: 3,
+            response_to: NonZeroI32::new(1),
+            operation: Operation::Reply(OperationReply {
+                flags: OperationReplyFlags::AWAIT_CAPABLE,
+                cursor_id: 0,
+                starting_from: 0,
+                number_returned: 1,
+                documents: vec![doc! {
+                "helloOk": true,
+                "ismaster": true,
+                "topologyVersion": {
+                    "processId": ObjectId::parse_str("68127974e6c09bf33bc5783f").unwrap(),
+                    "counter": 0i64
+                },
+                "maxBsonObjectSize": 16777216,
+                "maxMessageSizeBytes": 48000000,
+                "maxWriteBatchSize": 100000,
+                "localTime": DateTime::from_millis(1746041224056),
+                "logicalSessionTimeoutMinutes": 30,
+                "connectionId": 1,
+                "minWireVersion": 0,
+                "maxWireVersion": 17,
+                "readOnly": false,
+                "ok": 1.0,
+                }],
+            }),
+        }
+    }
+
+    pub fn bytes() -> &'static [u8] {
+        include_bytes!("./01_LEGACY_OP_REPLY.bin")
     }
 }

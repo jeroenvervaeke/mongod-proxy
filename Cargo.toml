@@ -6,8 +6,13 @@ edition = "2024"
 [dependencies]
 bitflags = "2.9.0"
 bson = "2.14.0"
+futures = { workspace = true }
 thiserror = "2.0.12"
+tokio = { workspace = true }
 tokio-util = { workspace = true }
+tower-layer = { workspace = true }
+tower-service = { workspace = true }
+tokio-stream = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = "1.4.1"
@@ -17,4 +22,9 @@ rstest = "0.25.0"
 members = [".", "logger"]
 
 [workspace.dependencies]
+futures = "0.3.0"
+tokio = { version = "1.44.2", features = ["full"] }
 tokio-util = { version = "0.7.14", features = ["codec"] }
+tower-layer = "0.3.3"
+tower-service = "0.3.3"
+tokio-stream = "0.1.17"

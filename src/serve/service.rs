@@ -10,28 +10,51 @@ use tokio::{
     sync::Mutex,
 };
 use tokio_util::codec::{FramedRead, FramedWrite};
+use tower_layer::{Identity, Layer, Stack};
 use tower_service::Service;
 
 use crate::{
+    LogLayer,
     decoder::{WireDecoder, WireDecoderError},
     encoder::{WireEncoder, WireEncoderError},
     message::Message,
 };
 
-pub struct Proxy {
+pub struct Proxy<L> {
     destination: SocketAddr,
+    proxy_layer: L,
 }
 
-impl Proxy {
+impl Proxy<Identity> {
     pub fn new(destination: SocketAddr) -> Self {
-        Self { destination }
+        Self {
+            destination,
+            proxy_layer: Identity::new(),
+        }
     }
 }
 
-impl Service<SocketAddr> for Proxy {
-    type Response = ProxyClient;
+impl<L> Proxy<L> {
+    pub fn layer<T>(self, layer: T) -> Proxy<Stack<T, L>> {
+        Proxy {
+            destination: self.destination,
+            proxy_layer: Stack::new(layer, self.proxy_layer),
+        }
+    }
+
+    pub fn enable_logging(self) -> Proxy<Stack<LogLayer, L>> {
+        self.layer(LogLayer::new())
+    }
+}
+
+impl<L> Service<SocketAddr> for Proxy<L>
+where
+    L: Clone + Layer<ProxyClient> + Send + 'static,
+    L::Service: Service<Message>,
+{
+    type Response = L::Service;
     type Error = ProxyClientForwardError;
-    type Future = ProxyClientCreationFuture;
+    type Future = ProxyClientCreationFuture<L::Service>;
 
     fn poll_ready(
         &mut self,
@@ -42,16 +65,24 @@ impl Service<SocketAddr> for Proxy {
 
     fn call(&mut self, _req: SocketAddr) -> Self::Future {
         let dst = self.destination.clone();
-        ProxyClientCreationFuture(Box::pin(async move { ProxyClient::forward_to(dst).await }))
+        let layer = self.proxy_layer.clone();
+        ProxyClientCreationFuture(Box::pin(async move {
+            ProxyClient::forward_to(dst).await.map(|s| layer.layer(s))
+        }))
     }
 }
 
-pub struct ProxyClientCreationFuture(
-    Pin<Box<dyn Future<Output = Result<ProxyClient, ProxyClientForwardError>> + Send + 'static>>,
-);
+pub struct ProxyClientCreationFuture<S>(
+    Pin<Box<dyn Future<Output = Result<S, ProxyClientForwardError>> + Send + 'static>>,
+)
+where
+    S: Service<Message>;
 
-impl Future for ProxyClientCreationFuture {
-    type Output = Result<ProxyClient, ProxyClientForwardError>;
+impl<S> Future for ProxyClientCreationFuture<S>
+where
+    S: Service<Message>,
+{
+    type Output = Result<S, ProxyClientForwardError>;
 
     fn poll(
         mut self: Pin<&mut Self>,

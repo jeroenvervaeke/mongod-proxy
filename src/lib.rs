@@ -9,4 +9,4 @@ pub mod serve;
 #[cfg(test)]
 mod fixtures;
 
-pub use serve::{serve, service::Proxy};
+pub use serve::{log::LogLayer, serve, service::Proxy};

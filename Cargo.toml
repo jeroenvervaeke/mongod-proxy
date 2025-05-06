@@ -13,6 +13,7 @@ tokio-util = { workspace = true }
 tower-layer = { workspace = true }
 tower-service = { workspace = true }
 tokio-stream = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = "1.4.1"
@@ -28,3 +29,4 @@ tokio-util = { version = "0.7.14", features = ["codec"] }
 tower-layer = "0.3.3"
 tower-service = "0.3.3"
 tokio-stream = "0.1.17"
+tracing = { version = "0.1.41", features = ["attributes"] }

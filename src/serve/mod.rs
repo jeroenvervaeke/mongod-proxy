@@ -12,6 +12,7 @@ use crate::{
     message::Message,
 };
 
+pub mod log;
 pub mod service;
 
 #[derive(Debug, thiserror::Error)]

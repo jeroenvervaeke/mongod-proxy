@@ -1,5 +1,3 @@
-use std::{net::SocketAddr, str::FromStr};
-
 use anyhow::{Context, Result};
 use mongod_proxy::{Proxy, serve};
 use tokio::net::TcpListener;
@@ -14,7 +12,12 @@ async fn main() -> Result<()> {
         .await
         .context("bind tcp socket")?;
 
-    let proxy = Proxy::new(SocketAddr::from_str("127.0.0.1:27017").unwrap()).enable_logging();
+    let proxy = Proxy::new(
+        "autoembeddingtest-shard-00-01.7aoyd.mongodb-qa.net",
+        27017,
+        true,
+    )
+    .enable_logging();
 
     serve(listener, proxy).await.context("run mongodb proxy")?;
 

@@ -1,13 +1,19 @@
-use std::{net::SocketAddr, pin::Pin, sync::Arc};
+use std::{
+    net::{SocketAddr, ToSocketAddrs},
+    pin::Pin,
+    sync::Arc,
+};
 
 use futures::{SinkExt, StreamExt};
+use rustls_pki_types::{InvalidDnsNameError, ServerName};
 use tokio::{
-    io,
-    net::{
-        TcpStream, ToSocketAddrs,
-        tcp::{OwnedReadHalf, OwnedWriteHalf},
-    },
+    io::{self, AsyncRead, AsyncWrite, split},
+    net::TcpStream,
     sync::Mutex,
+};
+use tokio_rustls::{
+    TlsConnector,
+    rustls::{ClientConfig, RootCertStore},
 };
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tower_layer::{Identity, Layer, Stack};
@@ -21,14 +27,33 @@ use crate::{
 };
 
 pub struct Proxy<L> {
-    destination: SocketAddr,
+    destination_name: String,
+    destination_port: u16,
+    tls_connector: Option<Arc<TlsConnector>>,
+
     proxy_layer: L,
 }
 
 impl Proxy<Identity> {
-    pub fn new(destination: SocketAddr) -> Self {
+    pub fn new(destination_name: impl Into<String>, destination_port: u16, use_tls: bool) -> Self {
+        let tls_connector = if use_tls {
+            let mut root_cert_store = RootCertStore::empty();
+            root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            let mut config = ClientConfig::builder()
+                .with_root_certificates(root_cert_store)
+                .with_no_client_auth();
+            config.enable_sni = true;
+
+            Some(Arc::new(TlsConnector::from(Arc::new(config))))
+        } else {
+            None
+        };
+
         Self {
-            destination,
+            destination_name: destination_name.into(),
+            destination_port,
+            tls_connector,
+
             proxy_layer: Identity::new(),
         }
     }
@@ -37,7 +62,10 @@ impl Proxy<Identity> {
 impl<L> Proxy<L> {
     pub fn layer<T>(self, layer: T) -> Proxy<Stack<T, L>> {
         Proxy {
-            destination: self.destination,
+            destination_name: self.destination_name,
+            destination_port: self.destination_port,
+            tls_connector: self.tls_connector,
+
             proxy_layer: Stack::new(layer, self.proxy_layer),
         }
     }
@@ -64,10 +92,16 @@ where
     }
 
     fn call(&mut self, _req: SocketAddr) -> Self::Future {
-        let dst = self.destination.clone();
+        let destinatino_name = self.destination_name.clone();
+        let destination_port = self.destination_port;
+        let tls_connector = self.tls_connector.clone();
+
         let layer = self.proxy_layer.clone();
+
         ProxyClientCreationFuture(Box::pin(async move {
-            ProxyClient::forward_to(dst).await.map(|s| layer.layer(s))
+            ProxyClient::forward_to(destinatino_name, destination_port, tls_connector)
+                .await
+                .map(|s| layer.layer(s))
         }))
     }
 }
@@ -97,20 +131,58 @@ pub struct ProxyClient {
 }
 
 struct ProxyClientInner {
-    server_reader: FramedRead<OwnedReadHalf, WireDecoder>,
-    server_writer: FramedWrite<OwnedWriteHalf, WireEncoder>,
+    server_reader: FramedRead<Pin<Box<dyn AsyncRead + Send + Sync + 'static>>, WireDecoder>,
+    server_writer: FramedWrite<Pin<Box<dyn AsyncWrite + Send + Sync + 'static>>, WireEncoder>,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProxyClientForwardError {
+    #[error("invalid socket address: {0}")]
+    InvalidSocketAddress(io::Error),
+    #[error("socket address not found")]
+    SocketAddressNotFound,
     #[error("failed to connect to proxied server: {0}")]
-    FailedToConnectToProxiedServer(#[from] io::Error),
+    FailedToConnectToProxiedServer(io::Error),
+    #[error("invalid server name: {0}")]
+    InvalidServerName(InvalidDnsNameError),
 }
 
 impl ProxyClient {
-    pub async fn forward_to<A: ToSocketAddrs>(addr: A) -> Result<Self, ProxyClientForwardError> {
-        let server_stream = TcpStream::connect(addr).await?;
-        let (server_reader, server_writer) = server_stream.into_split();
+    pub async fn forward_to(
+        destination_name: String,
+        destination_port: u16,
+        tls_connector: Option<Arc<TlsConnector>>,
+    ) -> Result<Self, ProxyClientForwardError> {
+        // convert hostname to ip address
+        // due to sharding this might change, that's why we it here
+        /*
+        let addr = (destination_name.as_str(), destination_port)
+            .to_socket_addrs()
+            .map_err(ProxyClientForwardError::InvalidSocketAddress)?
+            .next()
+            .ok_or(ProxyClientForwardError::SocketAddressNotFound)?;
+        */
+        let addr = format!("{destination_name}:{destination_port}");
+        // open a tcp stream to the server
+        let server_stream = TcpStream::connect(addr)
+            .await
+            .map_err(ProxyClientForwardError::FailedToConnectToProxiedServer)?;
+
+        // upgrade the tcp stream if nesseseary
+        let (server_reader, server_writer): (
+            Pin<Box<dyn AsyncRead + Send + Sync>>,
+            Pin<Box<dyn AsyncWrite + Send + Sync>>,
+        ) = if let Some(connector) = tls_connector {
+            let domain = ServerName::try_from(destination_name)
+                .map_err(ProxyClientForwardError::InvalidServerName)?;
+
+            let tls_stream = connector.connect(domain, server_stream).await.unwrap();
+            let (server_reader, server_writer) = split(tls_stream);
+            (Box::pin(server_reader), Box::pin(server_writer))
+        } else {
+            let (server_reader, server_writer) = server_stream.into_split();
+            (Box::pin(server_reader), Box::pin(server_writer))
+        };
 
         let server_reader = FramedRead::new(server_reader, WireDecoder::default());
         let server_writer = FramedWrite::new(server_writer, WireEncoder::default());

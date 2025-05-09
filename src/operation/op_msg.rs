@@ -17,7 +17,7 @@ bitflags! {
         const MORE_TO_COME = 0b0000_0000_0000_0010;
         // The client is prepared for multiple replies to this request using the moreToCome bit. The server will never produce replies with the moreToCome bit set unless the request has this bit set.
         // This ensures that multiple replies are only sent when the network layer of the requester is prepared for them.
-        const EXHAUST_ALLOWED = 0b1000_0000_0000_0000;
+        const EXHAUST_ALLOWED = 0x00010000;
     }
 }
 
@@ -149,7 +149,12 @@ impl OperationMessage {
 
         // Write the rest of the message
         // Flags
-        dst.put_u32_le(OperationMessageFlags::empty().bits());
+        let mut flags = self.flags;
+        if flags.contains(OperationMessageFlags::CHECKSUM_PRESENT) {
+            flags = flags - OperationMessageFlags::CHECKSUM_PRESENT;
+        }
+
+        dst.put_u32_le(flags.bits());
         // Kind
         dst.put_u8(0);
         // Data

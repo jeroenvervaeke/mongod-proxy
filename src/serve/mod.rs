@@ -1,15 +1,21 @@
-use std::{fmt::Display, marker::PhantomData, net::SocketAddr, pin::Pin};
+use std::{fmt::Display, marker::PhantomData, net::SocketAddr, num::NonZeroI32, pin::Pin};
 
+use bson::{DateTime, doc, oid::ObjectId};
 use futures::sink::SinkExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tower_service::Service;
+use tracing::error;
 
 use crate::{
     decoder::WireDecoder,
     encoder::{WireEncoder, WireEncoderError},
     message::Message,
+    operation::{
+        Operation,
+        op_msg::{OperationMessage, OperationMessageFlags},
+    },
 };
 
 pub mod log;
@@ -31,6 +37,7 @@ where
     Serve {
         listener,
         make_service,
+        process_id: ObjectId::new(),
         _marker: PhantomData,
     }
 }
@@ -38,6 +45,7 @@ where
 pub struct Serve<M, ME, S, E> {
     listener: TcpListener,
     make_service: M,
+    process_id: ObjectId,
     _marker: PhantomData<(ME, S, E)>,
 }
 
@@ -91,7 +99,9 @@ where
                         .call(addr)
                         .await
                         .map_err(ServeError::CreateClientError)?;
-                    tokio::spawn(accept_client(service, client_stream));
+                    let process_id = self.process_id.clone();
+
+                    tokio::spawn(accept_client(service, process_id, client_stream));
                 }
                 Err(e) => println!("couldn't get client: {:?}", e),
             }
@@ -99,13 +109,13 @@ where
     }
 }
 
-async fn accept_client<S, E>(service: S, client_stream: TcpStream)
+async fn accept_client<S, E>(service: S, process_id: ObjectId, client_stream: TcpStream)
 where
     S: Service<Message, Response = Message, Error = E> + Send + 'static,
     S::Future: Send,
     E: Display + Send + 'static,
 {
-    if let Err(e) = accept_client_inner(service, client_stream).await {
+    if let Err(e) = accept_client_inner(service, process_id, client_stream).await {
         eprintln!("error occured, stopping connection. error = {e}")
     }
 }
@@ -120,6 +130,8 @@ enum AcceptClientError<E: Display> {
 
 async fn accept_client_inner<S, E>(
     mut service: S,
+    process_id: ObjectId,
+
     client_stream: TcpStream,
 ) -> Result<(), AcceptClientError<E>>
 where
@@ -132,17 +144,97 @@ where
     let mut client_reader = FramedRead::new(client_reader, WireDecoder::default());
     let mut client_writer = FramedWrite::new(client_writer, WireEncoder::default());
 
-    while let Some(Ok(client_req)) = client_reader.next().await {
-        let response = service
-            .call(client_req)
-            .await
-            .map_err(AcceptClientError::ForwardToRequestServer)?;
+    while let Some(client_result) = client_reader.next().await {
+        match client_result {
+            Ok(client_req) => {
+                let response = match handle_hello(&client_req, process_id) {
+                    Some(hello_response) => {
+                        service
+                            .call(client_req)
+                            .await
+                            .map_err(AcceptClientError::ForwardToRequestServer)?;
+                        hello_response
+                    }
+                    None => service
+                        .call(client_req)
+                        .await
+                        .map_err(AcceptClientError::ForwardToRequestServer)?,
+                };
 
-        client_writer
-            .send(response)
-            .await
-            .map_err(AcceptClientError::ForwardToResponseClient)?;
+                client_writer
+                    .send(response)
+                    .await
+                    .map_err(AcceptClientError::ForwardToResponseClient)?;
+            }
+            Err(e) => {
+                error!(?e, "wire decode error");
+                break;
+            }
+        }
     }
 
     Ok(())
+}
+
+fn handle_hello(message: &Message, process_id: ObjectId) -> Option<Message> {
+    match &message.operation {
+        Operation::Query(query)
+            if query.full_collection_name == "admin.$cmd"
+                && query.query.contains_key("helloOk") =>
+        {
+            Some(Message {
+                request_id: message.request_id + 1_000_000,
+                response_to: NonZeroI32::new(message.request_id),
+                operation: Operation::Message(OperationMessage {
+                    flags: OperationMessageFlags::empty(),
+                    sections: doc! {
+                        "helloOk": true,
+                        "ismaster": true,
+                        "topologyVersion": {
+                            "processId": process_id,
+                            "counter": 0,
+                        },
+                        "maxBsonObjectSize": 16777216,
+                        "maxMessageSizeBytes": 48000000,
+                        "maxWriteBatchSize": 100000,
+                        "localTime": DateTime::now(),
+                        "logicalSessionTimeoutMinutes": 30,
+                        "connectionId": 1,
+                        "minWireVersion": 0,
+                        "maxWireVersion": 17,
+                        "readOnly": false,
+                        "ok": 1
+                    },
+                    checksum: None,
+                }),
+            })
+        }
+        Operation::Message(mesage) if mesage.sections.contains_key("hello") => Some(Message {
+            request_id: message.request_id + 1_000_000,
+            response_to: NonZeroI32::new(message.request_id),
+            operation: Operation::Message(OperationMessage {
+                flags: OperationMessageFlags::empty(),
+                sections: doc! {
+                    "helloOk": true,
+                    "ismaster": true,
+                    "topologyVersion": {
+                        "processId": process_id,
+                        "counter": 0,
+                    },
+                    "maxBsonObjectSize": 16777216,
+                    "maxMessageSizeBytes": 48000000,
+                    "maxWriteBatchSize": 100000,
+                    "localTime": DateTime::now(),
+                    "logicalSessionTimeoutMinutes": 30,
+                    "connectionId": 1,
+                    "minWireVersion": 0,
+                    "maxWireVersion": 17,
+                    "readOnly": false,
+                    "ok": 1
+                },
+                checksum: None,
+            }),
+        }),
+        _ => None,
+    }
 }

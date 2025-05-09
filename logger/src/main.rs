@@ -12,12 +12,10 @@ async fn main() -> Result<()> {
         .await
         .context("bind tcp socket")?;
 
-    let proxy = Proxy::new(
-        "autoembeddingtest-shard-00-01.7aoyd.mongodb-qa.net",
-        27017,
-        true,
-    )
-    .enable_logging();
+    let proxy = Proxy::connect_to_srv("autoembeddingtest.7aoyd.mongodb-qa.net")
+        .await
+        .context("resolve host info")?
+        .enable_logging();
 
     serve(listener, proxy).await.context("run mongodb proxy")?;
 

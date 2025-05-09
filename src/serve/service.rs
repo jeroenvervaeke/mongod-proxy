@@ -1,10 +1,14 @@
 use std::{
-    net::{SocketAddr, ToSocketAddrs},
-    pin::Pin,
-    sync::Arc,
+    net::{IpAddr, SocketAddr}, pin::Pin, sync::Arc
 };
 
+use bson::{doc, oid::ObjectId};
 use futures::{SinkExt, StreamExt};
+use hickory_resolver::{
+    ResolveError, Resolver, config::ResolverConfig, name_server::TokioConnectionProvider,
+    proto::rr::RData,
+};
+use rand::{rng, seq::IndexedRandom};
 use rustls_pki_types::{InvalidDnsNameError, ServerName};
 use tokio::{
     io::{self, AsyncRead, AsyncWrite, split},
@@ -27,16 +31,71 @@ use crate::{
 };
 
 pub struct Proxy<L> {
-    destination_name: String,
-    destination_port: u16,
+    hosts: Vec<Host>,
     tls_connector: Option<Arc<TlsConnector>>,
 
     proxy_layer: L,
 }
 
+#[derive(Clone)]
+struct Host {
+    domain: Option<String>,
+    ip: IpAddr,
+    port: u16,
+}
+
+pub enum ProxyDestination {
+    Ip { ip: IpAddr, port: u16 },
+    Srv { domain: String },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ProxyConnectToError {
+    #[error("failed to connect to srv: {0}")]
+    ConnectToSrv(#[from] ProxyConnectToSrvError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ProxyConnectToSrvError {
+    #[error("srv lookup failed: {0}")]
+    SrvLookup(ResolveError),
+    #[error("ip lookup failed: {0}")]
+    IpLookup(ResolveError),
+    #[error("ip lookup returned no IPs")]
+    IpLookupReturnedNoIPs,
+    #[error("found no IPs")]
+    NoIPs,
+}
+
 impl Proxy<Identity> {
-    pub fn new(destination_name: impl Into<String>, destination_port: u16, use_tls: bool) -> Self {
-        let tls_connector = if use_tls {
+    pub async fn connect_to(
+        destination: ProxyDestination,
+    ) -> Result<Self, ProxyConnectToError> {
+        match destination {
+            ProxyDestination::Ip { ip, port } => Ok(Self::connect_to_ip(ip, port).await),
+            ProxyDestination::Srv { domain } => Ok(Self::connect_to_srv(domain).await?),
+        }
+    }
+
+    pub async fn connect_to_ip(ip: IpAddr, port: u16) -> Self {
+        Self {
+            hosts: vec![Host {
+                domain: None,
+                ip,
+                port,
+            }],
+            tls_connector: None,
+
+            proxy_layer: Identity::new(),
+        }
+    }
+
+    pub async fn connect_to_srv(
+        domain: impl Into<String>,
+    ) -> Result<Self, ProxyConnectToSrvError> {
+        let domain = domain.into();
+
+        let tls_connector = {
             let mut root_cert_store = RootCertStore::empty();
             root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
             let mut config = ClientConfig::builder()
@@ -45,25 +104,63 @@ impl Proxy<Identity> {
             config.enable_sni = true;
 
             Some(Arc::new(TlsConnector::from(Arc::new(config))))
-        } else {
-            None
         };
 
-        Self {
-            destination_name: destination_name.into(),
-            destination_port,
+        let resolver = Resolver::builder_with_config(
+            ResolverConfig::default(),
+            TokioConnectionProvider::default(),
+        )
+        .build();
+
+        let srv_lookup_result = resolver
+            .srv_lookup(format!("_mongodb._tcp.{domain}"))
+            .await
+            .map_err(ProxyConnectToSrvError::SrvLookup)?;
+        let mut hosts = vec![];
+        for record in srv_lookup_result.as_lookup().record_iter() {
+            let srv = match record.data() {
+                RData::SRV(s) => s,
+                _ => continue,
+            };
+            let mut host = srv.target().to_utf8();
+            // Remove the trailing '.'
+            if host.ends_with('.') {
+                host.pop();
+            }
+
+            let lookup_ip = resolver
+                .lookup_ip(&host)
+                .await
+                .map_err(ProxyConnectToSrvError::IpLookup)?;
+            let ip = lookup_ip
+                .iter()
+                .next()
+                .ok_or(ProxyConnectToSrvError::IpLookupReturnedNoIPs)?;
+            let port = srv.port();
+            hosts.push(Host {
+                domain: Some(host),
+                ip,
+                port,
+            });
+        }
+
+        if hosts.is_empty() {
+            return Err(ProxyConnectToSrvError::NoIPs);
+        }
+
+        Ok(Self {
+            hosts,
             tls_connector,
 
             proxy_layer: Identity::new(),
-        }
+        })
     }
 }
 
 impl<L> Proxy<L> {
     pub fn layer<T>(self, layer: T) -> Proxy<Stack<T, L>> {
         Proxy {
-            destination_name: self.destination_name,
-            destination_port: self.destination_port,
+            hosts: self.hosts,
             tls_connector: self.tls_connector,
 
             proxy_layer: Stack::new(layer, self.proxy_layer),
@@ -92,14 +189,18 @@ where
     }
 
     fn call(&mut self, _req: SocketAddr) -> Self::Future {
-        let destinatino_name = self.destination_name.clone();
-        let destination_port = self.destination_port;
+        let mut rng = rng();
+        let destination = self
+            .hosts
+            .choose(&mut rng)
+            .expect("thre is always at least 1 host")
+            .to_owned();
         let tls_connector = self.tls_connector.clone();
 
         let layer = self.proxy_layer.clone();
 
         ProxyClientCreationFuture(Box::pin(async move {
-            ProxyClient::forward_to(destinatino_name, destination_port, tls_connector)
+            ProxyClient::forward_to(destination, tls_connector)
                 .await
                 .map(|s| layer.layer(s))
         }))
@@ -148,23 +249,12 @@ pub enum ProxyClientForwardError {
 }
 
 impl ProxyClient {
-    pub async fn forward_to(
-        destination_name: String,
-        destination_port: u16,
+    async fn forward_to(
+        destination: Host,
         tls_connector: Option<Arc<TlsConnector>>,
     ) -> Result<Self, ProxyClientForwardError> {
-        // convert hostname to ip address
-        // due to sharding this might change, that's why we it here
-        /*
-        let addr = (destination_name.as_str(), destination_port)
-            .to_socket_addrs()
-            .map_err(ProxyClientForwardError::InvalidSocketAddress)?
-            .next()
-            .ok_or(ProxyClientForwardError::SocketAddressNotFound)?;
-        */
-        let addr = format!("{destination_name}:{destination_port}");
         // open a tcp stream to the server
-        let server_stream = TcpStream::connect(addr)
+        let server_stream = TcpStream::connect((destination.ip, destination.port))
             .await
             .map_err(ProxyClientForwardError::FailedToConnectToProxiedServer)?;
 
@@ -172,9 +262,9 @@ impl ProxyClient {
         let (server_reader, server_writer): (
             Pin<Box<dyn AsyncRead + Send + Sync>>,
             Pin<Box<dyn AsyncWrite + Send + Sync>>,
-        ) = if let Some(connector) = tls_connector {
-            let domain = ServerName::try_from(destination_name)
-                .map_err(ProxyClientForwardError::InvalidServerName)?;
+        ) = if let (Some(connector), Some(domain)) = (tls_connector, destination.domain) {
+            let domain =
+                ServerName::try_from(domain).map_err(ProxyClientForwardError::InvalidServerName)?;
 
             let tls_stream = connector.connect(domain, server_stream).await.unwrap();
             let (server_reader, server_writer) = split(tls_stream);

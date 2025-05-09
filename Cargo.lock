@@ -927,6 +927,7 @@ dependencies = [
  "futures",
  "hickory-resolver",
  "pretty_assertions",
+ "rand",
  "rstest",
  "rustls-pki-types",
  "thiserror 2.0.12",

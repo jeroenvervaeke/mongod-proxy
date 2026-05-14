@@ -47,6 +47,7 @@
 pub mod decoder;
 pub mod encoder;
 pub mod header;
+pub mod ids;
 pub mod message;
 pub mod op_code;
 pub mod operation;

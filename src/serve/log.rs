@@ -79,7 +79,7 @@ where
             direction = "request",
             op = op_kind(&req.operation),
             command = command_name(&req.operation).unwrap_or(""),
-            request_id = req.request_id,
+            request_id = %req.request_id,
             ?req,
             "received request"
         );
@@ -118,8 +118,8 @@ where
                 info!(
                     direction = "response",
                     op = op_kind(&message.operation),
-                    request_id = message.response_to,
-                    response_id = message.request_id,
+                    request_id = ?message.response_to,
+                    response_id = %message.request_id,
                     ?message,
                     "received response"
                 );

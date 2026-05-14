@@ -4,12 +4,11 @@
 //! header bits that carry framing (`message_length`, `op_code`) are derived
 //! from the operation at write time and are not stored on the struct.
 
-use std::num::NonZeroI32;
-
 use tokio_util::bytes::BytesMut;
 
 use crate::{
     header::{MessageHeader, MessageHeaderParseError},
+    ids::{RequestId, ResponseTo},
     operation::{Operation, OperationParseError, OperationWriteError},
 };
 
@@ -26,13 +25,14 @@ use crate::{
 ///
 /// ```
 /// use bson::doc;
+/// use mongod_proxy::ids::RequestId;
 /// use mongod_proxy::message::Message;
 /// use mongod_proxy::operation::Operation;
 /// use mongod_proxy::operation::op_msg::{OpMsgSection, OperationMessage, OperationMessageFlags};
 /// use tokio_util::bytes::BytesMut;
 ///
 /// let msg = Message {
-///     request_id: 1,
+///     request_id: RequestId::new(1),
 ///     response_to: None,
 ///     operation: Operation::Message(OperationMessage {
 ///         flags: OperationMessageFlags::empty(),
@@ -50,11 +50,11 @@ use crate::{
 pub struct Message {
     /// Sender-chosen identifier. Replies reference this in their
     /// [`response_to`](Self::response_to).
-    pub request_id: i32,
+    pub request_id: RequestId,
     /// `Some(n)` if this is a reply to request `n`; `None` for a fresh
-    /// request. Using `NonZeroI32` rules out confusing the sentinel `0`
-    /// with a real id.
-    pub response_to: Option<NonZeroI32>,
+    /// request. Wraps a `NonZeroI32` so the on-the-wire sentinel `0`
+    /// cannot be confused with a real id.
+    pub response_to: Option<ResponseTo>,
     /// The typed body. Determines the on-the-wire opcode at write time.
     pub operation: Operation,
 }
@@ -123,7 +123,7 @@ impl Message {
         bytes: &[u8],
     ) -> Result<Self, MessageAndHeaderParseError> {
         let actual_bytes = bytes.len();
-        let expected_bytes = header.message_length as usize;
+        let expected_bytes = header.message_length.into_inner() as usize;
 
         if actual_bytes < expected_bytes {
             return Err(MessageAndHeaderParseError::NotEnoughBytes {
@@ -208,10 +208,11 @@ mod tests {
     #[test]
     fn from_headers_and_bytes_errors_when_actual_lt_expected() {
         use crate::header::MessageHeader;
+        use crate::ids::{MessageLength, RequestId};
         use crate::op_code::OPCode;
         let header = MessageHeader {
-            message_length: 100,
-            request_id: 1,
+            message_length: MessageLength::try_new(100).unwrap(),
+            request_id: RequestId::new(1),
             response_to: None,
             op_code: OPCode::Msg,
         };

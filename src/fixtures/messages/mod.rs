@@ -1,3 +1,4 @@
+use crate::ids::{RequestId, ResponseTo};
 use crate::operation::{
     op_msg::{OpMsgSection, OperationMessage, OperationMessageFlags},
     op_query::{OperationQuery, OperationQueryFlags},
@@ -16,7 +17,7 @@ pub mod msg_00_query_request {
             91, 106, 64, 108, 211, 154, 77, 196, 174, 190, 152, 194, 44, 80, 165, 37,
         ]);
         Message {
-            request_id: 17,
+            request_id: RequestId::new(17),
             response_to: None,
             operation: Operation::Message(OperationMessage {
                 flags: OperationMessageFlags::empty(),
@@ -48,8 +49,8 @@ pub mod msg_00_query_response {
 
     pub fn message() -> Message {
         Message {
-            request_id: 21,
-            response_to: NonZeroI32::new(17),
+            request_id: RequestId::new(21),
+            response_to: NonZeroI32::new(17).map(ResponseTo::new),
             operation: Operation::Message(OperationMessage {
                 flags: OperationMessageFlags::empty(),
                 sections: vec![OpMsgSection::Body(doc! {
@@ -161,7 +162,7 @@ pub mod msg_01_legacy_op_query {
 
     pub fn message() -> Message {
         Message {
-            request_id: 1,
+            request_id: RequestId::new(1),
             response_to: None,
             operation: Operation::Query(OperationQuery {
                 flags: OperationQueryFlags::empty(),
@@ -205,8 +206,8 @@ pub mod msg_01_legacy_op_reply {
 
     pub fn message() -> Message {
         Message {
-            request_id: 3,
-            response_to: NonZeroI32::new(1),
+            request_id: RequestId::new(3),
+            response_to: NonZeroI32::new(1).map(ResponseTo::new),
             operation: Operation::Reply(OperationReply {
                 flags: OperationReplyFlags::AWAIT_CAPABLE,
                 cursor_id: 0,

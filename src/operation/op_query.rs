@@ -8,7 +8,6 @@
 use std::{
     ffi::{CStr, CString, FromBytesUntilNulError, NulError},
     io::Cursor,
-    num::NonZeroI32,
     str::Utf8Error,
 };
 
@@ -16,7 +15,11 @@ use bitflags::bitflags;
 use bson::Document;
 use tokio_util::bytes::{Buf, BufMut, BytesMut};
 
-use crate::{header::MessageHeader, op_code::OPCode};
+use crate::{
+    header::MessageHeader,
+    ids::{MessageLength, RequestId, ResponseTo},
+    op_code::OPCode,
+};
 
 /// Legacy OP_QUERY message body.
 ///
@@ -192,8 +195,8 @@ impl OperationQuery {
     pub fn write_bytes(
         &self,
         dst: &mut BytesMut,
-        request_id: i32,
-        response_to: Option<NonZeroI32>,
+        request_id: RequestId,
+        response_to: Option<ResponseTo>,
     ) -> Result<(), OperationQueryWriteError> {
         let query_bytes = bson::to_vec(&self.query)
             .map_err(|e| OperationQueryWriteError::SerializeQueryError(e.to_string()))?;
@@ -219,7 +222,8 @@ impl OperationQuery {
         dst.reserve(message_length);
 
         let header = MessageHeader {
-            message_length: message_length as i32,
+            message_length: MessageLength::try_new(message_length as i32)
+                .expect("message_length derived from serialised body is within wire envelope"),
             op_code: OPCode::Query,
             request_id,
             response_to,
@@ -253,7 +257,9 @@ mod tests {
             return_fields_selector: Some(doc! { "_id": 0, "name": 1 }),
         };
         let mut buf = BytesMut::new();
-        query.write_bytes(&mut buf, 1, None).unwrap();
+        query
+            .write_bytes(&mut buf, RequestId::new(1), None)
+            .unwrap();
         let body = &buf[MessageHeader::size()..];
         let parsed = OperationQuery::from_bytes(body).unwrap();
         assert_eq!(parsed, query);

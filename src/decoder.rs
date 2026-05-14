@@ -5,6 +5,7 @@ use tokio_util::{bytes::BytesMut, codec::Decoder};
 
 use crate::{
     header::{MessageHeader, MessageHeaderParseError},
+    ids::MessageLengthError,
     message::{Message, MessageAndHeaderParseError},
     op_code::OPCodeParseError,
 };
@@ -25,6 +26,7 @@ use crate::{
 /// ```
 /// use bson::doc;
 /// use mongod_proxy::decoder::WireDecoder;
+/// use mongod_proxy::ids::RequestId;
 /// use mongod_proxy::message::Message;
 /// use mongod_proxy::operation::Operation;
 /// use mongod_proxy::operation::op_msg::{OpMsgSection, OperationMessage, OperationMessageFlags};
@@ -33,7 +35,7 @@ use crate::{
 ///
 /// // Build a frame to feed in.
 /// let msg = Message {
-///     request_id: 1,
+///     request_id: RequestId::new(1),
 ///     response_to: None,
 ///     operation: Operation::Message(OperationMessage {
 ///         flags: OperationMessageFlags::empty(),
@@ -46,7 +48,7 @@ use crate::{
 ///
 /// let mut decoder = WireDecoder::default();
 /// let decoded = decoder.decode(&mut buf).unwrap().unwrap();
-/// assert_eq!(decoded.request_id, 1);
+/// assert_eq!(decoded.request_id, RequestId::new(1));
 /// assert!(buf.is_empty());
 /// ```
 #[derive(Debug, Default)]
@@ -66,6 +68,9 @@ pub enum WireDecoderError {
     /// The frame body could not be parsed against the header's opcode.
     #[error("failed to parse message: {0}")]
     MessageParse(#[from] MessageAndHeaderParseError),
+    /// The header's `message_length` was outside the protocol envelope.
+    #[error("invalid message length: {0}")]
+    InvalidMessageLength(#[from] MessageLengthError),
 }
 
 impl Decoder for WireDecoder {
@@ -84,6 +89,9 @@ impl Decoder for WireDecoder {
                     MessageHeaderParseError::InvalidOPCode(opcode_parse_error) => {
                         return Err(opcode_parse_error.into());
                     }
+                    MessageHeaderParseError::InvalidMessageLength(length_err) => {
+                        return Err(length_err.into());
+                    }
                 },
             }
         }
@@ -94,7 +102,7 @@ impl Decoder for WireDecoder {
                 return Ok(None);
             };
 
-            if buf.len() < next_header.message_length as usize {
+            if buf.len() < next_header.message_length.into_inner() as usize {
                 return Ok(None);
             }
         }
@@ -102,7 +110,7 @@ impl Decoder for WireDecoder {
         // At this point we have a header and enough data to parse the message
         let header = self.next_header.take().unwrap();
         // remove the entire message from the buffer
-        let message_bytes = buf.split_to(header.message_length as usize);
+        let message_bytes = buf.split_to(header.message_length.into_inner() as usize);
 
         // Parse message based on header and bytes
         Ok(Some(Message::from_headers_and_bytes(

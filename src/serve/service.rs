@@ -443,6 +443,7 @@ mod tests {
     use tokio_util::bytes::BytesMut;
 
     use super::*;
+    use crate::ids::{RequestId, ResponseTo};
     use crate::operation::op_msg::{OpMsgSection, OperationMessage, OperationMessageFlags};
 
     fn build_msg(
@@ -451,8 +452,8 @@ mod tests {
         response_to: Option<NonZeroI32>,
     ) -> Message {
         Message {
-            request_id,
-            response_to,
+            request_id: RequestId::new(request_id),
+            response_to: response_to.map(ResponseTo::new),
             operation: Operation::Message(OperationMessage {
                 flags,
                 sections: vec![OpMsgSection::Body(doc! { "n": request_id })],
@@ -517,9 +518,9 @@ mod tests {
         let r1 = stream.next().await.expect("first reply").expect("ok");
         let r2 = stream.next().await.expect("second reply").expect("ok");
         let r3 = stream.next().await.expect("third reply").expect("ok");
-        assert_eq!(r1.request_id, 101);
-        assert_eq!(r2.request_id, 102);
-        assert_eq!(r3.request_id, 103);
+        assert_eq!(r1.request_id, RequestId::new(101));
+        assert_eq!(r2.request_id, RequestId::new(102));
+        assert_eq!(r3.request_id, RequestId::new(103));
         assert!(more_to_come(&r1.operation));
         assert!(more_to_come(&r2.operation));
         assert!(!more_to_come(&r3.operation));
@@ -551,7 +552,7 @@ mod tests {
             .expect("call succeeds");
 
         let r = stream.next().await.expect("reply").expect("ok");
-        assert_eq!(r.request_id, 200);
+        assert_eq!(r.request_id, RequestId::new(200));
         assert!(stream.next().await.is_none());
     }
 
@@ -593,7 +594,7 @@ mod tests {
         drop(upstream);
 
         let first = stream.next().await.expect("first reply").expect("ok reply");
-        assert_eq!(first.request_id, 100);
+        assert_eq!(first.request_id, RequestId::new(100));
         assert!(more_to_come(&first.operation));
 
         let eof = stream

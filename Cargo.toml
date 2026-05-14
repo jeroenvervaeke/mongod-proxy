@@ -7,6 +7,7 @@ edition = "2024"
 bitflags = "2.9.0"
 bson = "2.15.0"
 futures = { workspace = true }
+nutype = "0.6"
 thiserror = "2.0.12"
 tokio = { workspace = true }
 tokio-util = { workspace = true }

@@ -30,7 +30,7 @@ pub enum MessageAndHeaderParseError {
     FailedToParseOperation(#[from] OperationParseError),
 }
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error)]
 pub enum MessageWriteError {
     #[error("failed to write operation: {0}")]
     FailedToWriteOperation(#[from] OperationWriteError),
@@ -51,7 +51,7 @@ impl Message {
         let actual_bytes = bytes.len();
         let expected_bytes = header.message_length as usize;
 
-        if expected_bytes < actual_bytes {
+        if actual_bytes < expected_bytes {
             return Err(MessageAndHeaderParseError::NotEnoughBytes {
                 actual: actual_bytes,
                 expected: expected_bytes,
@@ -110,17 +110,36 @@ mod tests {
     }
 
     #[rstest]
-    #[case::plain_query_request(msg_00_query_request::message(), Ok(msg_00_query_request::bytes()))]
-    #[case::plain_query_response(
-        msg_00_query_response::message(),
-        Ok(msg_00_query_response::bytes())
-    )]
-    #[case::legacy_op_query(msg_01_legacy_op_query::message(), Ok(msg_01_legacy_op_query::bytes()))]
-    #[case::legacy_op_query(msg_01_legacy_op_reply::message(), Ok(msg_01_legacy_op_reply::bytes()))]
-    fn serialize(#[case] message: Message, #[case] expected: Result<&[u8], &MessageWriteError>) {
+    #[case::plain_query_request(msg_00_query_request::message(), msg_00_query_request::bytes())]
+    #[case::plain_query_response(msg_00_query_response::message(), msg_00_query_response::bytes())]
+    #[case::legacy_op_query(msg_01_legacy_op_query::message(), msg_01_legacy_op_query::bytes())]
+    #[case::legacy_op_reply(msg_01_legacy_op_reply::message(), msg_01_legacy_op_reply::bytes())]
+    fn serialize(#[case] message: Message, #[case] expected: &[u8]) {
         let mut bytes = BytesMut::new();
-        let actual = message.write_bytes(&mut bytes).map(|_| bytes.to_vec());
+        message.write_bytes(&mut bytes).expect("write succeeds");
 
-        assert_eq!(expected, actual.as_deref());
+        assert_eq!(expected, bytes.as_ref());
+    }
+
+    #[test]
+    fn from_headers_and_bytes_errors_when_actual_lt_expected() {
+        use crate::header::MessageHeader;
+        use crate::op_code::OPCode;
+        let header = MessageHeader {
+            message_length: 100,
+            request_id: 1,
+            response_to: None,
+            op_code: OPCode::Msg,
+        };
+        // 20-byte slice but header claims 100.
+        let bytes = [0u8; 20];
+        let err = Message::from_headers_and_bytes(header, &bytes).unwrap_err();
+        match err {
+            MessageAndHeaderParseError::NotEnoughBytes { actual, expected } => {
+                assert_eq!(actual, 20);
+                assert_eq!(expected, 100);
+            }
+            other => panic!("expected NotEnoughBytes, got {other:?}"),
+        }
     }
 }

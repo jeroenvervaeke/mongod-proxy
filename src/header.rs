@@ -62,8 +62,8 @@ mod tests {
     use crate::fixtures::headers::*;
 
     #[rstest]
-    #[case::plain_request_message(op_msg_01::bytes(), Ok(op_msg_01::header()))]
-    #[case::conpressed_response_message(op_msg_02::bytes(), Ok(op_msg_02::header()))]
+    #[case::op_msg(op_msg_01::bytes(), Ok(op_msg_01::header()))]
+    #[case::op_query(op_query_01::bytes(), Ok(op_query_01::header()))]
     fn decode(
         #[case] bytes: &[u8],
         #[case] expected: Result<MessageHeader, MessageHeaderParseError>,
@@ -72,8 +72,8 @@ mod tests {
     }
 
     #[rstest]
-    #[case::plain_request_message(op_msg_01::header(), op_msg_01::bytes())]
-    #[case::conpressed_response_message(op_msg_02::header(), op_msg_02::bytes())]
+    #[case::op_msg(op_msg_01::header(), op_msg_01::bytes())]
+    #[case::op_query(op_query_01::header(), op_query_01::bytes())]
     fn encode(#[case] message: MessageHeader, #[case] expected: &[u8]) {
         let mut dst = BytesMut::new();
         message.write_bytes(&mut dst);
@@ -81,8 +81,8 @@ mod tests {
     }
 
     #[rstest]
-    #[case::plain_request_message(op_msg_01::bytes())]
-    #[case::conpressed_response_message(op_msg_02::bytes())]
+    #[case::op_msg(op_msg_01::bytes())]
+    #[case::op_query(op_query_01::bytes())]
     fn encode_decode(#[case] bytes: &[u8]) {
         let header = MessageHeader::from_bytes(bytes).expect("encode should succeed");
         let mut dst = BytesMut::new();

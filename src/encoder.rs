@@ -29,26 +29,15 @@ mod tests {
     use crate::fixtures::messages::*;
 
     #[test]
-    fn emcode() {
-        // Create a new decoder and message bytes
+    fn encode_multiple_op_msg() {
         let mut encoder = WireEncoder::default();
         let mut buf = BytesMut::new();
-        /*let mut buf = BytesMut::from(
-            [
-                msg_00_query_request::bytes(),
-                msg_00_query_response::bytes(),
-            ]
-            .concat()
-            .as_slice(),
-        );*/
 
-        // Encode the first message
         encoder
             .encode(msg_00_query_request::message(), &mut buf)
             .expect("encode succeeds");
         assert_eq!(BytesMut::from(msg_00_query_request::bytes()), buf);
 
-        // Encode the second message
         encoder
             .encode(msg_00_query_response::message(), &mut buf)
             .expect("encode succeeds");
@@ -57,6 +46,32 @@ mod tests {
                 [
                     msg_00_query_request::bytes(),
                     msg_00_query_response::bytes(),
+                ]
+                .concat()
+                .as_slice(),
+            ),
+            buf
+        );
+    }
+
+    #[test]
+    fn encode_legacy_op_query_and_reply() {
+        let mut encoder = WireEncoder::default();
+        let mut buf = BytesMut::new();
+
+        encoder
+            .encode(msg_01_legacy_op_query::message(), &mut buf)
+            .expect("encode succeeds");
+        assert_eq!(BytesMut::from(msg_01_legacy_op_query::bytes()), buf);
+
+        encoder
+            .encode(msg_01_legacy_op_reply::message(), &mut buf)
+            .expect("encode succeeds");
+        assert_eq!(
+            BytesMut::from(
+                [
+                    msg_01_legacy_op_query::bytes(),
+                    msg_01_legacy_op_reply::bytes(),
                 ]
                 .concat()
                 .as_slice(),

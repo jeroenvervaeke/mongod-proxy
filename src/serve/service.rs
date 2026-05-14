@@ -1,8 +1,4 @@
-use std::{
-    net::{SocketAddr, ToSocketAddrs},
-    pin::Pin,
-    sync::Arc,
-};
+use std::{net::SocketAddr, pin::Pin, sync::Arc};
 
 use futures::{SinkExt, StreamExt};
 use rustls_pki_types::{InvalidDnsNameError, ServerName};
@@ -25,6 +21,11 @@ use crate::{
     encoder::{WireEncoder, WireEncoderError},
     message::Message,
 };
+
+type BoxedAsyncRead = Pin<Box<dyn AsyncRead + Send + Sync + 'static>>;
+type BoxedAsyncWrite = Pin<Box<dyn AsyncWrite + Send + Sync + 'static>>;
+type ServerReader = FramedRead<BoxedAsyncRead, WireDecoder>;
+type ServerWriter = FramedWrite<BoxedAsyncWrite, WireEncoder>;
 
 pub struct Proxy<L> {
     destination_name: String,
@@ -71,7 +72,7 @@ impl<L> Proxy<L> {
     }
 
     pub fn enable_logging(self) -> Proxy<Stack<LogLayer, L>> {
-        self.layer(LogLayer::new())
+        self.layer(LogLayer)
     }
 }
 
@@ -92,14 +93,14 @@ where
     }
 
     fn call(&mut self, _req: SocketAddr) -> Self::Future {
-        let destinatino_name = self.destination_name.clone();
+        let destination_name = self.destination_name.clone();
         let destination_port = self.destination_port;
         let tls_connector = self.tls_connector.clone();
 
         let layer = self.proxy_layer.clone();
 
         ProxyClientCreationFuture(Box::pin(async move {
-            ProxyClient::forward_to(destinatino_name, destination_port, tls_connector)
+            ProxyClient::forward_to(destination_name, destination_port, tls_connector)
                 .await
                 .map(|s| layer.layer(s))
         }))
@@ -131,20 +132,18 @@ pub struct ProxyClient {
 }
 
 struct ProxyClientInner {
-    server_reader: FramedRead<Pin<Box<dyn AsyncRead + Send + Sync + 'static>>, WireDecoder>,
-    server_writer: FramedWrite<Pin<Box<dyn AsyncWrite + Send + Sync + 'static>>, WireEncoder>,
+    server_reader: ServerReader,
+    server_writer: ServerWriter,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProxyClientForwardError {
-    #[error("invalid socket address: {0}")]
-    InvalidSocketAddress(io::Error),
-    #[error("socket address not found")]
-    SocketAddressNotFound,
     #[error("failed to connect to proxied server: {0}")]
     FailedToConnectToProxiedServer(io::Error),
     #[error("invalid server name: {0}")]
     InvalidServerName(InvalidDnsNameError),
+    #[error("tls handshake failed: {0}")]
+    TlsHandshake(io::Error),
 }
 
 impl ProxyClient {
@@ -153,36 +152,25 @@ impl ProxyClient {
         destination_port: u16,
         tls_connector: Option<Arc<TlsConnector>>,
     ) -> Result<Self, ProxyClientForwardError> {
-        // convert hostname to ip address
-        // due to sharding this might change, that's why we it here
-        /*
-        let addr = (destination_name.as_str(), destination_port)
-            .to_socket_addrs()
-            .map_err(ProxyClientForwardError::InvalidSocketAddress)?
-            .next()
-            .ok_or(ProxyClientForwardError::SocketAddressNotFound)?;
-        */
         let addr = format!("{destination_name}:{destination_port}");
-        // open a tcp stream to the server
         let server_stream = TcpStream::connect(addr)
             .await
             .map_err(ProxyClientForwardError::FailedToConnectToProxiedServer)?;
 
-        // upgrade the tcp stream if nesseseary
-        let (server_reader, server_writer): (
-            Pin<Box<dyn AsyncRead + Send + Sync>>,
-            Pin<Box<dyn AsyncWrite + Send + Sync>>,
-        ) = if let Some(connector) = tls_connector {
-            let domain = ServerName::try_from(destination_name)
-                .map_err(ProxyClientForwardError::InvalidServerName)?;
-
-            let tls_stream = connector.connect(domain, server_stream).await.unwrap();
-            let (server_reader, server_writer) = split(tls_stream);
-            (Box::pin(server_reader), Box::pin(server_writer))
-        } else {
-            let (server_reader, server_writer) = server_stream.into_split();
-            (Box::pin(server_reader), Box::pin(server_writer))
-        };
+        let (server_reader, server_writer): (BoxedAsyncRead, BoxedAsyncWrite) =
+            if let Some(connector) = tls_connector {
+                let domain = ServerName::try_from(destination_name)
+                    .map_err(ProxyClientForwardError::InvalidServerName)?;
+                let tls_stream = connector
+                    .connect(domain, server_stream)
+                    .await
+                    .map_err(ProxyClientForwardError::TlsHandshake)?;
+                let (reader, writer) = split(tls_stream);
+                (Box::pin(reader), Box::pin(writer))
+            } else {
+                let (reader, writer) = server_stream.into_split();
+                (Box::pin(reader), Box::pin(writer))
+            };
 
         let server_reader = FramedRead::new(server_reader, WireDecoder::default());
         let server_writer = FramedWrite::new(server_writer, WireEncoder::default());
@@ -195,6 +183,7 @@ impl ProxyClient {
         })
     }
 }
+
 impl Service<Message> for ProxyClient {
     type Response = Message;
     type Error = ProxyClientRequestError;
@@ -205,11 +194,11 @@ impl Service<Message> for ProxyClient {
         &mut self,
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
-        if self.inner.try_lock().is_ok() {
-            std::task::Poll::Ready(Ok(()))
-        } else {
-            std::task::Poll::Pending
-        }
+        // ProxyClient owns a single upstream socket and is used by exactly one
+        // accept_client_inner task that issues request/response serially. The
+        // Arc<Mutex<...>> exists only to satisfy the 'static bound on the future;
+        // it is never contended, so always-ready is correct.
+        std::task::Poll::Ready(Ok(()))
     }
 
     fn call(&mut self, req: Message) -> Self::Future {
@@ -217,12 +206,12 @@ impl Service<Message> for ProxyClient {
         ProxyClientRequestFuture(Box::pin(async move {
             let mut inner = inner.lock().await;
             inner.server_writer.send(req).await?;
-            let response_result = inner
+            let response = inner
                 .server_reader
                 .next()
                 .await
-                .ok_or(ProxyClientRequestError::EndOfStream)?;
-            Ok(response_result?)
+                .ok_or(ProxyClientRequestError::EndOfStream)??;
+            Ok(response)
         }))
     }
 }

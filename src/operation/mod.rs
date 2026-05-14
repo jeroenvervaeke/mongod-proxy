@@ -28,7 +28,7 @@ pub enum OperationParseError {
     FailedToParseReply(#[from] OperationReplyParseError),
 }
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error)]
 pub enum OperationWriteError {
     #[error("failed to write message operation: {0}")]
     FailedToWriteOperationMessage(#[from] OperationMessageWriteError),
@@ -38,25 +38,12 @@ pub enum OperationWriteError {
     FailedToWriteOperationReply(#[from] OperationReplyWriteError),
 }
 
-impl Eq for OperationMessageWriteError {}
-
-impl PartialEq for OperationMessageWriteError {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (
-                OperationMessageWriteError::SerializeError(_),
-                OperationMessageWriteError::SerializeError(_),
-            ) => true,
-        }
-    }
-}
-
 impl Operation {
     pub fn from_bytes(op_code: OPCode, bytes: &[u8]) -> Result<Self, OperationParseError> {
         Ok(match op_code {
             OPCode::Msg => Operation::Message(OperationMessage::from_bytes(bytes)?),
             OPCode::Query => Operation::Query(OperationQuery::from_bytes(bytes)?),
-            OPCode::Replay => Operation::Reply(OperationReply::from_bytes(bytes)?),
+            OPCode::Reply => Operation::Reply(OperationReply::from_bytes(bytes)?),
         })
     }
 

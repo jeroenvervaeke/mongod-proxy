@@ -211,7 +211,6 @@ pub mod msg_01_legacy_op_reply {
                 flags: OperationReplyFlags::AWAIT_CAPABLE,
                 cursor_id: 0,
                 starting_from: 0,
-                number_returned: 1,
                 documents: vec![doc! {
                 "helloOk": true,
                 "ismaster": true,

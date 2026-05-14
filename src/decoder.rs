@@ -109,4 +109,25 @@ mod tests {
         // Make sure nothings left
         assert_eq!(None, decoder.decode(&mut buf).expect("decode succceeds"));
     }
+
+    #[test]
+    fn decode_returns_none_on_partial_header() {
+        let mut decoder = WireDecoder::default();
+        let mut buf = BytesMut::from(&[0u8; 8][..]);
+        assert_eq!(None, decoder.decode(&mut buf).expect("partial header"));
+        assert_eq!(8, buf.len(), "buffer must be preserved");
+    }
+
+    #[test]
+    fn decode_errors_on_invalid_opcode() {
+        let mut decoder = WireDecoder::default();
+        let mut header = Vec::new();
+        header.extend_from_slice(&16i32.to_le_bytes()); // length
+        header.extend_from_slice(&1i32.to_le_bytes()); // request_id
+        header.extend_from_slice(&0i32.to_le_bytes()); // response_to
+        header.extend_from_slice(&0xAAi32.to_le_bytes()); // unknown opcode
+        let mut buf = BytesMut::from(header.as_slice());
+        let err = decoder.decode(&mut buf).unwrap_err();
+        assert!(matches!(err, WireDecoderError::InvalidOpcode(_)));
+    }
 }

@@ -5,9 +5,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tower_service::Service;
+use tracing::error;
 
 use crate::{
-    decoder::WireDecoder,
+    decoder::{WireDecoder, WireDecoderError},
     encoder::{WireEncoder, WireEncoderError},
     message::Message,
 };
@@ -16,9 +17,9 @@ pub mod log;
 pub mod service;
 
 #[derive(Debug, thiserror::Error)]
-pub enum ServeError<ME: Display> {
-    #[error("create client error: {0}")]
-    CreateClientError(ME),
+pub enum ServeError {
+    #[error("failed to accept incoming connection: {0}")]
+    Accept(#[from] std::io::Error),
 }
 
 pub fn serve<M, ME, S, E>(listener: TcpListener, make_service: M) -> Serve<M, ME, S, E>
@@ -50,21 +51,19 @@ where
     S::Future: Send,
     E: Display + Send + 'static,
 {
-    type Output = Result<(), ServeError<ME>>;
+    type Output = Result<(), ServeError>;
 
-    type IntoFuture = ServeFuture<ME>;
+    type IntoFuture = ServeFuture;
 
     fn into_future(self) -> Self::IntoFuture {
         ServeFuture(Box::pin(async move { self.run().await }))
     }
 }
 
-pub struct ServeFuture<ME: Display>(
-    Pin<Box<dyn Future<Output = Result<(), ServeError<ME>>> + Send + 'static>>,
-);
+pub struct ServeFuture(Pin<Box<dyn Future<Output = Result<(), ServeError>> + Send + 'static>>);
 
-impl<ME: Display> Future for ServeFuture<ME> {
-    type Output = Result<(), ServeError<ME>>;
+impl Future for ServeFuture {
+    type Output = Result<(), ServeError>;
 
     fn poll(
         mut self: Pin<&mut Self>,
@@ -77,24 +76,31 @@ impl<ME: Display> Future for ServeFuture<ME> {
 impl<M, ME, S, E> Serve<M, ME, S, E>
 where
     M: Service<SocketAddr, Error = ME, Response = S>,
-    ME: Display,
+    ME: Display + Send + 'static,
+    M::Future: Send + 'static,
     S: Service<Message, Response = Message, Error = E> + Send + 'static,
     S::Future: Send,
     E: Display + Send + 'static,
 {
-    pub async fn run(mut self) -> Result<(), ServeError<ME>> {
+    pub async fn run(mut self) -> Result<(), ServeError> {
         loop {
-            match self.listener.accept().await {
-                Ok((client_stream, addr)) => {
-                    let service = self
-                        .make_service
-                        .call(addr)
-                        .await
-                        .map_err(ServeError::CreateClientError)?;
-                    tokio::spawn(accept_client(service, client_stream));
+            let (client_stream, addr) = match self.listener.accept().await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    error!(error = %e, "failed to accept incoming connection");
+                    continue;
                 }
-                Err(e) => println!("couldn't get client: {:?}", e),
-            }
+            };
+
+            // Build the upstream service in a dedicated task so a slow upstream
+            // connect cannot stall the accept loop.
+            let service_fut = self.make_service.call(addr);
+            tokio::spawn(async move {
+                match service_fut.await {
+                    Ok(service) => accept_client(service, client_stream).await,
+                    Err(e) => error!(error = %e, %addr, "failed to create upstream service"),
+                }
+            });
         }
     }
 }
@@ -106,16 +112,18 @@ where
     E: Display + Send + 'static,
 {
     if let Err(e) = accept_client_inner(service, client_stream).await {
-        eprintln!("error occured, stopping connection. error = {e}")
+        error!(error = %e, "connection terminated");
     }
 }
 
 #[derive(Debug, thiserror::Error)]
 enum AcceptClientError<E: Display> {
+    #[error("failed to decode wire message from client: {0}")]
+    DecodeFromClient(#[from] WireDecoderError),
     #[error("failed to forward request to server: {0}")]
     ForwardToRequestServer(E),
     #[error("failed to forward response to client: {0}")]
-    ForwardToResponseClient(WireEncoderError),
+    ForwardToResponseClient(#[from] WireEncoderError),
 }
 
 async fn accept_client_inner<S, E>(
@@ -132,16 +140,14 @@ where
     let mut client_reader = FramedRead::new(client_reader, WireDecoder::default());
     let mut client_writer = FramedWrite::new(client_writer, WireEncoder::default());
 
-    while let Some(Ok(client_req)) = client_reader.next().await {
+    while let Some(req) = client_reader.next().await {
+        let client_req = req?;
         let response = service
             .call(client_req)
             .await
             .map_err(AcceptClientError::ForwardToRequestServer)?;
 
-        client_writer
-            .send(response)
-            .await
-            .map_err(AcceptClientError::ForwardToResponseClient)?;
+        client_writer.send(response).await?;
     }
 
     Ok(())

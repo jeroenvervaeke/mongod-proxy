@@ -1,11 +1,11 @@
 use std::{net::SocketAddr, pin::Pin, sync::Arc};
 
-use futures::{SinkExt, StreamExt};
+use futures::{SinkExt, Stream, StreamExt};
 use rustls_pki_types::{InvalidDnsNameError, ServerName};
 use tokio::{
     io::{self, AsyncRead, AsyncWrite, split},
     net::TcpStream,
-    sync::Mutex,
+    sync::{Mutex, OwnedMutexGuard},
 };
 use tokio_rustls::{
     TlsConnector,
@@ -20,6 +20,7 @@ use crate::{
     decoder::{WireDecoder, WireDecoderError},
     encoder::{WireEncoder, WireEncoderError},
     message::Message,
+    operation::{Operation, op_msg::OperationMessageFlags},
 };
 
 type BoxedAsyncRead = Pin<Box<dyn AsyncRead + Send + Sync + 'static>>;
@@ -184,8 +185,86 @@ impl ProxyClient {
     }
 }
 
+/// Returns true if `op` is an OP_MSG carrying the moreToCome flag.
+///
+/// On a *request* this means fire-and-forget: the server will not reply.
+/// On a *response* it means another reply will follow on the same socket.
+fn more_to_come(op: &Operation) -> bool {
+    matches!(
+        op,
+        Operation::Message(m) if m.flags.contains(OperationMessageFlags::MORE_TO_COME)
+    )
+}
+
+/// Stream of upstream replies for a single client request.
+///
+/// In the common case this yields exactly one message and then `None`. When
+/// the upstream sets `moreToCome` on its reply (streaming SDAM / exhaust
+/// cursors), the stream keeps yielding until a terminal message arrives.
+/// For fire-and-forget requests the stream is empty.
+///
+/// The stream owns the upstream mutex guard for its lifetime, which prevents
+/// other request/response pairs on the same `ProxyClient` from interleaving
+/// with an in-flight streamed reply.
+pub struct ProxyResponseStream {
+    state: ProxyResponseStreamState,
+}
+
+enum ProxyResponseStreamState {
+    /// No further reads expected (fire-and-forget request or stream done).
+    Done,
+    /// Holding the upstream guard; reads from `server_reader`.
+    Streaming(OwnedMutexGuard<ProxyClientInner>),
+}
+
+impl ProxyResponseStream {
+    fn empty() -> Self {
+        Self {
+            state: ProxyResponseStreamState::Done,
+        }
+    }
+
+    fn streaming(guard: OwnedMutexGuard<ProxyClientInner>) -> Self {
+        Self {
+            state: ProxyResponseStreamState::Streaming(guard),
+        }
+    }
+}
+
+impl Stream for ProxyResponseStream {
+    type Item = Result<Message, ProxyClientRequestError>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let guard = match &mut self.state {
+            ProxyResponseStreamState::Done => return std::task::Poll::Ready(None),
+            ProxyResponseStreamState::Streaming(guard) => guard,
+        };
+
+        match guard.server_reader.poll_next_unpin(cx) {
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Ready(None) => {
+                self.state = ProxyResponseStreamState::Done;
+                std::task::Poll::Ready(Some(Err(ProxyClientRequestError::EndOfStream)))
+            }
+            std::task::Poll::Ready(Some(Err(e))) => {
+                self.state = ProxyResponseStreamState::Done;
+                std::task::Poll::Ready(Some(Err(e.into())))
+            }
+            std::task::Poll::Ready(Some(Ok(msg))) => {
+                if !more_to_come(&msg.operation) {
+                    self.state = ProxyResponseStreamState::Done;
+                }
+                std::task::Poll::Ready(Some(Ok(msg)))
+            }
+        }
+    }
+}
+
 impl Service<Message> for ProxyClient {
-    type Response = Message;
+    type Response = ProxyResponseStream;
     type Error = ProxyClientRequestError;
 
     type Future = ProxyClientRequestFuture;
@@ -203,15 +282,16 @@ impl Service<Message> for ProxyClient {
 
     fn call(&mut self, req: Message) -> Self::Future {
         let inner = self.inner.clone();
+        let fire_and_forget = more_to_come(&req.operation);
         ProxyClientRequestFuture(Box::pin(async move {
-            let mut inner = inner.lock().await;
-            inner.server_writer.send(req).await?;
-            let response = inner
-                .server_reader
-                .next()
-                .await
-                .ok_or(ProxyClientRequestError::EndOfStream)??;
-            Ok(response)
+            let mut guard = inner.lock_owned().await;
+            guard.server_writer.send(req).await?;
+            if fire_and_forget {
+                drop(guard);
+                Ok(ProxyResponseStream::empty())
+            } else {
+                Ok(ProxyResponseStream::streaming(guard))
+            }
         }))
     }
 }
@@ -229,16 +309,194 @@ pub enum ProxyClientRequestError {
 }
 
 pub struct ProxyClientRequestFuture(
-    Pin<Box<dyn Future<Output = Result<Message, ProxyClientRequestError>> + Send + 'static>>,
+    Pin<
+        Box<
+            dyn Future<Output = Result<ProxyResponseStream, ProxyClientRequestError>>
+                + Send
+                + 'static,
+        >,
+    >,
 );
 
 impl Future for ProxyClientRequestFuture {
-    type Output = Result<Message, ProxyClientRequestError>;
+    type Output = Result<ProxyResponseStream, ProxyClientRequestError>;
 
     fn poll(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         self.0.as_mut().poll(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroI32;
+
+    use bson::doc;
+    use futures::StreamExt;
+    use tokio::io::{AsyncWriteExt, duplex};
+    use tokio_util::bytes::BytesMut;
+
+    use super::*;
+    use crate::operation::op_msg::{OperationMessage, OperationMessageFlags};
+
+    fn build_msg(
+        flags: OperationMessageFlags,
+        request_id: i32,
+        response_to: Option<NonZeroI32>,
+    ) -> Message {
+        Message {
+            request_id,
+            response_to,
+            operation: Operation::Message(OperationMessage {
+                flags,
+                sections: doc! { "n": request_id },
+                checksum: None,
+            }),
+        }
+    }
+
+    /// Build a `ProxyClient` whose upstream socket is a `duplex` pipe so tests
+    /// can script byte-level reply sequences without touching the network.
+    fn proxy_against_duplex() -> (ProxyClient, tokio::io::DuplexStream) {
+        let (upstream_side, proxy_side) = duplex(64 * 1024);
+        let (proxy_read, proxy_write) = tokio::io::split(proxy_side);
+
+        let server_reader = FramedRead::new(
+            Box::pin(proxy_read) as BoxedAsyncRead,
+            WireDecoder::default(),
+        );
+        let server_writer = FramedWrite::new(
+            Box::pin(proxy_write) as BoxedAsyncWrite,
+            WireEncoder::default(),
+        );
+
+        let client = ProxyClient {
+            inner: Arc::new(Mutex::new(ProxyClientInner {
+                server_reader,
+                server_writer,
+            })),
+        };
+        (client, upstream_side)
+    }
+
+    fn encode_messages(messages: &[Message]) -> Vec<u8> {
+        let mut buf = BytesMut::new();
+        for m in messages {
+            m.write_bytes(&mut buf).expect("encode succeeds");
+        }
+        buf.to_vec()
+    }
+
+    #[tokio::test]
+    async fn streaming_response_yields_until_terminal_reply() {
+        let (mut client, mut upstream) = proxy_against_duplex();
+
+        let replies = vec![
+            build_msg(OperationMessageFlags::MORE_TO_COME, 101, NonZeroI32::new(1)),
+            build_msg(OperationMessageFlags::MORE_TO_COME, 102, NonZeroI32::new(1)),
+            build_msg(OperationMessageFlags::empty(), 103, NonZeroI32::new(1)),
+        ];
+        let bytes = encode_messages(&replies);
+        // Push the scripted replies onto the upstream side. Spawn so the
+        // proxy can begin reading concurrently.
+        tokio::spawn(async move {
+            upstream.write_all(&bytes).await.expect("upstream write");
+        });
+
+        let req = build_msg(OperationMessageFlags::empty(), 1, None);
+        let mut stream = <ProxyClient as Service<Message>>::call(&mut client, req)
+            .await
+            .expect("call succeeds");
+
+        let r1 = stream.next().await.expect("first reply").expect("ok");
+        let r2 = stream.next().await.expect("second reply").expect("ok");
+        let r3 = stream.next().await.expect("third reply").expect("ok");
+        assert_eq!(r1.request_id, 101);
+        assert_eq!(r2.request_id, 102);
+        assert_eq!(r3.request_id, 103);
+        assert!(more_to_come(&r1.operation));
+        assert!(more_to_come(&r2.operation));
+        assert!(!more_to_come(&r3.operation));
+
+        // After the terminal reply the stream must complete.
+        assert!(
+            stream.next().await.is_none(),
+            "stream must end after non-MORE_TO_COME reply"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_reply_response_completes_after_one_message() {
+        let (mut client, mut upstream) = proxy_against_duplex();
+
+        let replies = vec![build_msg(
+            OperationMessageFlags::empty(),
+            200,
+            NonZeroI32::new(1),
+        )];
+        let bytes = encode_messages(&replies);
+        tokio::spawn(async move {
+            upstream.write_all(&bytes).await.expect("upstream write");
+        });
+
+        let req = build_msg(OperationMessageFlags::empty(), 1, None);
+        let mut stream = <ProxyClient as Service<Message>>::call(&mut client, req)
+            .await
+            .expect("call succeeds");
+
+        let r = stream.next().await.expect("reply").expect("ok");
+        assert_eq!(r.request_id, 200);
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn fire_and_forget_request_returns_empty_stream() {
+        let (mut client, _upstream) = proxy_against_duplex();
+
+        // Request carries MORE_TO_COME -> server will not reply, proxy must
+        // return an empty response stream rather than blocking on a read.
+        let req = build_msg(OperationMessageFlags::MORE_TO_COME, 1, None);
+        let mut stream = <ProxyClient as Service<Message>>::call(&mut client, req)
+            .await
+            .expect("call succeeds");
+
+        assert!(
+            stream.next().await.is_none(),
+            "fire-and-forget request must produce no reply"
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_eof_mid_stream_surfaces_as_end_of_stream_error() {
+        let (mut client, mut upstream) = proxy_against_duplex();
+
+        let req = build_msg(OperationMessageFlags::empty(), 1, None);
+        let mut stream = <ProxyClient as Service<Message>>::call(&mut client, req)
+            .await
+            .expect("call succeeds");
+
+        // Send one MORE_TO_COME reply then close the upstream socket without
+        // ever sending the terminal reply.
+        let partial = encode_messages(&[build_msg(
+            OperationMessageFlags::MORE_TO_COME,
+            100,
+            NonZeroI32::new(1),
+        )]);
+        upstream.write_all(&partial).await.expect("write reply");
+        upstream.shutdown().await.expect("shutdown");
+        drop(upstream);
+
+        let first = stream.next().await.expect("first reply").expect("ok reply");
+        assert_eq!(first.request_id, 100);
+        assert!(more_to_come(&first.operation));
+
+        let eof = stream
+            .next()
+            .await
+            .expect("stream yields the EOF before terminating");
+        assert!(matches!(eof, Err(ProxyClientRequestError::EndOfStream)));
+        assert!(stream.next().await.is_none());
     }
 }

@@ -127,17 +127,15 @@ done
 log "driving traffic through the proxy"
 # Every command below MUST flow through the proxy. We deliberately use raw
 # `runCommand` calls rather than the helper methods on Collection (findOne,
-# insertMany, etc.) so that:
-#   * each command produces exactly one OP_MSG request + one OP_MSG response
-#     (no driver-side exhaust-cursor optimisation that would stream multiple
-#     replies per request -- the proxy does not yet support that mode)
-#   * the command name appearing in the proxy log is unambiguous
-#   * we can drive explicit getMore round-trips
+# insertMany, etc.) so that each command produces exactly one named OP_MSG
+# request, the command name appearing in the proxy log is unambiguous, and
+# explicit getMore round-trips are emitted.
 #
-# `serverMonitoringMode=poll` disables streaming SDAM (awaitable hello /
-# exhaust-allowed monitoring), which the proxy cannot currently shepherd.
-# `directConnection=true` skips replica-set topology discovery.
-PROXY_URI="mongodb://127.0.0.1:${PROXY_PORT}/?serverMonitoringMode=poll&directConnection=true"
+# `directConnection=true` keeps the driver from doing replica-set topology
+# discovery beyond the host we point it at. Streaming-SDAM (awaitable hello
+# with EXHAUST_ALLOWED + moreToCome) is intentionally *left enabled* so the
+# proxy's multi-reply handling gets exercised by every run.
+PROXY_URI="mongodb://127.0.0.1:${PROXY_PORT}/?directConnection=true"
 set +e
 docker exec -i "$MONGO_CONTAINER" mongosh --quiet "$PROXY_URI" >/dev/null <<'EOF'
 const adminDb = db.getSiblingDB('admin');

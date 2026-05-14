@@ -1,9 +1,11 @@
+use std::pin::Pin;
+
 use crate::message::Message;
 use crate::operation::Operation;
-use futures::{TryFutureExt, future::MapOk};
+use futures::Stream;
 use tower_layer::Layer;
 use tower_service::Service;
-use tracing::{Instrument, info, instrument::Instrumented};
+use tracing::info;
 
 #[derive(Clone, Default)]
 pub struct LogLayer;
@@ -20,14 +22,16 @@ pub struct LogService<S> {
     service: S,
 }
 
-impl<S> Service<Message> for LogService<S>
+impl<S, St, E> Service<Message> for LogService<S>
 where
-    S: Service<Message, Response = Message> + Send,
-    S::Future: Send,
+    S: Service<Message, Response = St, Error = E>,
+    S::Future: Send + 'static,
+    St: Stream<Item = Result<Message, E>> + Unpin + Send + 'static,
+    E: Send + 'static,
 {
-    type Response = S::Response;
-    type Error = S::Error;
-    type Future = Instrumented<MapOk<S::Future, fn(S::Response) -> S::Response>>;
+    type Response = LoggedStream<St>;
+    type Error = E;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, E>> + Send + 'static>>;
 
     fn poll_ready(
         &mut self,
@@ -37,35 +41,59 @@ where
     }
 
     fn call(&mut self, req: Message) -> Self::Future {
-        let op_kind = op_kind(&req.operation);
-        let command = command_name(&req.operation).unwrap_or("");
         info!(
             direction = "request",
-            op = op_kind,
-            command,
+            op = op_kind(&req.operation),
+            command = command_name(&req.operation).unwrap_or(""),
             request_id = req.request_id,
             ?req,
             "received request"
         );
 
-        self.service
-            .call(req)
-            .map_ok(log_message as fn(S::Response) -> S::Response)
-            .in_current_span()
+        let fut = self.service.call(req);
+        Box::pin(async move {
+            let inner = fut.await?;
+            Ok(LoggedStream { inner })
+        })
     }
 }
 
-fn log_message(message: Message) -> Message {
-    let op_kind = op_kind(&message.operation);
-    info!(
-        direction = "response",
-        op = op_kind,
-        request_id = message.response_to,
-        response_id = message.request_id,
-        ?message,
-        "received response"
-    );
-    message
+/// Wraps a stream of upstream replies and logs each one as it is yielded.
+///
+/// `LoggedStream` is `Unpin` whenever its inner stream is, so no pin projection
+/// (and therefore no `unsafe`) is needed: `Pin::new(&mut self.inner)` is sound
+/// because the inner field is `Unpin`.
+pub struct LoggedStream<St> {
+    inner: St,
+}
+
+impl<St, E> Stream for LoggedStream<St>
+where
+    St: Stream<Item = Result<Message, E>> + Unpin,
+{
+    type Item = Result<Message, E>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        match Pin::new(&mut self.inner).poll_next(cx) {
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+            std::task::Poll::Ready(Some(Ok(message))) => {
+                info!(
+                    direction = "response",
+                    op = op_kind(&message.operation),
+                    request_id = message.response_to,
+                    response_id = message.request_id,
+                    ?message,
+                    "received response"
+                );
+                std::task::Poll::Ready(Some(Ok(message)))
+            }
+            std::task::Poll::Ready(Some(Err(e))) => std::task::Poll::Ready(Some(Err(e))),
+        }
+    }
 }
 
 fn op_kind(op: &Operation) -> &'static str {

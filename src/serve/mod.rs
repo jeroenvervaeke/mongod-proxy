@@ -1,6 +1,6 @@
 use std::{fmt::Display, marker::PhantomData, net::SocketAddr, pin::Pin};
 
-use futures::sink::SinkExt;
+use futures::{Stream, sink::SinkExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, FramedWrite};
@@ -22,12 +22,13 @@ pub enum ServeError {
     Accept(#[from] std::io::Error),
 }
 
-pub fn serve<M, ME, S, E>(listener: TcpListener, make_service: M) -> Serve<M, ME, S, E>
+pub fn serve<M, ME, S, E, St>(listener: TcpListener, make_service: M) -> Serve<M, ME, S, E, St>
 where
     M: Service<SocketAddr, Error = ME, Response = S>,
     ME: Display,
-    S: Service<Message, Response = Message, Error = E> + Send + 'static,
+    S: Service<Message, Response = St, Error = E> + Send + 'static,
     S::Future: Send,
+    St: Stream<Item = Result<Message, E>> + Send + Unpin + 'static,
 {
     Serve {
         listener,
@@ -36,19 +37,20 @@ where
     }
 }
 
-pub struct Serve<M, ME, S, E> {
+pub struct Serve<M, ME, S, E, St> {
     listener: TcpListener,
     make_service: M,
-    _marker: PhantomData<(ME, S, E)>,
+    _marker: PhantomData<(ME, S, E, St)>,
 }
 
-impl<M, ME, S, E> IntoFuture for Serve<M, ME, S, E>
+impl<M, ME, S, E, St> IntoFuture for Serve<M, ME, S, E, St>
 where
     M: Service<SocketAddr, Error = ME, Response = S> + Send + 'static,
     M::Future: Send,
     ME: Display + Send + 'static,
-    S: Service<Message, Response = Message, Error = E> + Send + 'static,
+    S: Service<Message, Response = St, Error = E> + Send + 'static,
     S::Future: Send,
+    St: Stream<Item = Result<Message, E>> + Send + Unpin + 'static,
     E: Display + Send + 'static,
 {
     type Output = Result<(), ServeError>;
@@ -73,13 +75,14 @@ impl Future for ServeFuture {
     }
 }
 
-impl<M, ME, S, E> Serve<M, ME, S, E>
+impl<M, ME, S, E, St> Serve<M, ME, S, E, St>
 where
     M: Service<SocketAddr, Error = ME, Response = S>,
     ME: Display + Send + 'static,
     M::Future: Send + 'static,
-    S: Service<Message, Response = Message, Error = E> + Send + 'static,
+    S: Service<Message, Response = St, Error = E> + Send + 'static,
     S::Future: Send,
+    St: Stream<Item = Result<Message, E>> + Send + Unpin + 'static,
     E: Display + Send + 'static,
 {
     pub async fn run(mut self) -> Result<(), ServeError> {
@@ -105,10 +108,11 @@ where
     }
 }
 
-async fn accept_client<S, E>(service: S, client_stream: TcpStream)
+async fn accept_client<S, St, E>(service: S, client_stream: TcpStream)
 where
-    S: Service<Message, Response = Message, Error = E> + Send + 'static,
+    S: Service<Message, Response = St, Error = E> + Send + 'static,
     S::Future: Send,
+    St: Stream<Item = Result<Message, E>> + Send + Unpin + 'static,
     E: Display + Send + 'static,
 {
     if let Err(e) = accept_client_inner(service, client_stream).await {
@@ -126,13 +130,14 @@ enum AcceptClientError<E: Display> {
     ForwardToResponseClient(#[from] WireEncoderError),
 }
 
-async fn accept_client_inner<S, E>(
+async fn accept_client_inner<S, St, E>(
     mut service: S,
     client_stream: TcpStream,
 ) -> Result<(), AcceptClientError<E>>
 where
-    S: Service<Message, Response = Message, Error = E> + Send + 'static,
+    S: Service<Message, Response = St, Error = E> + Send + 'static,
     S::Future: Send,
+    St: Stream<Item = Result<Message, E>> + Send + Unpin + 'static,
     E: Display + Send + 'static,
 {
     let (client_reader, client_writer) = client_stream.into_split();
@@ -142,12 +147,19 @@ where
 
     while let Some(req) = client_reader.next().await {
         let client_req = req?;
-        let response = service
+        let mut response_stream = service
             .call(client_req)
             .await
             .map_err(AcceptClientError::ForwardToRequestServer)?;
 
-        client_writer.send(response).await?;
+        // Forward every reply the upstream produces for this request. In the
+        // common case there is exactly one. In streaming-SDAM / exhaust mode
+        // the upstream emits multiple replies (each with moreToCome) and we
+        // must shuttle every one to the client until the terminal reply.
+        while let Some(resp) = response_stream.next().await {
+            let resp = resp.map_err(AcceptClientError::ForwardToRequestServer)?;
+            client_writer.send(resp).await?;
+        }
     }
 
     Ok(())

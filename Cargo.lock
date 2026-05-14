@@ -1459,6 +1459,7 @@ checksum = "224484c5d09285a7b8cb0a0c117e847ebd14cb6e4470ecf68cdb89c503b0edb9"
 name = "mongod-proxy"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "atlas-local",
  "bitflags",
  "bollard",
@@ -1470,6 +1471,7 @@ dependencies = [
  "pretty_assertions",
  "rstest",
  "rustls-pki-types",
+ "scopeguard",
  "serde",
  "thiserror 2.0.18",
  "tokio",
@@ -1479,6 +1481,7 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
+ "tracing-subscriber",
  "webpki-roots",
 ]
 

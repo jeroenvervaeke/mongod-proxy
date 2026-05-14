@@ -21,6 +21,7 @@ use crate::{
     message::Message,
 };
 
+pub mod explain;
 pub mod log;
 pub mod service;
 

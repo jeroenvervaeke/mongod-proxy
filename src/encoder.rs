@@ -18,7 +18,7 @@ use crate::message::{Message, MessageWriteError};
 /// use mongod_proxy::encoder::WireEncoder;
 /// use mongod_proxy::message::Message;
 /// use mongod_proxy::operation::Operation;
-/// use mongod_proxy::operation::op_msg::{OperationMessage, OperationMessageFlags};
+/// use mongod_proxy::operation::op_msg::{OpMsgSection, OperationMessage, OperationMessageFlags};
 /// use tokio_util::bytes::BytesMut;
 /// use tokio_util::codec::Encoder;
 ///
@@ -27,7 +27,7 @@ use crate::message::{Message, MessageWriteError};
 ///     response_to: None,
 ///     operation: Operation::Message(OperationMessage {
 ///         flags: OperationMessageFlags::empty(),
-///         sections: doc! { "ping": 1 },
+///         sections: vec![OpMsgSection::Body(doc! { "ping": 1 })],
 ///         checksum: None,
 ///     }),
 /// };

@@ -7,7 +7,11 @@
 //! request/response forwarding, modelled as a stream so it can handle
 //! moreToCome multi-reply traffic.
 
-use std::{net::SocketAddr, pin::Pin, sync::Arc};
+use std::{
+    net::SocketAddr,
+    pin::Pin,
+    sync::{Arc, Once},
+};
 
 use futures::{SinkExt, Stream, StreamExt};
 use rustls_pki_types::{InvalidDnsNameError, ServerName};
@@ -32,6 +36,20 @@ use crate::{
     operation::{Operation, op_msg::OperationMessageFlags},
 };
 
+/// Ensures rustls has a usable [`CryptoProvider`](tokio_rustls::rustls::crypto::CryptoProvider).
+///
+/// rustls 0.23+ refuses to pick a provider when more than one is compiled
+/// in (which happens whenever transitive dependencies enable both the `ring`
+/// and `aws-lc-rs` features — common in mixed dependency trees). We pick
+/// `aws_lc_rs` deterministically here. `install_default` errors after the
+/// first successful install, so we ignore the error to be idempotent.
+fn install_default_crypto_provider() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
+
 type BoxedAsyncRead = Pin<Box<dyn AsyncRead + Send + Sync + 'static>>;
 type BoxedAsyncWrite = Pin<Box<dyn AsyncWrite + Send + Sync + 'static>>;
 type ServerReader = FramedRead<BoxedAsyncRead, WireDecoder>;
@@ -52,7 +70,9 @@ type ServerWriter = FramedWrite<BoxedAsyncWrite, WireEncoder>;
 /// ```
 /// use mongod_proxy::{LogLayer, Proxy};
 ///
-/// let proxy = Proxy::new("mongo.example.com", 27017, /* use_tls = */ true)
+/// // For the doctest we pass `use_tls = false` to avoid a network-dependent
+/// // rustls config; switch to `true` to forward over TLS in real use.
+/// let proxy = Proxy::new("mongo.example.com", 27017, /* use_tls = */ false)
 ///     .layer(LogLayer);
 /// // `proxy` is now a `Service<SocketAddr>` ready to hand to `serve(...)`.
 /// # let _ = proxy;
@@ -75,6 +95,7 @@ impl Proxy<Identity> {
     /// plain TCP.
     pub fn new(destination_name: impl Into<String>, destination_port: u16, use_tls: bool) -> Self {
         let tls_connector = if use_tls {
+            install_default_crypto_provider();
             let mut root_cert_store = RootCertStore::empty();
             root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
             let mut config = ClientConfig::builder()
@@ -422,7 +443,7 @@ mod tests {
     use tokio_util::bytes::BytesMut;
 
     use super::*;
-    use crate::operation::op_msg::{OperationMessage, OperationMessageFlags};
+    use crate::operation::op_msg::{OpMsgSection, OperationMessage, OperationMessageFlags};
 
     fn build_msg(
         flags: OperationMessageFlags,
@@ -434,7 +455,7 @@ mod tests {
             response_to,
             operation: Operation::Message(OperationMessage {
                 flags,
-                sections: doc! { "n": request_id },
+                sections: vec![OpMsgSection::Body(doc! { "n": request_id })],
                 checksum: None,
             }),
         }

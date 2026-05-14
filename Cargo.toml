@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 bitflags = "2.9.0"
-bson = "2.14.0"
+bson = "2.15.0"
 futures = { workspace = true }
 thiserror = "2.0.12"
 tokio = { workspace = true }
@@ -22,6 +22,8 @@ hickory-resolver = "0.25.2"
 [dev-dependencies]
 pretty_assertions = "1.4.1"
 rstest = "0.25.0"
+bollard = "0.18"
+mongodb = { version = "3.1" }
 
 [workspace]
 members = [".", "logger"]

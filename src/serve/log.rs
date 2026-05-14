@@ -139,11 +139,14 @@ fn op_kind(op: &Operation) -> &'static str {
 }
 
 /// Returns the BSON command name driving this operation, when one is identifiable.
-/// For OP_MSG/OP_QUERY the convention is that the first key of the body document
-/// is the command name (e.g. "find", "insert", "hello").
+///
+/// For OP_MSG the convention is that the first key of the first body section
+/// is the command name (e.g. `"find"`, `"insert"`, `"hello"`). For OP_QUERY
+/// the first key of the query document is used. Server replies (OP_REPLY)
+/// don't carry a command name.
 fn command_name(op: &Operation) -> Option<&str> {
     match op {
-        Operation::Message(m) => m.sections.keys().next().map(String::as_str),
+        Operation::Message(m) => m.command_name(),
         Operation::Query(q) => q.query.keys().next().map(String::as_str),
         Operation::Reply(_) => None,
     }

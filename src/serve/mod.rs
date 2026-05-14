@@ -1,3 +1,11 @@
+//! Runtime that drives the proxy: an accept loop, per-connection upstream
+//! services, and the tower [`Service`] glue that ties them together.
+//!
+//! Most consumers only need [`serve`] together with
+//! [`Proxy`](crate::Proxy) / [`LogLayer`](crate::LogLayer). The lower-level
+//! [`service`] module is exposed for users who want to build their own
+//! upstream service.
+
 use std::{fmt::Display, marker::PhantomData, net::SocketAddr, pin::Pin};
 
 use futures::{Stream, sink::SinkExt};
@@ -16,12 +24,41 @@ use crate::{
 pub mod log;
 pub mod service;
 
+/// Failure modes for the [`Serve`] future.
+///
+/// Per-connection failures (parse errors, upstream disconnects, etc.) are
+/// logged and do *not* terminate the run; only catastrophic accept-loop
+/// failures bubble up here.
 #[derive(Debug, thiserror::Error)]
 pub enum ServeError {
+    /// `TcpListener::accept` returned an unrecoverable error.
     #[error("failed to accept incoming connection: {0}")]
     Accept(#[from] std::io::Error),
 }
 
+/// Constructs a [`Serve`] that drives `listener` against the upstream
+/// `make_service` factory.
+///
+/// `make_service` is a tower [`Service<SocketAddr>`] that produces a fresh
+/// per-connection [`Service<Message>`] for each accepted client. In typical
+/// use, that is a [`Proxy`](crate::Proxy) (optionally with a
+/// [`LogLayer`](crate::LogLayer) chained on).
+///
+/// The returned [`Serve`] is a `Future` (also a manually polled struct) that
+/// loops forever accepting connections. Drop it to stop accepting.
+///
+/// # Examples
+///
+/// ```no_run
+/// use mongod_proxy::{LogLayer, Proxy, serve};
+/// use tokio::net::TcpListener;
+///
+/// # async fn run() {
+/// let listener = TcpListener::bind("127.0.0.1:27018").await.unwrap();
+/// let proxy = Proxy::new("127.0.0.1", 27017, false).layer(LogLayer);
+/// serve(listener, proxy).await.unwrap();
+/// # }
+/// ```
 pub fn serve<M, ME, S, E, St>(listener: TcpListener, make_service: M) -> Serve<M, ME, S, E, St>
 where
     M: Service<SocketAddr, Error = ME, Response = S>,
@@ -37,6 +74,12 @@ where
     }
 }
 
+/// Long-running future returned by [`serve`].
+///
+/// Holds the listener and the upstream make-service. Implements both
+/// [`IntoFuture`] (so it can be `.await`ed directly) and exposes a manual
+/// [`Serve::run`] for callers who want explicit error handling without going
+/// through the boxed-future indirection.
 pub struct Serve<M, ME, S, E, St> {
     listener: TcpListener,
     make_service: M,
@@ -62,6 +105,10 @@ where
     }
 }
 
+/// Concrete boxed future returned by [`Serve::into_future`].
+///
+/// Hand-rolled rather than using `BoxFuture` so the type appears in
+/// documentation and call sites without an opaque `impl Future`.
 pub struct ServeFuture(Pin<Box<dyn Future<Output = Result<(), ServeError>> + Send + 'static>>);
 
 impl Future for ServeFuture {
@@ -85,6 +132,17 @@ where
     St: Stream<Item = Result<Message, E>> + Send + Unpin + 'static,
     E: Display + Send + 'static,
 {
+    /// Runs the accept loop until the listener errors out fatally.
+    ///
+    /// For each accepted TCP connection the upstream service is built in a
+    /// dedicated tokio task so a slow upstream connect cannot stall the
+    /// accept loop. Once the upstream service is ready, the per-connection
+    /// forwarding loop runs in the same spawned task.
+    ///
+    /// # Errors
+    ///
+    /// Returns once `TcpListener::accept` itself fails. Per-connection
+    /// errors are logged via `tracing::error!` and never bubble up.
     pub async fn run(mut self) -> Result<(), ServeError> {
         loop {
             let (client_stream, addr) = match self.listener.accept().await {

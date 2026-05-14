@@ -1,3 +1,26 @@
+//! Tower layer that logs every parsed request and reply.
+//!
+//! [`LogLayer`] wraps any inner [`Service<Message, Response = St>`] (where
+//! `St` is a [`Stream`] of replies) and emits a structured `tracing::info!`
+//! event for each request entering the layer and each reply yielded by the
+//! response stream. The events include:
+//!
+//! * `direction` — `"request"` or `"response"`
+//! * `op` — `"OP_MSG"` / `"OP_QUERY"` / `"OP_REPLY"`
+//! * `command` — the first BSON key of the body (e.g. `"find"`, `"insert"`),
+//!   when one is identifiable
+//! * `request_id` / `response_id` — message identifiers
+//! * `req` / `message` — full [`Debug`](std::fmt::Debug) of the [`Message`]
+//!
+//! # Examples
+//!
+//! ```
+//! use mongod_proxy::{LogLayer, Proxy};
+//!
+//! let proxy = Proxy::new("127.0.0.1", 27017, false).layer(LogLayer);
+//! # let _ = proxy;
+//! ```
+
 use std::pin::Pin;
 
 use crate::message::Message;
@@ -7,6 +30,11 @@ use tower_layer::Layer;
 use tower_service::Service;
 use tracing::info;
 
+/// Tower [`Layer`] that wraps a service in [`LogService`].
+///
+/// `LogLayer` is a unit struct: it has no configuration. If you need
+/// per-instance settings (sampling, redaction, log level overrides) build
+/// your own layer following the same pattern.
 #[derive(Clone, Default)]
 pub struct LogLayer;
 
@@ -18,6 +46,12 @@ impl<S> Layer<S> for LogLayer {
     }
 }
 
+/// [`Service`] produced by [`LogLayer`].
+///
+/// Logs requests on the way in and replies on the way out, then delegates
+/// to the wrapped inner service. The reply stream is transparently
+/// re-wrapped in a [`LoggedStream`] so streamed responses (moreToCome
+/// chains) get one event per intermediate reply.
 pub struct LogService<S> {
     service: S,
 }

@@ -1,3 +1,6 @@
+//! [`tokio_util::codec::Decoder`] implementation that frames a TCP byte
+//! stream into typed [`Message`] values.
+
 use tokio_util::{bytes::BytesMut, codec::Decoder};
 
 use crate::{
@@ -6,17 +9,61 @@ use crate::{
     op_code::OPCodeParseError,
 };
 
+/// Stateful decoder that turns a stream of wire-protocol bytes into
+/// [`Message`] values.
+///
+/// Combine with [`tokio_util::codec::FramedRead`] to read messages off an
+/// `AsyncRead` (typically a `TcpStream` half).
+///
+/// The decoder is bounded-memory: it parses the header lazily and caches it
+/// until the rest of the frame has been received. If the buffer doesn't yet
+/// contain a full header or full body, `decode` returns `Ok(None)` and
+/// `FramedRead` will call again after more bytes arrive.
+///
+/// # Examples
+///
+/// ```
+/// use bson::doc;
+/// use mongod_proxy::decoder::WireDecoder;
+/// use mongod_proxy::message::Message;
+/// use mongod_proxy::operation::Operation;
+/// use mongod_proxy::operation::op_msg::{OperationMessage, OperationMessageFlags};
+/// use tokio_util::bytes::BytesMut;
+/// use tokio_util::codec::Decoder;
+///
+/// // Build a frame to feed in.
+/// let msg = Message {
+///     request_id: 1,
+///     response_to: None,
+///     operation: Operation::Message(OperationMessage {
+///         flags: OperationMessageFlags::empty(),
+///         sections: doc! { "ping": 1 },
+///         checksum: None,
+///     }),
+/// };
+/// let mut buf = BytesMut::new();
+/// msg.write_bytes(&mut buf).unwrap();
+///
+/// let mut decoder = WireDecoder::default();
+/// let decoded = decoder.decode(&mut buf).unwrap().unwrap();
+/// assert_eq!(decoded.request_id, 1);
+/// assert!(buf.is_empty());
+/// ```
 #[derive(Debug, Default)]
 pub struct WireDecoder {
     next_header: Option<MessageHeader>,
 }
 
+/// Failure modes emitted by [`WireDecoder`].
 #[derive(Debug, thiserror::Error)]
 pub enum WireDecoderError {
+    /// Underlying [`std::io::Error`] surfaced by [`tokio_util::codec`].
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
+    /// Header carried an opcode the proxy does not implement.
     #[error("invalid opcode: {0}")]
     InvalidOpcode(#[from] OPCodeParseError),
+    /// The frame body could not be parsed against the header's opcode.
     #[error("failed to parse message: {0}")]
     MessageParse(#[from] MessageAndHeaderParseError),
 }

@@ -1,30 +1,94 @@
+//! The fixed-size 16-byte header that prefixes every wire-protocol frame.
+
 use std::num::NonZeroI32;
 
 use tokio_util::bytes::BytesMut;
 
 use crate::op_code::{OPCode, OPCodeParseError};
 
+/// Standard MongoDB wire-protocol message header.
+///
+/// Every frame on the wire begins with this header. Layout (little-endian
+/// throughout):
+///
+/// | offset | size | field              |
+/// |-------:|-----:|--------------------|
+/// | 0      | 4    | `message_length`   |
+/// | 4      | 4    | `request_id`       |
+/// | 8      | 4    | `response_to`      |
+/// | 12     | 4    | `op_code`          |
+///
+/// `message_length` is the *total* size of the frame including these 16 bytes.
+/// `response_to` is zero on a fresh request (modelled here as `None`) or the
+/// originating `request_id` on a reply (modelled as `Some(NonZeroI32)`).
+///
+/// # Examples
+///
+/// ```
+/// use mongod_proxy::header::MessageHeader;
+/// use mongod_proxy::op_code::OPCode;
+/// use std::num::NonZeroI32;
+/// use tokio_util::bytes::BytesMut;
+///
+/// let header = MessageHeader {
+///     message_length: 32,
+///     request_id: 7,
+///     response_to: NonZeroI32::new(3),
+///     op_code: OPCode::Msg,
+/// };
+/// let mut buf = BytesMut::new();
+/// header.write_bytes(&mut buf);
+/// assert_eq!(buf.len(), MessageHeader::size());
+/// assert_eq!(MessageHeader::from_bytes(&buf), Ok(header));
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MessageHeader {
+    /// Total length of the frame in bytes, including the 16-byte header.
     pub message_length: i32,
+    /// Identifier chosen by the sender. Replies use this in [`Self::response_to`].
     pub request_id: i32,
+    /// `Some(n)` if this is a reply to request `n`; `None` if it is a
+    /// fresh request. Modelled as `Option<NonZeroI32>` rather than a raw
+    /// `i32` so the on-the-wire "no response_to" sentinel (`0`) cannot be
+    /// confused with a valid id.
     pub response_to: Option<NonZeroI32>,
+    /// Identifies the wire-protocol operation this frame carries.
     pub op_code: OPCode,
 }
 
+/// Failure modes when parsing the first 16 bytes of a frame.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum MessageHeaderParseError {
+    /// Caller passed a buffer shorter than [`MessageHeader::size`]. The
+    /// included `usize` is the actual length.
     #[error("size is too short, expected 4 bytes, got {0}")]
     TooFewBytes(usize),
+    /// The four opcode bytes did not match any supported opcode.
     #[error("invalid opcode: {0}")]
     InvalidOPCode(#[from] OPCodeParseError),
 }
 
 impl MessageHeader {
+    /// On-the-wire size of a header in bytes (always 16).
+    ///
+    /// Exposed as a function rather than a constant so consumers don't have
+    /// to import a hand-named constant in their `message_length` arithmetic.
     pub fn size() -> usize {
         16
     }
 
+    /// Parses a header from the start of `bytes`.
+    ///
+    /// `bytes` may be longer than [`Self::size`] — the trailing data is
+    /// ignored and presumed to be the message body, which the caller will
+    /// hand to the matching `Operation::from_bytes`.
+    ///
+    /// # Errors
+    ///
+    /// * [`MessageHeaderParseError::TooFewBytes`] when fewer than 16 bytes
+    ///   are available.
+    /// * [`MessageHeaderParseError::InvalidOPCode`] when the opcode field
+    ///   does not match any supported [`OPCode`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, MessageHeaderParseError> {
         let len = bytes.len();
         if len < Self::size() {
@@ -41,6 +105,10 @@ impl MessageHeader {
         })
     }
 
+    /// Serialises the header into `dst` in little-endian wire order.
+    ///
+    /// Appends exactly [`Self::size`] bytes. Does not touch any existing
+    /// contents of `dst`.
     pub fn write_bytes(&self, dst: &mut BytesMut) {
         let message_length_bytes = i32::to_le_bytes(self.message_length);
         let request_id_bytes = i32::to_le_bytes(self.request_id);

@@ -1,3 +1,10 @@
+//! Modern OP_MSG opcode (`2013`).
+//!
+//! Every command issued by current MongoDB drivers is carried in an OP_MSG.
+//! The opcode supports a flag bitfield (see [`OperationMessageFlags`]),
+//! multiple "sections" (only kind-0 / single document is implemented here),
+//! and an optional CRC-32C checksum.
+
 use std::num::NonZeroI32;
 
 use bitflags::bitflags;
@@ -5,56 +12,132 @@ use tokio_util::bytes::{BufMut, BytesMut};
 
 use crate::{header::MessageHeader, op_code::OPCode};
 
+/// Mask of the bits the spec classifies as *required* (`0..16`).
+///
+/// Parsers MUST error on an unknown required bit. Unknown optional bits
+/// (`16..32`) are silently cleared.
 const REQUIRED_BITS_MASK: u32 = 0x0000_FFFF;
 
 bitflags! {
-    /// The flagBits integer is a bitmask encoding flags that modify the format and behavior of OP_MSG.
-    /// The first 16 bits (0-15) are required and parsers MUST error if an unknown bit is set.
-    /// The last 16 bits (16-31) are optional, and parsers MUST ignore any unknown set bits.
-    /// Proxies and other message forwarders MUST clear any unknown optional bits before forwarding messages.
+    /// `flagBits` bitmask carried in the first four bytes of an OP_MSG body.
+    ///
+    /// The MongoDB wire spec splits the bits into two halves:
+    ///
+    /// * **required** (`0..16`) — parsers MUST error on an unknown bit set
+    ///   here. Mutating proxies must preserve known required bits verbatim.
+    /// * **optional** (`16..32`) — parsers MUST ignore unknown bits, and
+    ///   proxies MUST clear unknown optional bits before forwarding.
+    ///
+    /// This crate implements both halves of that contract in
+    /// [`OperationMessage::from_bytes`].
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct OperationMessageFlags: u32 {
-        /// The message ends with 4 bytes containing a CRC-32C checksum.
+        /// The message ends with a four-byte CRC-32C checksum.
         const CHECKSUM_PRESENT = 1 << 0;
-        /// Another message will follow this one without further action from the receiver.
+        /// On a request: fire-and-forget — server will not reply.
+        ///
+        /// On a reply: another reply for the same request will follow on this
+        /// socket without the client sending anything (streaming SDAM /
+        /// exhaust cursors).
         const MORE_TO_COME = 1 << 1;
-        /// The client is prepared for multiple replies to this request using the moreToCome bit.
+        /// On a request: the client is prepared to receive a stream of
+        /// replies using `MORE_TO_COME`. Server will not stream unless the
+        /// originating request had this set.
         const EXHAUST_ALLOWED = 1 << 16;
     }
 }
 
+/// Modern OP_MSG message body.
+///
+/// Only kind-0 (single BSON document) sections are modelled; kind-1
+/// (document sequence) sections are not yet supported. Most user-visible
+/// commands (`find`, `insert`, `aggregate`, etc.) use kind-0 in practice.
+///
+/// # Examples
+///
+/// Round-trip an OP_MSG body through the wire encoding:
+///
+/// ```
+/// use bson::doc;
+/// use mongod_proxy::header::MessageHeader;
+/// use mongod_proxy::message::Message;
+/// use mongod_proxy::operation::Operation;
+/// use mongod_proxy::operation::op_msg::{OperationMessage, OperationMessageFlags};
+/// use tokio_util::bytes::BytesMut;
+///
+/// let msg = Message {
+///     request_id: 42,
+///     response_to: None,
+///     operation: Operation::Message(OperationMessage {
+///         flags: OperationMessageFlags::MORE_TO_COME,
+///         sections: doc! { "find": "movies", "$db": "sample" },
+///         checksum: None,
+///     }),
+/// };
+///
+/// let mut buf = BytesMut::new();
+/// msg.write_bytes(&mut buf).unwrap();
+/// // Skip the header so we feed only the body bytes to OperationMessage.
+/// let body = &buf[MessageHeader::size()..];
+/// let parsed = OperationMessage::from_bytes(body).unwrap();
+/// assert!(parsed.flags.contains(OperationMessageFlags::MORE_TO_COME));
+/// ```
 #[derive(Clone, Debug, PartialEq)]
 pub struct OperationMessage {
+    /// `flagBits` field controlling checksum, streaming, etc.
     pub flags: OperationMessageFlags,
+    /// The kind-0 body section as a single BSON document. By convention the
+    /// first key is the command name (`find`, `insert`, ...).
     pub sections: bson::Document,
+    /// `Some(crc)` when [`OperationMessageFlags::CHECKSUM_PRESENT`] is set on
+    /// the wire. The proxy preserves it across round-trips; it does not
+    /// currently validate the CRC against the rest of the message.
     pub checksum: Option<u32>,
 }
 
+/// Failure modes for [`OperationMessage::from_bytes`].
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum OperationMessageParseError {
+    /// Body shorter than the unconditional minimum (flag bits + kind byte).
     #[error("not enough bytes, expected at least {min} bytes, got {actual}")]
     NotEnoughBytes { actual: usize, min: usize },
+    /// One or more *required* flag bits (`0..16`) set are not understood.
+    /// The included `u32` is the unknown bits only (known bits masked off).
     #[error("unknown required flag bits set: {0:#010x}")]
     UnknownRequiredBits(u32),
+    /// First section's `kind` byte was not `0`. Only kind-0 (body) sections
+    /// are implemented.
     #[error("invalid kind, expected 0, got {0}")]
     InvalidKind(u8),
+    /// `CHECKSUM_PRESENT` flag set but fewer than four trailing bytes remain.
     #[error("checksum is missing")]
     MissingChecksum,
+    /// BSON parsing of the section document failed.
     #[error("failed to parse bson: {0}")]
     InvalidBson(String),
 }
 
+/// Failure modes for [`OperationMessage::write_bytes`].
 #[derive(Debug, thiserror::Error)]
 pub enum OperationMessageWriteError {
+    /// Serialising `sections` to BSON failed.
     #[error("failed to serialize sections: {0}")]
     SerializeError(#[from] bson::ser::Error),
 }
 
 impl OperationMessage {
+    /// Smallest possible OP_MSG body size in bytes (`flagBits` + first
+    /// section's `kind` byte). Empty BSON sections add more on top of this.
     pub const fn min_len() -> usize {
         size_of::<u32>() + size_of::<u8>()
     }
 
+    /// Parses an OP_MSG body. `bytes` must NOT include the 16-byte
+    /// [`MessageHeader`]; the caller is expected to have stripped it off.
+    ///
+    /// # Errors
+    ///
+    /// See [`OperationMessageParseError`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, OperationMessageParseError> {
         let actual_len = bytes.len();
         let min_len = Self::min_len();
@@ -112,6 +195,16 @@ impl OperationMessage {
         })
     }
 
+    /// Appends a full OP_MSG frame (header + body) to `dst`.
+    ///
+    /// The function unconditionally sets / clears
+    /// [`OperationMessageFlags::CHECKSUM_PRESENT`] to match whether
+    /// `self.checksum` is `Some` — so the bit and the trailing checksum
+    /// bytes cannot disagree on the wire.
+    ///
+    /// # Errors
+    ///
+    /// See [`OperationMessageWriteError`].
     pub fn write_bytes(
         &self,
         dst: &mut BytesMut,

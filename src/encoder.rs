@@ -1,14 +1,51 @@
+//! [`tokio_util::codec::Encoder`] implementation that serialises typed
+//! [`Message`] values onto a TCP byte stream.
+
 use tokio_util::{bytes::BytesMut, codec::Encoder};
 
 use crate::message::{Message, MessageWriteError};
 
+/// Stateless encoder that writes [`Message`] values onto an `AsyncWrite`
+/// via [`tokio_util::codec::FramedWrite`].
+///
+/// All encoding state lives in the [`Message`] itself; the encoder simply
+/// delegates to [`Message::write_bytes`].
+///
+/// # Examples
+///
+/// ```
+/// use bson::doc;
+/// use mongod_proxy::encoder::WireEncoder;
+/// use mongod_proxy::message::Message;
+/// use mongod_proxy::operation::Operation;
+/// use mongod_proxy::operation::op_msg::{OperationMessage, OperationMessageFlags};
+/// use tokio_util::bytes::BytesMut;
+/// use tokio_util::codec::Encoder;
+///
+/// let msg = Message {
+///     request_id: 1,
+///     response_to: None,
+///     operation: Operation::Message(OperationMessage {
+///         flags: OperationMessageFlags::empty(),
+///         sections: doc! { "ping": 1 },
+///         checksum: None,
+///     }),
+/// };
+///
+/// let mut buf = BytesMut::new();
+/// WireEncoder::default().encode(msg, &mut buf).unwrap();
+/// assert!(!buf.is_empty());
+/// ```
 #[derive(Debug, Default)]
 pub struct WireEncoder {}
 
+/// Failure modes for [`WireEncoder::encode`].
 #[derive(Debug, thiserror::Error)]
 pub enum WireEncoderError {
+    /// Underlying [`std::io::Error`] surfaced by [`tokio_util::codec`].
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
+    /// Serialising the message body failed (typically BSON encoding).
     #[error("Failed to write error: {0}")]
     MessageWriteError(#[from] MessageWriteError),
 }

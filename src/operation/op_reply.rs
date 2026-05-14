@@ -1,3 +1,8 @@
+//! Legacy OP_REPLY opcode (`1`).
+//!
+//! The server replies to an OP_QUERY (typically the handshake `isMaster` /
+//! `hello`) with this opcode. New cursor commands use OP_MSG instead.
+
 use std::{io::Cursor, num::NonZeroI32};
 
 use bitflags::bitflags;
@@ -6,47 +11,81 @@ use tokio_util::bytes::{BufMut, BytesMut};
 
 use crate::{header::MessageHeader, op_code::OPCode};
 
+/// Legacy OP_REPLY body.
+///
+/// Carries cursor metadata (`cursor_id`, `starting_from`) and the batch of
+/// result documents. The on-the-wire `numberReturned` integer is *derived*
+/// from `documents.len()` at write time, so it cannot diverge from the
+/// actual batch.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OperationReply {
+    /// Reply flag bits.
     pub flags: OperationReplyFlags,
+    /// Server-assigned cursor id, or `0` when the cursor is exhausted.
     pub cursor_id: i64,
+    /// Index (0-based) of the first document in this batch within the cursor.
     pub starting_from: i32,
+    /// Result documents in this batch.
     pub documents: Vec<Document>,
 }
 
 bitflags! {
+    /// Reply-side flag bits set by the server in an OP_REPLY response.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct OperationReplyFlags: u32 {
+        /// The cursor referenced by `getMore` no longer exists.
         const CURSOR_NOT_FOUND = 1 << 0;
+        /// The query failed; the first document carries the error info.
         const QUERY_FAILURE = 1 << 1;
+        /// Routing metadata is stale (sharded deployments).
         const SHARD_CONFIG_STALE = 1 << 2;
+        /// Server supports `AwaitData` on tailable cursors.
         const AWAIT_CAPABLE = 1 << 3;
     }
 }
 
+/// Failure modes for [`OperationReply::from_bytes`].
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum OperationReplyParseError {
+    /// Body shorter than the unconditional minimum.
     #[error("not enough bytes, expected at least {min} bytes, got {actual}")]
     NotEnoughBytes { actual: usize, min: usize },
+    /// One or more unknown flag bits were set. The `u32` carries unknown
+    /// bits only.
     #[error("unknown reply flag bits set: {0:#010x}")]
     UnknownFlagBits(u32),
+    /// Parsing the document at index `n` failed; `message` is the underlying
+    /// BSON error.
     #[error("failed to parse document (n={n}), message: {message}")]
     FailedToParseDocument { n: usize, message: String },
 }
 
+/// Failure modes for [`OperationReply::write_bytes`].
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum OperationReplyWriteError {
+    /// BSON serialisation of a document failed.
     #[error("failed to serialize document: {0}")]
     SerializeDocumentError(String),
+    /// `documents.len()` doesn't fit in the `i32` `numberReturned` field.
+    /// In practice this never happens — wire-protocol message size limits
+    /// kick in long before two-billion-plus documents do.
     #[error("document count {0} exceeds i32::MAX")]
     TooManyDocuments(usize),
 }
 
 impl OperationReply {
+    /// Smallest possible OP_REPLY body size in bytes:
+    /// `flags(4) + cursor_id(8) + starting_from(4) + number_returned(4)`.
     pub const fn min_len() -> usize {
         size_of::<u32>() + size_of::<i64>() + size_of::<i32>() + size_of::<i32>()
     }
 
+    /// Parses an OP_REPLY body. `bytes` must NOT include the
+    /// [`MessageHeader`].
+    ///
+    /// # Errors
+    ///
+    /// See [`OperationReplyParseError`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, OperationReplyParseError> {
         let actual_len = bytes.len();
         let min_len = Self::min_len();
@@ -93,6 +132,14 @@ impl OperationReply {
         })
     }
 
+    /// Appends a full OP_REPLY frame (header + body) to `dst`.
+    ///
+    /// The `numberReturned` field is derived from `documents.len()` rather
+    /// than stored on the struct so the two cannot drift.
+    ///
+    /// # Errors
+    ///
+    /// See [`OperationReplyWriteError`].
     pub fn write_bytes(
         &self,
         dst: &mut BytesMut,

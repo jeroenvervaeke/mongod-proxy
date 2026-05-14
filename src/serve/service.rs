@@ -1,3 +1,12 @@
+//! Upstream proxy [`Service`] — opens the upstream socket, optionally over
+//! TLS, and shuttles messages between client and `mongod`.
+//!
+//! [`Proxy`] is a [`Service<SocketAddr>`] (i.e. a make-service) that produces
+//! a fresh [`ProxyClient`] per incoming client connection. [`ProxyClient`]
+//! is the per-connection [`Service<Message>`] that does the actual
+//! request/response forwarding, modelled as a stream so it can handle
+//! moreToCome multi-reply traffic.
+
 use std::{net::SocketAddr, pin::Pin, sync::Arc};
 
 use futures::{SinkExt, Stream, StreamExt};
@@ -28,6 +37,26 @@ type BoxedAsyncWrite = Pin<Box<dyn AsyncWrite + Send + Sync + 'static>>;
 type ServerReader = FramedRead<BoxedAsyncRead, WireDecoder>;
 type ServerWriter = FramedWrite<BoxedAsyncWrite, WireEncoder>;
 
+/// Upstream proxy configuration and make-service.
+///
+/// Implements [`Service<SocketAddr>`], producing one fresh
+/// [`L::Service`](Layer::Service) wrapping a [`ProxyClient`] per call. The
+/// type parameter `L` carries the tower [`Layer`] stack applied around the
+/// inner [`ProxyClient`]; `Identity` (the default returned by
+/// [`Proxy::new`]) applies no layers.
+///
+/// # Examples
+///
+/// Build a plain-TCP proxy and wrap a [`LogLayer`] around it:
+///
+/// ```
+/// use mongod_proxy::{LogLayer, Proxy};
+///
+/// let proxy = Proxy::new("mongo.example.com", 27017, /* use_tls = */ true)
+///     .layer(LogLayer);
+/// // `proxy` is now a `Service<SocketAddr>` ready to hand to `serve(...)`.
+/// # let _ = proxy;
+/// ```
 pub struct Proxy<L> {
     destination_name: String,
     destination_port: u16,
@@ -37,6 +66,13 @@ pub struct Proxy<L> {
 }
 
 impl Proxy<Identity> {
+    /// Creates a new proxy that forwards every incoming client connection
+    /// to `destination_name:destination_port`.
+    ///
+    /// When `use_tls` is true the upstream socket is wrapped in a `rustls`
+    /// TLS client using the standard `webpki-roots` trust anchors and SNI
+    /// derived from `destination_name`. When false the upstream socket is
+    /// plain TCP.
     pub fn new(destination_name: impl Into<String>, destination_port: u16, use_tls: bool) -> Self {
         let tls_connector = if use_tls {
             let mut root_cert_store = RootCertStore::empty();
@@ -62,6 +98,11 @@ impl Proxy<Identity> {
 }
 
 impl<L> Proxy<L> {
+    /// Chains another tower [`Layer`] around the inner [`ProxyClient`].
+    ///
+    /// Layers are applied outer-most last (same convention as tower's
+    /// `ServiceBuilder`). Use this to add custom middleware (rate limiting,
+    /// auth, redaction, etc.) without writing a new [`Service`].
     pub fn layer<T>(self, layer: T) -> Proxy<Stack<T, L>> {
         Proxy {
             destination_name: self.destination_name,
@@ -72,6 +113,11 @@ impl<L> Proxy<L> {
         }
     }
 
+    /// Convenience for `self.layer(LogLayer)`.
+    ///
+    /// Every request and every reply (including intermediate replies of a
+    /// streamed response) is logged at `info` level with structured
+    /// `direction`, `op`, `command`, and identifier fields.
     pub fn enable_logging(self) -> Proxy<Stack<LogLayer, L>> {
         self.layer(LogLayer)
     }
@@ -108,6 +154,10 @@ where
     }
 }
 
+/// Future returned by `<Proxy as Service<SocketAddr>>::call`.
+///
+/// Resolves to the per-connection [`Service<Message>`] (typically a
+/// layered [`ProxyClient`]) once the upstream socket is fully established.
 pub struct ProxyClientCreationFuture<S>(
     Pin<Box<dyn Future<Output = Result<S, ProxyClientForwardError>> + Send + 'static>>,
 )
@@ -128,6 +178,15 @@ where
     }
 }
 
+/// Per-connection [`Service<Message>`] holding one upstream socket.
+///
+/// Implements [`Service<Message>`] with `Response = `[`ProxyResponseStream`].
+/// Each `call` writes the request to the upstream socket and returns a
+/// stream that yields zero or more replies until the upstream signals end
+/// of stream (or fewer replies in fire-and-forget mode).
+///
+/// Construct via [`ProxyClient::forward_to`]; or via [`Proxy::call`] which
+/// builds one per accepted client connection.
 pub struct ProxyClient {
     inner: Arc<Mutex<ProxyClientInner>>,
 }
@@ -137,17 +196,31 @@ struct ProxyClientInner {
     server_writer: ServerWriter,
 }
 
+/// Failure modes for [`ProxyClient::forward_to`].
 #[derive(Debug, thiserror::Error)]
 pub enum ProxyClientForwardError {
+    /// `TcpStream::connect` to the upstream failed (DNS, refused, etc.).
     #[error("failed to connect to proxied server: {0}")]
     FailedToConnectToProxiedServer(io::Error),
+    /// `destination_name` is not a valid DNS name for use with TLS SNI.
     #[error("invalid server name: {0}")]
     InvalidServerName(InvalidDnsNameError),
+    /// The TLS handshake itself failed (cert validation, protocol, etc.).
     #[error("tls handshake failed: {0}")]
     TlsHandshake(io::Error),
 }
 
 impl ProxyClient {
+    /// Opens an upstream TCP (and optionally TLS) socket and wraps it in
+    /// the proxy's framed reader / writer pair.
+    ///
+    /// `destination_name` is used both for DNS resolution and (when
+    /// `tls_connector` is `Some`) for SNI. Passing `None` produces a
+    /// plain-TCP proxy.
+    ///
+    /// # Errors
+    ///
+    /// See [`ProxyClientForwardError`].
     pub async fn forward_to(
         destination_name: String,
         destination_port: u16,
@@ -296,18 +369,28 @@ impl Service<Message> for ProxyClient {
     }
 }
 
+/// Failure modes for an in-flight request against [`ProxyClient`].
 #[derive(Debug, thiserror::Error)]
 pub enum ProxyClientRequestError {
+    /// Underlying socket I/O failed.
     #[error("io error: {0}")]
     Io(#[from] io::Error),
+    /// Upstream closed the socket while a reply was still pending.
     #[error("end of stream")]
     EndOfStream,
+    /// Encoding the request before sending it upstream failed.
     #[error("wire encode error: {0}")]
     WireEncode(#[from] WireEncoderError),
+    /// Decoding an upstream reply failed.
     #[error("wire decode error: {0}")]
     WireDecode(#[from] WireDecoderError),
 }
 
+/// Future returned by `<ProxyClient as Service<Message>>::call`.
+///
+/// Resolves to a [`ProxyResponseStream`] once the request has been written
+/// to the upstream and the proxy has acquired the upstream guard. The
+/// caller then drains the stream to receive replies.
 pub struct ProxyClientRequestFuture(
     Pin<
         Box<

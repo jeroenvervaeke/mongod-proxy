@@ -1,3 +1,17 @@
+//! Typed wire-protocol operation bodies (everything after the 16-byte header).
+//!
+//! The MongoDB wire protocol uses a small set of opcodes. Each opcode has its
+//! own body layout, modelled here:
+//!
+//! * [`op_msg::OperationMessage`] — modern OP_MSG; the only opcode used for
+//!   user-visible commands on current servers.
+//! * [`op_query::OperationQuery`] — legacy OP_QUERY; still used for the
+//!   initial `isMaster` / `hello` handshake.
+//! * [`op_reply::OperationReply`] — legacy OP_REPLY; paired with OP_QUERY.
+//!
+//! The [`Operation`] enum is the discriminated union the rest of the crate
+//! uses to talk about an operation body abstractly.
+
 use std::num::NonZeroI32;
 
 use op_msg::{OperationMessage, OperationMessageParseError, OperationMessageWriteError};
@@ -11,34 +25,61 @@ pub mod op_msg;
 pub mod op_query;
 pub mod op_reply;
 
+/// Typed wire-protocol operation, selected by [`OPCode`].
+///
+/// A [`Message`](crate::message::Message) owns exactly one of these.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Operation {
+    /// Legacy OP_QUERY body. Drivers still emit this for the initial
+    /// `isMaster` / `hello` handshake before the wire version is known.
     Query(OperationQuery),
+    /// Modern OP_MSG body. Every post-handshake command uses this format.
     Message(OperationMessage),
+    /// Legacy OP_REPLY body. Servers emit this in response to OP_QUERY.
     Reply(OperationReply),
 }
 
+/// Failure modes for [`Operation::from_bytes`].
+///
+/// Each variant flattens the per-opcode parse error.
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum OperationParseError {
+    /// The OP_MSG body could not be parsed.
     #[error("failed to parse message: {0}")]
     FailedToParseMessage(#[from] OperationMessageParseError),
+    /// The OP_QUERY body could not be parsed.
     #[error("failed to parse query: {0}")]
     FailedToParseQuery(#[from] OperationQueryParseError),
+    /// The OP_REPLY body could not be parsed.
     #[error("failed to reply query: {0}")]
     FailedToParseReply(#[from] OperationReplyParseError),
 }
 
+/// Failure modes for [`Operation::write_bytes`].
 #[derive(Debug, thiserror::Error)]
 pub enum OperationWriteError {
+    /// Encoding an OP_MSG body failed (typically BSON serialisation).
     #[error("failed to write message operation: {0}")]
     FailedToWriteOperationMessage(#[from] OperationMessageWriteError),
+    /// Encoding an OP_QUERY body failed.
     #[error("failed to write query operation: {0}")]
     FailedToWriteOperationQuery(#[from] OperationQueryWriteError),
+    /// Encoding an OP_REPLY body failed.
     #[error("failed to write reply operation: {0}")]
     FailedToWriteOperationReply(#[from] OperationReplyWriteError),
 }
 
 impl Operation {
+    /// Parses the body bytes that follow a [`MessageHeader`](crate::header::MessageHeader),
+    /// dispatching on the opcode the header announced.
+    ///
+    /// `bytes` should contain *only* the body — the caller (typically
+    /// [`Message::from_headers_and_bytes`](crate::message::Message::from_headers_and_bytes))
+    /// is responsible for stripping the header off first.
+    ///
+    /// # Errors
+    ///
+    /// See [`OperationParseError`].
     pub fn from_bytes(op_code: OPCode, bytes: &[u8]) -> Result<Self, OperationParseError> {
         Ok(match op_code {
             OPCode::Msg => Operation::Message(OperationMessage::from_bytes(bytes)?),
@@ -47,6 +88,17 @@ impl Operation {
         })
     }
 
+    /// Appends the full wire encoding (header + body) for this operation to
+    /// `dst`.
+    ///
+    /// The function delegates to the variant-specific writer, which builds
+    /// the matching [`MessageHeader`](crate::header::MessageHeader) (with
+    /// the correct `op_code` and the derived `message_length`) and the body
+    /// itself.
+    ///
+    /// # Errors
+    ///
+    /// See [`OperationWriteError`].
     pub fn write_bytes(
         &self,
         dst: &mut BytesMut,

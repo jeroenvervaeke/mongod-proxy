@@ -5,6 +5,7 @@ use super::{
     namespace::Namespace,
     newtypes::{AggregateTime, DocsExamined, DocsReturned, IndexName, KeysExamined, NodeTime},
     open_vocab::Command,
+    plan_details::{Filter, IndexBounds, KeyPattern},
     stage::Stage,
 };
 
@@ -25,6 +26,11 @@ pub struct PlanNode {
     pub docs_examined: Option<DocsExamined>,
     pub keys_examined: Option<KeysExamined>,
     pub index_name: Option<IndexName>,
+    pub key_pattern: Option<KeyPattern>,
+    pub index_bounds: Option<IndexBounds>,
+    /// `"forward"` or `"backward"`. Present on most scan stages.
+    pub direction: Option<String>,
+    pub filter: Option<Filter>,
     pub children: Vec<PlanNode>,
 }
 

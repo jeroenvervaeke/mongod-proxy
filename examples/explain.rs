@@ -20,7 +20,9 @@ use std::env;
 use std::io::{self, IsTerminal};
 
 use anyhow::{Context, Result};
-use mongod_proxy::{ExplainEvent, PlanNode, Proxy, Stage, serve};
+use mongod_proxy::{
+    ExplainEvent, Filter, IndexBounds, IndexFieldKind, KeyPattern, PlanNode, Proxy, Stage, serve,
+};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tracing::Level;
@@ -111,12 +113,100 @@ fn walk(node: &PlanNode, depth: usize) {
         .as_ref()
         .map(|i| format!(" idx={}", i))
         .unwrap_or_default();
+    let direction = node
+        .direction
+        .as_deref()
+        .map(|d| format!(" dir={}", d))
+        .unwrap_or_default();
     println!(
-        "{}{stage} n={}{} ms={}",
-        indent, node.n_returned, index, per_stage_ms,
+        "{}{stage} n={}{}{} ms={}",
+        indent, node.n_returned, index, direction, per_stage_ms,
     );
+    if let Some(kp) = &node.key_pattern {
+        println!("{}  keyPattern: {}", indent, format_key_pattern(kp));
+    }
+    if let Some(b) = &node.index_bounds {
+        println!("{}  bounds:     {}", indent, format_index_bounds(b));
+    }
+    if let Some(f) = &node.filter {
+        println!("{}  filter:     {}", indent, format_filter(f));
+    }
     for child in &node.children {
         walk(child, depth + 1);
+    }
+}
+
+fn format_key_pattern(kp: &KeyPattern) -> String {
+    match kp {
+        KeyPattern::Document(fields) => {
+            let pairs: Vec<String> = fields
+                .iter()
+                .map(|f| format!("{}: {}", f.field, format_field_kind(&f.kind)))
+                .collect();
+            format!("{{ {} }}", pairs.join(", "))
+        }
+        KeyPattern::Express(s) => format!("(express) {s}"),
+        _ => "<unknown KeyPattern variant>".to_owned(),
+    }
+}
+
+fn format_field_kind(k: &IndexFieldKind) -> &'static str {
+    match k {
+        IndexFieldKind::Ascending => "1",
+        IndexFieldKind::Descending => "-1",
+        IndexFieldKind::Hashed => "\"hashed\"",
+        IndexFieldKind::Text => "\"text\"",
+        IndexFieldKind::TwoDSphere => "\"2dsphere\"",
+        IndexFieldKind::TwoD => "\"2d\"",
+        IndexFieldKind::Other(_) => "<other>",
+        _ => "<unknown>",
+    }
+}
+
+fn format_index_bounds(b: &IndexBounds) -> String {
+    match b {
+        IndexBounds::Document(map) => {
+            let entries: Vec<String> = map
+                .iter()
+                .map(|(field, ranges)| {
+                    let rs: Vec<String> = ranges.iter().map(format_range).collect();
+                    format!("{field}: [{}]", rs.join(", "))
+                })
+                .collect();
+            format!("{{ {} }}", entries.join(", "))
+        }
+        IndexBounds::Raw(s) => format!("(raw) {s}"),
+        _ => "<unknown IndexBounds variant>".to_owned(),
+    }
+}
+
+fn format_range(r: &mongod_proxy::IndexBoundRange) -> String {
+    let lo = format_bound_value(&r.lower);
+    let hi = format_bound_value(&r.upper);
+    let open = if r.lower_inclusive { '[' } else { '(' };
+    let close = if r.upper_inclusive { ']' } else { ')' };
+    format!("{open}{lo}, {hi}{close}")
+}
+
+fn format_bound_value(v: &mongod_proxy::BoundValue) -> String {
+    match v {
+        mongod_proxy::BoundValue::Inf => "inf".to_owned(),
+        mongod_proxy::BoundValue::NegInf => "-inf".to_owned(),
+        mongod_proxy::BoundValue::MinKey => "MinKey".to_owned(),
+        mongod_proxy::BoundValue::MaxKey => "MaxKey".to_owned(),
+        mongod_proxy::BoundValue::Literal(s) => s.clone(),
+        _ => "<unknown>".to_owned(),
+    }
+}
+
+fn format_filter(f: &Filter) -> String {
+    match f {
+        Filter::MatchExpression(d) => format!("{d:?}")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" "),
+        Filter::SbeExpression(s) => format!("(sbe) {s}"),
+        _ => "<unknown Filter variant>".to_owned(),
     }
 }
 

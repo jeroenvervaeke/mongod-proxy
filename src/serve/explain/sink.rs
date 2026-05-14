@@ -118,6 +118,10 @@ mod tests {
                 docs_examined: None,
                 keys_examined: None,
                 index_name: None,
+                key_pattern: None,
+                index_bounds: None,
+                direction: None,
+                filter: None,
                 children: vec![],
             },
         }

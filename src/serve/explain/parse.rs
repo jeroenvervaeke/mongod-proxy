@@ -144,6 +144,10 @@ pub(crate) fn to_plan_node(r: RawPlanNode, depth: usize) -> Result<PlanNode, Exp
         docs_examined: r.docs_examined,
         keys_examined: r.keys_examined,
         index_name: r.index_name,
+        key_pattern: r.key_pattern,
+        index_bounds: r.index_bounds,
+        direction: r.direction,
+        filter: r.filter,
         children,
     })
 }

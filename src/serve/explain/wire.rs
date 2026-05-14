@@ -8,8 +8,8 @@
 use serde::Deserialize;
 
 use super::model::{
-    DocsExamined, DocsReturned, ErrorLabel, IndexName, KeysExamined, ServerErrorCode,
-    ServerErrorCodeName, Stage,
+    DocsExamined, DocsReturned, ErrorLabel, Filter, IndexBounds, IndexName, KeyPattern,
+    KeysExamined, ServerErrorCode, ServerErrorCodeName, Stage,
 };
 
 #[allow(dead_code)]
@@ -61,6 +61,21 @@ pub(crate) struct RawPlanNode {
     pub keys_examined: Option<KeysExamined>,
     #[serde(default)]
     pub index_name: Option<IndexName>,
+    /// Index definition. Classic engines ship a BSON Document; Express
+    /// engines ship a pretty-printed string. See [`KeyPattern`] for
+    /// engine semantics.
+    #[serde(default)]
+    pub key_pattern: Option<KeyPattern>,
+    /// Index bounds actually consulted on an IXSCAN. See [`IndexBounds`].
+    #[serde(default)]
+    pub index_bounds: Option<IndexBounds>,
+    /// `"forward"` or `"backward"` on scan stages.
+    #[serde(default)]
+    pub direction: Option<String>,
+    /// MatchExpression / SBE expression evaluated during this stage.
+    /// See [`Filter`].
+    #[serde(default)]
+    pub filter: Option<Filter>,
     /// Wire field `inputStage` (single-child case).
     #[serde(default, rename = "inputStage")]
     pub input_stage: Option<Box<RawPlanNode>>,

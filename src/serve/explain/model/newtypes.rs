@@ -62,7 +62,7 @@ fn validate_index_name(s: &str) -> Result<(), IndexNameError> {
 
 /// MongoDB index name from a plan's `IXSCAN` stage (e.g. `"year_1"`).
 #[nutype(
-    derive(Debug, Clone, PartialEq, Eq, Hash, AsRef, Display),
+    derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, AsRef, Display),
     validate(with = validate_index_name, error = IndexNameError),
 )]
 pub struct IndexName(String);
@@ -81,7 +81,7 @@ fn validate_docs_returned(n: &i64) -> Result<(), DocsReturnedError> {
 
 /// Number of documents returned by a stage / plan total.
 #[nutype(
-    derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display, Into),
+    derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Display, Into),
     validate(with = validate_docs_returned, error = DocsReturnedError),
 )]
 pub struct DocsReturned(i64);
@@ -100,7 +100,7 @@ fn validate_docs_examined(n: &i64) -> Result<(), DocsExaminedError> {
 
 /// Number of documents examined (visited during execution).
 #[nutype(
-    derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display, Into),
+    derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Display, Into),
     validate(with = validate_docs_examined, error = DocsExaminedError),
 )]
 pub struct DocsExamined(i64);
@@ -119,7 +119,7 @@ fn validate_keys_examined(n: &i64) -> Result<(), KeysExaminedError> {
 
 /// Number of index keys examined during execution.
 #[nutype(
-    derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display, Into),
+    derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Display, Into),
     validate(with = validate_keys_examined, error = KeysExaminedError),
 )]
 pub struct KeysExamined(i64);
@@ -148,7 +148,7 @@ fn validate_server_error_code(n: &i32) -> Result<(), ServerErrorCodeError> {
 
 /// MongoDB server error code (e.g. `11000` for duplicate key).
 #[nutype(
-    derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display, Into),
+    derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Display, Into),
     validate(with = validate_server_error_code, error = ServerErrorCodeError),
 )]
 pub struct ServerErrorCode(i32);

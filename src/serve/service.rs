@@ -142,6 +142,37 @@ impl<L> Proxy<L> {
     pub fn enable_logging(self) -> Proxy<Stack<LogLayer, L>> {
         self.layer(LogLayer)
     }
+
+    /// Convenience for `self.layer(ExplainLayer::new())`.
+    ///
+    /// Captures explainable client commands (`find`, `aggregate`, …) and
+    /// emits a typed `tracing::info!` event with the executed plan and
+    /// per-stage timing. No user-supplied sink is wired — use
+    /// [`enable_explain_with_sink`](Self::enable_explain_with_sink) to
+    /// consume typed [`ExplainEvent`](crate::ExplainEvent)s programmatically.
+    pub fn enable_explain(
+        self,
+    ) -> Proxy<Stack<crate::serve::explain::ExplainLayer<crate::serve::explain::TracingOnly>, L>>
+    {
+        self.layer(crate::serve::explain::ExplainLayer::new())
+    }
+
+    /// Convenience for `self.layer(ExplainLayer::with_sink(sink))`.
+    ///
+    /// `sink` receives a typed [`ExplainEvent`](crate::ExplainEvent) for
+    /// every explainable client command and a typed
+    /// [`ExplainError`](crate::ExplainError) for every failure. The sink
+    /// `Clone`s once per accepted connection — keep it O(1) (refcount or
+    /// `Copy`).
+    pub fn enable_explain_with_sink<Sk>(
+        self,
+        sink: Sk,
+    ) -> Proxy<Stack<crate::serve::explain::ExplainLayer<Sk>, L>>
+    where
+        Sk: Clone,
+    {
+        self.layer(crate::serve::explain::ExplainLayer::with_sink(sink))
+    }
 }
 
 impl<L> Service<SocketAddr> for Proxy<L>
@@ -208,6 +239,12 @@ where
 ///
 /// Construct via [`ProxyClient::forward_to`]; or via [`Proxy::call`] which
 /// builds one per accepted client connection.
+///
+/// `Clone` is cheap (single `Arc::clone`) and exists so middleware layers
+/// that need to issue more than one call through the per-connection
+/// service (e.g. `ExplainLayer`'s sideband explain) can move a handle
+/// into their boxed future.
+#[derive(Clone)]
 pub struct ProxyClient {
     inner: Arc<Mutex<ProxyClientInner>>,
 }

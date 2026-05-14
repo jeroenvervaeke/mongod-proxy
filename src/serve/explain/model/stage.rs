@@ -52,6 +52,29 @@ pub enum Stage {
     Other(OtherName),
 }
 
+impl<'de> serde::Deserialize<'de> for Stage {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = Stage;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                write!(f, "a MongoDB plan stage name")
+            }
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Stage, E> {
+                Ok(Stage::from_wire_str(s))
+            }
+            fn visit_string<E: serde::de::Error>(self, s: String) -> Result<Stage, E> {
+                // Reuse from_wire_str then consume the owned String only for Other.
+                match Stage::from_wire_str(&s) {
+                    Stage::Other(_) => Ok(Stage::Other(super::newtypes::OtherName::new(s))),
+                    known => Ok(known),
+                }
+            }
+        }
+        d.deserialize_str(V)
+    }
+}
+
 impl Stage {
     /// Single source of truth: wire-string → [`Stage`]. Used by both the
     /// custom `serde::Deserialize` impl and any internal classifier.

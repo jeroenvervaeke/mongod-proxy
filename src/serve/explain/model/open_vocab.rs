@@ -50,6 +50,25 @@ macro_rules! open_vocab_enum {
                 }
             }
         }
+
+        impl<'de> serde::Deserialize<'de> for $Name {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                struct V;
+                impl<'de> serde::de::Visitor<'de> for V {
+                    type Value = $Name;
+                    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                        write!(f, "a string identifying a {}", stringify!($Name))
+                    }
+                    fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<$Name, E> {
+                        Ok($Name::from_wire_str(s))
+                    }
+                    fn visit_string<E: serde::de::Error>(self, s: String) -> Result<$Name, E> {
+                        Ok($Name::from_wire_string(s))
+                    }
+                }
+                d.deserialize_str(V)
+            }
+        }
     };
 }
 

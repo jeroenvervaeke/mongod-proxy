@@ -1470,6 +1470,7 @@ dependencies = [
  "pretty_assertions",
  "rstest",
  "rustls-pki-types",
+ "serde",
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",

@@ -56,4 +56,13 @@ pub mod serve;
 #[cfg(test)]
 mod fixtures;
 
+pub use serve::explain::{
+    AggregateTime, AndKind, Collection, CollectionError, Command, Database, DatabaseError,
+    DocsExamined, DocsExaminedError, DocsReturned, DocsReturnedError, ErrorLabel, ExplainError,
+    ExplainEvent, ExplainLayer, ExplainParseError, ExplainServerError, ExplainSink, ExplainTotals,
+    IndexName, IndexNameError, KeysExamined, KeysExaminedError, MalformedOkShape, Namespace,
+    NamespaceParseError, NamespaceParseErrorKind, NegativeDurationError, NodeTime, OtherName,
+    PlanNode, ProjectionKind, ReplayStream, RequestIdExhausted, ServerErrorCode,
+    ServerErrorCodeError, ServerErrorCodeName, Stage, TracingOnly, UnsupportedShape,
+};
 pub use serve::{log::LogLayer, serve, service::Proxy};

@@ -95,26 +95,6 @@ print("version=" + bi.version + " uptime_seconds=" + ss.uptime + " pid=" + ss.pi
 ' 2>/dev/null | tr -d '\r')
 log "mongod ready: $MONGO_INFO"
 
-log "seeding test data"
-mongosh_in_container --host "127.0.0.1:${MONGO_PORT}" >/dev/null <<'EOF'
-const sampleDb = db.getSiblingDB('sample');
-sampleDb.movies.drop();
-const docs = [];
-const genres = ['drama', 'comedy', 'action', 'sci-fi', 'horror', 'documentary'];
-for (let i = 0; i < 500; i++) {
-    docs.push({
-        _id: i,
-        title: `Movie ${i}`,
-        year: 1980 + (i % 45),
-        genre: genres[i % genres.length],
-        rating: Math.round(((i % 100) / 10) * 10) / 10,
-        tags: [`tag-${i % 7}`, `tag-${i % 11}`, `tag-${i % 13}`],
-    });
-}
-sampleDb.movies.insertMany(docs);
-print('seeded ' + sampleDb.movies.countDocuments() + ' documents');
-EOF
-
 log "building logger (release)"
 cargo build --release -p logger >/dev/null
 
@@ -145,27 +125,113 @@ for attempt in $(seq 1 60); do
 done
 
 log "driving traffic through the proxy"
+# Every command below MUST flow through the proxy. We deliberately use raw
+# `runCommand` calls rather than the helper methods on Collection (findOne,
+# insertMany, etc.) so that:
+#   * each command produces exactly one OP_MSG request + one OP_MSG response
+#     (no driver-side exhaust-cursor optimisation that would stream multiple
+#     replies per request -- the proxy does not yet support that mode)
+#   * the command name appearing in the proxy log is unambiguous
+#   * we can drive explicit getMore round-trips
+#
+# `serverMonitoringMode=poll` disables streaming SDAM (awaitable hello /
+# exhaust-allowed monitoring), which the proxy cannot currently shepherd.
+# `directConnection=true` skips replica-set topology discovery.
+PROXY_URI="mongodb://127.0.0.1:${PROXY_PORT}/?serverMonitoringMode=poll&directConnection=true"
 set +e
-mongosh_in_container --host "127.0.0.1:${PROXY_PORT}" >/dev/null <<'EOF'
+docker exec -i "$MONGO_CONTAINER" mongosh --quiet "$PROXY_URI" >/dev/null <<'EOF'
+const adminDb = db.getSiblingDB('admin');
 const sampleDb = db.getSiblingDB('sample');
-sampleDb.runCommand({ hello: 1 });
-sampleDb.movies.findOne();
-sampleDb.movies.find({ genre: 'drama' }).limit(10).toArray();
-// 500 documents at default batchSize 101 forces multiple getMore round-trips
-// so the proxy must handle several request/response pairs back-to-back.
-const all = sampleDb.movies.find().toArray();
-print('full scan length: ' + all.length);
-sampleDb.movies.aggregate([
-    { $group: { _id: '$genre', n: { $sum: 1 } } },
-    { $sort: { _id: 1 } },
-]).toArray();
-sampleDb.movies.countDocuments();
+
+// Handshake + server introspection
+adminDb.runCommand({ hello: 1 });
+adminDb.runCommand({ buildInfo: 1 });
+
+// DDL: drop any leftover collections
+sampleDb.runCommand({ drop: 'movies' });
+sampleDb.runCommand({ drop: 'docs' });
+
+// Inserts (multiple separate insert commands so we can count them)
+const genres = ['drama', 'comedy', 'action', 'sci-fi', 'horror', 'documentary'];
+const movies = [];
+for (let i = 0; i < 500; i++) {
+    movies.push({
+        _id: i,
+        title: `Movie ${i}`,
+        year: 1980 + (i % 45),
+        genre: genres[i % genres.length],
+        rating: Math.round(((i % 100) / 10) * 10) / 10,
+        tags: [`tag-${i % 7}`, `tag-${i % 11}`, `tag-${i % 13}`],
+    });
+}
+sampleDb.runCommand({ insert: 'movies', documents: movies });
+sampleDb.runCommand({ insert: 'docs', documents: [{ a: 1, label: 'one' }] });
+sampleDb.runCommand({ insert: 'docs', documents: [{ a: 2, label: 'two' }] });
+
+// Index management
+sampleDb.runCommand({
+    createIndexes: 'movies',
+    indexes: [{ key: { genre: 1 }, name: 'genre_idx' }],
+});
+sampleDb.runCommand({ listIndexes: 'movies' });
+
+// Metadata
+sampleDb.runCommand({ listCollections: 1 });
+adminDb.runCommand({ listDatabases: 1 });
+
+// Reads. `singleBatch:false` keeps the cursor open so we can drive explicit
+// getMore round-trips below. Small batchSize -> multiple getMore needed to
+// drain 500 docs.
+const findRes = sampleDb.runCommand({
+    find: 'movies',
+    batchSize: 50,
+    singleBatch: false,
+});
+let cursorId = findRes.cursor.id;
+print('initial batch length: ' + findRes.cursor.firstBatch.length);
+while (cursorId && cursorId.toString() !== '0') {
+    const next = sampleDb.runCommand({
+        getMore: cursorId,
+        collection: 'movies',
+        batchSize: 50,
+    });
+    cursorId = next.cursor.id;
+}
+
+// Filtered find (just one batch needed for the drama subset)
+sampleDb.runCommand({ find: 'movies', filter: { genre: 'drama' }, batchSize: 200 });
+
+// Aggregation + count
+sampleDb.runCommand({
+    aggregate: 'movies',
+    pipeline: [{ $group: { _id: '$genre', n: { $sum: 1 } } }, { $sort: { _id: 1 } }],
+    cursor: {},
+});
+sampleDb.runCommand({ count: 'movies' });
+
+// Mutations
+sampleDb.runCommand({
+    update: 'docs',
+    updates: [{ q: { a: 1 }, u: { $set: { label: 'updated' } } }],
+});
+sampleDb.runCommand({
+    update: 'docs',
+    updates: [{ q: {}, u: { $set: { touched: true } }, multi: true }],
+});
+sampleDb.runCommand({
+    delete: 'docs',
+    deletes: [{ q: { a: 2 }, limit: 1 }],
+});
+
+// Cleanup drop (a second drop so the assert can expect drop>=2)
+sampleDb.runCommand({ drop: 'movies' });
 EOF
 mongosh_rc=$?
 set -e
 
-# Give the proxy a moment to flush its last response log line.
-sleep 0.5
+# Allow the proxy time to flush the last response log line for fire-and-forget
+# commands mongosh emits on exit (e.g. endSessions / killCursors).
+sleep 2
 kill -TERM "$PROXY_PID" 2>/dev/null || true
 wait "$PROXY_PID" 2>/dev/null || true
 PROXY_PID=""
@@ -182,33 +248,73 @@ CLEAN_LOG="${ARTIFACTS_DIR}/proxy.clean.log"
 sed -E 's/\x1B\[[0-9;]*[A-Za-z]//g' "$LOG_FILE" > "$CLEAN_LOG"
 
 fail=0
-require_token() {
-    local pattern="$1"
-    local label="$2"
-    if ! grep -qF "$pattern" "$CLEAN_LOG"; then
-        err "FAIL: log missing $label (substring: $pattern)"
+
+# Count occurrences of a given (direction, command) pair on the structured
+# log line. The LogService emits: `direction: "X", op: "...", command: "CMD", ...`
+# in that order, so a regex anchored to both fields is robust.
+count_dir_command() {
+    local direction="$1" cmd="$2"
+    grep -cE "direction: \"${direction}\", op: \"[A-Z_]+\", command: \"${cmd}\"" "$CLEAN_LOG" || true
+}
+
+# Note on response classification: OP_MSG responses carry result documents
+# whose first BSON key is `cursor` / `ok` / `databases` / etc., not the
+# command name. So we assert against the *request* side (where command name
+# is unambiguous) and verify overall request/response parity separately.
+expect_command() {
+    local cmd="$1" min="$2"
+    local req
+    req=$(count_dir_command request "$cmd")
+    printf '  %-18s requests=%-3s (min=%s)\n' "$cmd" "$req" "$min"
+    if [[ "$req" -lt "$min" ]]; then
+        err "FAIL: expected >=$min request(s) classified as command=$cmd, got $req"
         fail=1
     fi
 }
 
-require_token 'received request'    'request log line'
-require_token 'received response'   'response log line'
-require_token 'OP_MSG'              'OP_MSG operation tag'
-require_token '"find"'              'find command in captured body'
-require_token '"getMore"'           'getMore command (proves multi-batch reply handling)'
-require_token '"aggregate"'         'aggregate command'
-require_token '"movies"'            'collection name in captured body'
-require_token 'sample'              'database name in captured body'
+log "per-command breakdown (commands classified by the proxy):"
+# Commands we explicitly drove via mongosh. Minimums are conservative because
+# mongosh + the server also emit driver-internal commands (extra hello / endSessions).
+expect_command hello           1
+expect_command buildInfo       1
+expect_command drop            2
+expect_command insert          3   # insertMany + 2x insertOne
+expect_command createIndexes   1
+expect_command listIndexes     1
+expect_command find            2
+expect_command getMore         3   # 500 docs / batch ~101 -> several getMore
+expect_command aggregate       2   # explicit aggregate + countDocuments
+expect_command count           1
+expect_command update          2
+expect_command delete          1
+expect_command listCollections 1
+expect_command listDatabases   1
 
-requests=$(grep -c 'received request' "$CLEAN_LOG" || true)
-responses=$(grep -c 'received response' "$CLEAN_LOG" || true)
-log "captured $requests requests / $responses responses"
-if [[ "$requests" -lt 10 ]]; then
-    err "FAIL: only $requests requests captured, expected at least 10"
+# Op-code mix
+op_msg_req=$(grep -cE 'direction: "request", op: "OP_MSG"' "$CLEAN_LOG" || true)
+op_msg_resp=$(grep -cE 'direction: "response", op: "OP_MSG"' "$CLEAN_LOG" || true)
+op_query_req=$(grep -cE 'direction: "request", op: "OP_QUERY"' "$CLEAN_LOG" || true)
+op_reply_resp=$(grep -cE 'direction: "response", op: "OP_REPLY"' "$CLEAN_LOG" || true)
+log "op-code mix: OP_MSG req=$op_msg_req resp=$op_msg_resp | OP_QUERY req=$op_query_req | OP_REPLY resp=$op_reply_resp"
+
+if [[ "$op_msg_req" -lt 20 ]]; then
+    err "FAIL: expected >=20 OP_MSG requests, got $op_msg_req"
     fail=1
 fi
-if [[ "$responses" -lt 10 ]]; then
-    err "FAIL: only $responses responses captured, expected at least 10"
+if [[ "$op_msg_resp" -lt 20 ]]; then
+    err "FAIL: expected >=20 OP_MSG responses, got $op_msg_resp"
+    fail=1
+fi
+
+# Sanity: every request should have a paired response (modulo fire-and-forget).
+total_req=$(grep -c 'received request' "$CLEAN_LOG" || true)
+total_resp=$(grep -c 'received response' "$CLEAN_LOG" || true)
+log "total: requests=$total_req responses=$total_resp"
+# Allow a small gap for endSessions / killCursors mongosh sends on exit.
+gap=$(( total_req - total_resp ))
+if (( gap < 0 )); then gap=$(( -gap )); fi
+if (( gap > 4 )); then
+    err "FAIL: request/response count imbalance too large ($total_req vs $total_resp)"
     fail=1
 fi
 
@@ -218,4 +324,4 @@ if [[ $fail -ne 0 ]]; then
     exit 1
 fi
 
-log "OK: proxy captured all expected traffic patterns"
+log "OK: proxy correctly classified every expected command"

@@ -20,7 +20,7 @@ pub mod op_msg_01 {
     }
 }
 
-pub mod op_msg_02 {
+pub mod op_query_01 {
 
     use super::*;
 

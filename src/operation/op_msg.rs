@@ -1,63 +1,222 @@
-use std::num::NonZeroI32;
+//! Modern OP_MSG opcode (`2013`).
+//!
+//! Every command issued by current MongoDB drivers is carried in an OP_MSG.
+//! The opcode supports a flag bitfield (see [`OperationMessageFlags`]), one
+//! or more sections (both kind-0 *body* sections and kind-1 *document
+//! sequence* sections are supported), and an optional CRC-32C checksum.
+
+use std::{
+    ffi::{CStr, CString, FromBytesUntilNulError, NulError},
+    io::Cursor,
+    num::NonZeroI32,
+    str::Utf8Error,
+};
 
 use bitflags::bitflags;
+use bson::Document;
 use tokio_util::bytes::{BufMut, BytesMut};
 
 use crate::{header::MessageHeader, op_code::OPCode};
 
+/// Mask of the bits the spec classifies as *required* (`0..16`).
+///
+/// Parsers MUST error on an unknown required bit. Unknown optional bits
+/// (`16..32`) are silently cleared.
+const REQUIRED_BITS_MASK: u32 = 0x0000_FFFF;
+
 bitflags! {
-    /// The flagBits integer is a bitmask encoding flags that modify the format and behavior of OP_MSG.
-    /// The first 16 bits (0-15) are required and parsers MUST error if an unknown bit is set.
-    /// The last 16 bits (16-31) are optional, and parsers MUST ignore any unknown set bits. Proxies and other message forwarders MUST clear any unknown optional bits before forwarding messages.
+    /// `flagBits` bitmask carried in the first four bytes of an OP_MSG body.
+    ///
+    /// The MongoDB wire spec splits the bits into two halves:
+    ///
+    /// * **required** (`0..16`) — parsers MUST error on an unknown bit set
+    ///   here. Mutating proxies must preserve known required bits verbatim.
+    /// * **optional** (`16..32`) — parsers MUST ignore unknown bits, and
+    ///   proxies MUST clear unknown optional bits before forwarding.
+    ///
+    /// This crate implements both halves of that contract in
+    /// [`OperationMessage::from_bytes`].
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct OperationMessageFlags: u32 {
-        // The message ends with 4 bytes containing a CRC-32C [2] checksum. See Checksum for details.
-        const CHECKSUM_PRESENT = 0b0000_0000_0000_0001;
-        // Another message will follow this one without further action from the receiver. The receiver MUST NOT send another message until receiving one with moreToCome set to 0 as sends may block, causing deadlock. Requests with the moreToCome bit set will not receive a reply. Replies will only have this set in response to requests with the exhaustAllowed bit set.
-        const MORE_TO_COME = 0b0000_0000_0000_0010;
-        // The client is prepared for multiple replies to this request using the moreToCome bit. The server will never produce replies with the moreToCome bit set unless the request has this bit set.
-        // This ensures that multiple replies are only sent when the network layer of the requester is prepared for them.
-        const EXHAUST_ALLOWED = 0b1000_0000_0000_0000;
+        /// The message ends with a four-byte CRC-32C checksum.
+        const CHECKSUM_PRESENT = 1 << 0;
+        /// On a request: fire-and-forget — server will not reply.
+        ///
+        /// On a reply: another reply for the same request will follow on this
+        /// socket without the client sending anything (streaming SDAM /
+        /// exhaust cursors).
+        const MORE_TO_COME = 1 << 1;
+        /// On a request: the client is prepared to receive a stream of
+        /// replies using `MORE_TO_COME`. Server will not stream unless the
+        /// originating request had this set.
+        const EXHAUST_ALLOWED = 1 << 16;
     }
 }
 
+/// One section in an OP_MSG body.
+///
+/// An OP_MSG always carries at least one [`OpMsgSection::Body`] section
+/// (the command document). Bulk-write commands (`insert`, `update`,
+/// `delete`) additionally carry one or more [`OpMsgSection::DocumentSequence`]
+/// sections that contain the array of documents / updates / deletes, lifted
+/// out of the body for wire efficiency.
+#[derive(Clone, Debug, PartialEq)]
+pub enum OpMsgSection {
+    /// Kind-0: a single BSON document (the "body"). By convention the first
+    /// key of the document is the command name (`find`, `insert`, ...).
+    Body(Document),
+    /// Kind-1: a named sequence of BSON documents. The driver uses this for
+    /// large arrays such as `insert.documents`, `update.updates`,
+    /// `delete.deletes`.
+    DocumentSequence {
+        /// Field name the documents would have occupied if inlined into the
+        /// body document.
+        identifier: String,
+        /// The documents themselves, in order.
+        documents: Vec<Document>,
+    },
+}
+
+impl OpMsgSection {
+    /// Returns `Some(&doc)` if this section is a [`OpMsgSection::Body`].
+    pub fn as_body(&self) -> Option<&Document> {
+        match self {
+            OpMsgSection::Body(doc) => Some(doc),
+            OpMsgSection::DocumentSequence { .. } => None,
+        }
+    }
+}
+
+/// Modern OP_MSG message body.
+///
+/// `sections` always has at least one element; the first element is
+/// conventionally a [`OpMsgSection::Body`] carrying the command document.
+/// Bulk-write commands append one or more [`OpMsgSection::DocumentSequence`]
+/// sections after it.
+///
+/// # Examples
+///
+/// Round-trip an OP_MSG body through the wire encoding:
+///
+/// ```
+/// use bson::doc;
+/// use mongod_proxy::header::MessageHeader;
+/// use mongod_proxy::message::Message;
+/// use mongod_proxy::operation::Operation;
+/// use mongod_proxy::operation::op_msg::{OpMsgSection, OperationMessage, OperationMessageFlags};
+/// use tokio_util::bytes::BytesMut;
+///
+/// let msg = Message {
+///     request_id: 42,
+///     response_to: None,
+///     operation: Operation::Message(OperationMessage {
+///         flags: OperationMessageFlags::MORE_TO_COME,
+///         sections: vec![OpMsgSection::Body(doc! { "find": "movies", "$db": "sample" })],
+///         checksum: None,
+///     }),
+/// };
+///
+/// let mut buf = BytesMut::new();
+/// msg.write_bytes(&mut buf).unwrap();
+/// let body = &buf[MessageHeader::size()..];
+/// let parsed = OperationMessage::from_bytes(body).unwrap();
+/// assert!(parsed.flags.contains(OperationMessageFlags::MORE_TO_COME));
+/// assert_eq!(parsed.command_name(), Some("find"));
+/// ```
 #[derive(Clone, Debug, PartialEq)]
 pub struct OperationMessage {
+    /// `flagBits` field controlling checksum, streaming, etc.
     pub flags: OperationMessageFlags,
-    pub sections: bson::Document,
+    /// Body and document-sequence sections in their on-the-wire order.
+    pub sections: Vec<OpMsgSection>,
+    /// `Some(crc)` when [`OperationMessageFlags::CHECKSUM_PRESENT`] is set on
+    /// the wire. The proxy preserves it across round-trips; it does not
+    /// currently validate the CRC against the rest of the message.
     pub checksum: Option<u32>,
 }
 
+/// Failure modes for [`OperationMessage::from_bytes`].
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum OperationMessageParseError {
+    /// Body shorter than the unconditional minimum (flag bits + first kind byte).
     #[error("not enough bytes, expected at least {min} bytes, got {actual}")]
     NotEnoughBytes { actual: usize, min: usize },
-    #[error("invalid bitflags")]
-    InvalidBitflags,
-    #[error("invalid kind, expected 0, got {0}")]
+    /// One or more *required* flag bits (`0..16`) set are not understood.
+    /// The included `u32` is the unknown bits only (known bits masked off).
+    #[error("unknown required flag bits set: {0:#010x}")]
+    UnknownRequiredBits(u32),
+    /// A section's `kind` byte was neither `0` (body) nor `1` (document sequence).
+    #[error("invalid section kind, expected 0 or 1, got {0}")]
     InvalidKind(u8),
+    /// `CHECKSUM_PRESENT` flag set but fewer than four trailing bytes remain.
     #[error("checksum is missing")]
     MissingChecksum,
+    /// A kind-1 section's self-declared size did not fit in the buffer.
+    #[error("document sequence section size {size} out of range")]
+    InvalidDocumentSequenceSize { size: i32 },
+    /// A kind-1 section's identifier (cstring) was malformed.
+    #[error("invalid document sequence identifier: {0}")]
+    InvalidDocumentSequenceIdentifier(String),
+    /// BSON parsing of a section document failed.
     #[error("failed to parse bson: {0}")]
     InvalidBson(String),
 }
 
+impl From<FromBytesUntilNulError> for OperationMessageParseError {
+    fn from(value: FromBytesUntilNulError) -> Self {
+        OperationMessageParseError::InvalidDocumentSequenceIdentifier(value.to_string())
+    }
+}
+
+impl From<Utf8Error> for OperationMessageParseError {
+    fn from(value: Utf8Error) -> Self {
+        OperationMessageParseError::InvalidDocumentSequenceIdentifier(value.to_string())
+    }
+}
+
+/// Failure modes for [`OperationMessage::write_bytes`].
 #[derive(Debug, thiserror::Error)]
 pub enum OperationMessageWriteError {
+    /// Serialising a section's BSON document failed.
     #[error("failed to serialize sections: {0}")]
     SerializeError(#[from] bson::ser::Error),
+    /// A document-sequence section's identifier contained an interior NUL
+    /// byte and so could not be written as a C string.
+    #[error("document sequence identifier contains null byte: {0}")]
+    IdentifierContainsNullByte(#[from] NulError),
 }
 
 impl OperationMessage {
-    pub fn min_len() -> usize {
-        size_of::<OperationMessageFlags>() + size_of::<u8>()
+    /// Smallest possible OP_MSG body size in bytes (`flagBits` + first
+    /// section's `kind` byte). Empty BSON sections add more on top of this.
+    pub const fn min_len() -> usize {
+        size_of::<u32>() + size_of::<u8>()
     }
 
+    /// Returns the command name carried by this message, if one can be
+    /// identified.
+    ///
+    /// By convention the first key of the first [`OpMsgSection::Body`]
+    /// section is the command name (e.g. `"find"`, `"insert"`). Server
+    /// responses don't carry a command name and return `None`.
+    pub fn command_name(&self) -> Option<&str> {
+        self.sections
+            .iter()
+            .find_map(OpMsgSection::as_body)
+            .and_then(|d| d.keys().next())
+            .map(String::as_str)
+    }
+
+    /// Parses an OP_MSG body. `bytes` must NOT include the 16-byte
+    /// [`MessageHeader`]; the caller is expected to have stripped it off.
+    ///
+    /// # Errors
+    ///
+    /// See [`OperationMessageParseError`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, OperationMessageParseError> {
         let actual_len = bytes.len();
         let min_len = Self::min_len();
 
-        // verify minimum length
         if actual_len < min_len {
             return Err(OperationMessageParseError::NotEnoughBytes {
                 actual: actual_len,
@@ -65,49 +224,39 @@ impl OperationMessage {
             });
         }
 
-        // parse the messages flags
-        let flags = OperationMessageFlags::from_bits(u32::from_le_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3],
-        ]))
-        .ok_or_else(|| OperationMessageParseError::InvalidBitflags)?;
-
-        // get the message kind
-        let kind = bytes[4];
-
-        // make sure the message kind is 0
-        if kind != 0 {
-            return Err(OperationMessageParseError::InvalidKind(kind));
+        let raw_flags = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let unknown_required =
+            (raw_flags & REQUIRED_BITS_MASK) & !OperationMessageFlags::all().bits();
+        if unknown_required != 0 {
+            return Err(OperationMessageParseError::UnknownRequiredBits(
+                unknown_required,
+            ));
         }
+        // from_bits_truncate clears unknown optional bits (16-31) per spec.
+        let flags = OperationMessageFlags::from_bits_truncate(raw_flags);
 
-        // get rid of the prefix
-        let bytes = &bytes[Self::min_len()..];
-
-        // now split of the checksum if nesseseary
-        let (bytes, checksum) = if flags.contains(OperationMessageFlags::CHECKSUM_PRESENT) {
-            let checksum_len = size_of::<usize>();
-            let bytes_len = bytes.len();
-            if bytes_len < checksum_len {
+        // Split off the trailing checksum (if any) before iterating sections.
+        let after_flags = &bytes[4..];
+        let (sections_bytes, checksum) = if flags.contains(OperationMessageFlags::CHECKSUM_PRESENT)
+        {
+            let checksum_len = size_of::<u32>();
+            if after_flags.len() < checksum_len {
                 return Err(OperationMessageParseError::MissingChecksum);
             }
-
-            let bytes_len = bytes_len - checksum_len;
-            let (bytes, checksum) = bytes.split_at(bytes_len);
-            (
-                bytes,
-                Some(u32::from_le_bytes([
-                    checksum[0],
-                    checksum[1],
-                    checksum[2],
-                    checksum[3],
-                ])),
-            )
+            let body_len = after_flags.len() - checksum_len;
+            let (body, checksum_bytes) = after_flags.split_at(body_len);
+            let checksum = u32::from_le_bytes([
+                checksum_bytes[0],
+                checksum_bytes[1],
+                checksum_bytes[2],
+                checksum_bytes[3],
+            ]);
+            (body, Some(checksum))
         } else {
-            (bytes, None)
+            (after_flags, None)
         };
 
-        // parse bson
-        let sections = bson::Document::from_reader(bytes)
-            .map_err(|e| OperationMessageParseError::InvalidBson(e.to_string()))?;
+        let sections = parse_sections(sections_bytes)?;
 
         Ok(Self {
             checksum,
@@ -116,45 +265,287 @@ impl OperationMessage {
         })
     }
 
+    /// Appends a full OP_MSG frame (header + body) to `dst`.
+    ///
+    /// The function unconditionally sets / clears
+    /// [`OperationMessageFlags::CHECKSUM_PRESENT`] to match whether
+    /// `self.checksum` is `Some` — so the bit and the trailing checksum
+    /// bytes cannot disagree on the wire.
+    ///
+    /// # Errors
+    ///
+    /// See [`OperationMessageWriteError`].
     pub fn write_bytes(
         &self,
         dst: &mut BytesMut,
         request_id: i32,
         response_to: Option<NonZeroI32>,
     ) -> Result<(), OperationMessageWriteError> {
-        // Serialize sections
-        let body_bytes = bson::to_vec(&self.sections)?;
+        // Pre-serialise every section so we know the on-the-wire length up
+        // front (the header carries the total message_length).
+        let mut sections_bytes = Vec::new();
+        for section in &self.sections {
+            write_section(section, &mut sections_bytes)?;
+        }
 
-        // Calculate the size of the message
-        // - size of header (4 * i32 = 16 bytes)
-        // - size of flags (i32 = 4 bytes)
-        // - size of kind (u8 = 1 byte)
-        // - size of body bytes
-        // - no checksum => 0 bytes
+        // Re-derive checksum-present flag from struct state to avoid mismatch.
+        let mut flags = self.flags;
+        flags.set(
+            OperationMessageFlags::CHECKSUM_PRESENT,
+            self.checksum.is_some(),
+        );
+
+        let checksum_len = if self.checksum.is_some() {
+            size_of::<u32>()
+        } else {
+            0
+        };
+
         let message_length =
-            MessageHeader::size() + size_of::<i32>() + size_of::<u8>() + body_bytes.len();
+            MessageHeader::size() + size_of::<u32>() + sections_bytes.len() + checksum_len;
 
-        // Allocate memory
         dst.reserve(message_length);
 
-        // Write the header
         let header = MessageHeader {
             message_length: message_length as i32,
             op_code: OPCode::Msg,
             request_id,
             response_to,
         };
-
         header.write_bytes(dst);
 
-        // Write the rest of the message
-        // Flags
-        dst.put_u32_le(OperationMessageFlags::empty().bits());
-        // Kind
-        dst.put_u8(0);
-        // Data
-        dst.put(body_bytes.as_slice());
+        dst.put_u32_le(flags.bits());
+        dst.put(sections_bytes.as_slice());
+
+        if let Some(checksum) = self.checksum {
+            dst.put_u32_le(checksum);
+        }
 
         Ok(())
+    }
+}
+
+fn parse_sections(bytes: &[u8]) -> Result<Vec<OpMsgSection>, OperationMessageParseError> {
+    let mut cursor = Cursor::new(bytes);
+    let mut sections = Vec::new();
+    while (cursor.position() as usize) < bytes.len() {
+        let pos = cursor.position() as usize;
+        let kind = bytes[pos];
+        cursor.set_position(pos as u64 + 1);
+        match kind {
+            0 => {
+                let doc = Document::from_reader(&mut cursor)
+                    .map_err(|e| OperationMessageParseError::InvalidBson(e.to_string()))?;
+                sections.push(OpMsgSection::Body(doc));
+            }
+            1 => {
+                let section_start = cursor.position() as usize;
+                if bytes.len() < section_start + 4 {
+                    return Err(OperationMessageParseError::InvalidDocumentSequenceSize {
+                        size: 0,
+                    });
+                }
+                let size = i32::from_le_bytes([
+                    bytes[section_start],
+                    bytes[section_start + 1],
+                    bytes[section_start + 2],
+                    bytes[section_start + 3],
+                ]);
+                if size < 5 || (section_start + size as usize) > bytes.len() {
+                    return Err(OperationMessageParseError::InvalidDocumentSequenceSize { size });
+                }
+                // Section payload (identifier + docs) excludes the kind byte
+                // and includes the size field itself.
+                let payload_end = section_start + size as usize;
+                cursor.set_position(section_start as u64 + 4);
+
+                let identifier_bytes = &bytes[cursor.position() as usize..payload_end];
+                let identifier_cstr = CStr::from_bytes_until_nul(identifier_bytes)?;
+                let identifier = identifier_cstr.to_str()?.to_owned();
+                cursor.set_position(cursor.position() + identifier_cstr.count_bytes() as u64 + 1);
+
+                let mut documents = Vec::new();
+                while (cursor.position() as usize) < payload_end {
+                    let doc = Document::from_reader(&mut cursor)
+                        .map_err(|e| OperationMessageParseError::InvalidBson(e.to_string()))?;
+                    documents.push(doc);
+                }
+                sections.push(OpMsgSection::DocumentSequence {
+                    identifier,
+                    documents,
+                });
+            }
+            other => return Err(OperationMessageParseError::InvalidKind(other)),
+        }
+    }
+    Ok(sections)
+}
+
+fn write_section(
+    section: &OpMsgSection,
+    out: &mut Vec<u8>,
+) -> Result<(), OperationMessageWriteError> {
+    match section {
+        OpMsgSection::Body(doc) => {
+            out.push(0);
+            doc.to_writer(&mut *out)?;
+        }
+        OpMsgSection::DocumentSequence {
+            identifier,
+            documents,
+        } => {
+            out.push(1);
+            let identifier_cstring = CString::new(identifier.as_str())?;
+            let identifier_bytes = identifier_cstring.as_bytes_with_nul();
+
+            // We need the size up front, so serialise docs into a scratch
+            // buffer first.
+            let mut docs_bytes = Vec::new();
+            for doc in documents {
+                doc.to_writer(&mut docs_bytes)?;
+            }
+
+            let size_field = size_of::<i32>();
+            let section_size = size_field + identifier_bytes.len() + docs_bytes.len();
+            // The size field is the size INCLUDING itself, NOT including the
+            // leading kind byte.
+            out.extend_from_slice(&(section_size as i32).to_le_bytes());
+            out.extend_from_slice(identifier_bytes);
+            out.extend_from_slice(&docs_bytes);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bson::doc;
+
+    fn sample_body() -> OpMsgSection {
+        OpMsgSection::Body(doc! { "hello": 1 })
+    }
+
+    fn sample_sections() -> Vec<OpMsgSection> {
+        vec![sample_body()]
+    }
+
+    #[test]
+    fn round_trip_preserves_more_to_come_flag() {
+        let msg = OperationMessage {
+            flags: OperationMessageFlags::MORE_TO_COME,
+            sections: sample_sections(),
+            checksum: None,
+        };
+        let mut buf = BytesMut::new();
+        msg.write_bytes(&mut buf, 1, None).unwrap();
+        // Skip 16-byte header to reach flags.
+        let raw_flags = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
+        assert_eq!(
+            raw_flags,
+            OperationMessageFlags::MORE_TO_COME.bits(),
+            "self.flags must be written, not empty"
+        );
+    }
+
+    #[test]
+    fn round_trip_with_checksum() {
+        let msg = OperationMessage {
+            flags: OperationMessageFlags::empty(),
+            sections: sample_sections(),
+            checksum: Some(0xDEADBEEF),
+        };
+        let mut buf = BytesMut::new();
+        msg.write_bytes(&mut buf, 1, None).unwrap();
+
+        let body = &buf[MessageHeader::size()..];
+        let parsed = OperationMessage::from_bytes(body).unwrap();
+        assert_eq!(parsed.checksum, Some(0xDEADBEEF));
+        assert!(
+            parsed
+                .flags
+                .contains(OperationMessageFlags::CHECKSUM_PRESENT)
+        );
+        assert_eq!(parsed.sections, sample_sections());
+    }
+
+    #[test]
+    fn parse_errors_on_unknown_required_bit() {
+        let mut body = Vec::new();
+        // Use bit 2 (unknown required).
+        body.extend_from_slice(&(1u32 << 2).to_le_bytes());
+        body.push(0); // kind
+        let doc_bytes = bson::to_vec(&doc! { "hello": 1 }).unwrap();
+        body.extend_from_slice(&doc_bytes);
+
+        let err = OperationMessage::from_bytes(&body).unwrap_err();
+        assert!(matches!(
+            err,
+            OperationMessageParseError::UnknownRequiredBits(_)
+        ));
+    }
+
+    #[test]
+    fn parse_clears_unknown_optional_bits() {
+        let mut body = Vec::new();
+        // Set bit 17 (unknown optional) — must be silently cleared per spec.
+        body.extend_from_slice(&(1u32 << 17).to_le_bytes());
+        body.push(0);
+        let doc_bytes = bson::to_vec(&doc! { "hello": 1 }).unwrap();
+        body.extend_from_slice(&doc_bytes);
+
+        let parsed = OperationMessage::from_bytes(&body).unwrap();
+        assert_eq!(parsed.flags, OperationMessageFlags::empty());
+    }
+
+    #[test]
+    fn parse_round_trips_exhaust_allowed_at_bit_16() {
+        let msg = OperationMessage {
+            flags: OperationMessageFlags::EXHAUST_ALLOWED,
+            sections: sample_sections(),
+            checksum: None,
+        };
+        let mut buf = BytesMut::new();
+        msg.write_bytes(&mut buf, 1, None).unwrap();
+        let body = &buf[MessageHeader::size()..];
+        let parsed = OperationMessage::from_bytes(body).unwrap();
+        assert_eq!(parsed.flags, OperationMessageFlags::EXHAUST_ALLOWED);
+    }
+
+    #[test]
+    fn round_trip_body_plus_document_sequence() {
+        // This is the shape a driver-emitted `insert` takes: the command
+        // lives in a kind-0 body section, the documents-to-insert in a
+        // kind-1 document-sequence section called "documents".
+        let msg = OperationMessage {
+            flags: OperationMessageFlags::empty(),
+            sections: vec![
+                OpMsgSection::Body(doc! { "insert": "movies", "$db": "sample" }),
+                OpMsgSection::DocumentSequence {
+                    identifier: "documents".to_owned(),
+                    documents: vec![
+                        doc! { "_id": 1, "title": "Movie 1" },
+                        doc! { "_id": 2, "title": "Movie 2" },
+                        doc! { "_id": 3, "title": "Movie 3" },
+                    ],
+                },
+            ],
+            checksum: None,
+        };
+        let mut buf = BytesMut::new();
+        msg.write_bytes(&mut buf, 7, None).unwrap();
+        let body = &buf[MessageHeader::size()..];
+        let parsed = OperationMessage::from_bytes(body).unwrap();
+        assert_eq!(parsed, msg);
+        assert_eq!(parsed.command_name(), Some("insert"));
+    }
+
+    #[test]
+    fn parse_errors_on_unknown_section_kind() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u32.to_le_bytes()); // flags
+        body.push(99); // unknown kind
+        let err = OperationMessage::from_bytes(&body).unwrap_err();
+        assert!(matches!(err, OperationMessageParseError::InvalidKind(99)));
     }
 }

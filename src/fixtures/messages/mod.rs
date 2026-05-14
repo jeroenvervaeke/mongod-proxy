@@ -1,5 +1,5 @@
 use crate::operation::{
-    op_msg::{OperationMessage, OperationMessageFlags},
+    op_msg::{OpMsgSection, OperationMessage, OperationMessageFlags},
     op_query::{OperationQuery, OperationQueryFlags},
     op_reply::{OperationReply, OperationReplyFlags},
 };
@@ -20,7 +20,7 @@ pub mod msg_00_query_request {
             response_to: None,
             operation: Operation::Message(OperationMessage {
                 flags: OperationMessageFlags::empty(),
-                sections: doc! {
+                sections: vec![OpMsgSection::Body(doc! {
                     "find": "softwares",
                     "filter": {},
                     "sort": {
@@ -32,7 +32,7 @@ pub mod msg_00_query_request {
                         "id": uuid
                     },
                     "$db": "msoftware"
-                },
+                })],
                 checksum: None,
             }),
         }
@@ -52,7 +52,7 @@ pub mod msg_00_query_response {
             response_to: NonZeroI32::new(17),
             operation: Operation::Message(OperationMessage {
                 flags: OperationMessageFlags::empty(),
-                sections: doc! {
+                sections: vec![OpMsgSection::Body(doc! {
                     "cursor": {
                         "firstBatch": vec![
                             doc! {
@@ -144,7 +144,7 @@ pub mod msg_00_query_response {
                         "ns": "msoftware.softwares"
                     },
                     "ok": 1.0
-                },
+                })],
                 checksum: None,
             }),
         }
@@ -211,7 +211,6 @@ pub mod msg_01_legacy_op_reply {
                 flags: OperationReplyFlags::AWAIT_CAPABLE,
                 cursor_id: 0,
                 starting_from: 0,
-                number_returned: 1,
                 documents: vec![doc! {
                 "helloOk": true,
                 "ismaster": true,

@@ -30,6 +30,7 @@ pub enum AndKind {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Stage {
+    // -------- Classic query-plan engine (uppercase wire names) --------
     Collscan,
     Ixscan,
     Fetch,
@@ -49,6 +50,34 @@ pub enum Stage {
     DistinctScan,
     UpdateStage,
     DeleteStage,
+
+    // -------- Slot-Based Execution engine (MongoDB 8+, lowercase wire names) --------
+    //
+    // SBE stages are kept distinct from their classic counterparts so
+    // consumers can tell which engine actually executed the query.
+    // Folding `scan` into `Collscan` would lie about the execution
+    // engine.
+    SbeScan,
+    SbeIxscan,
+    SbeIxseek,
+    SbeFetch,
+    SbeFilter,
+    SbeProject,
+    SbeGroup,
+    SbeSort,
+    SbeLimit,
+    SbeSkip,
+    SbeOr,
+    SbeUnwind,
+    SbeHashLookup,
+    SbeMerge,
+
+    // -------- MongoDB 8 "express" fast paths (single-document by `_id`). --------
+    ExpressIxscan,
+    ExpressClusteredIxscan,
+    ExpressUpdate,
+    ExpressDelete,
+
     Other(OtherName),
 }
 
@@ -81,6 +110,7 @@ impl Stage {
     #[allow(dead_code)]
     pub(crate) fn from_wire_str(s: &str) -> Self {
         match s {
+            // Classic query-plan engine (uppercase).
             "COLLSCAN" => Stage::Collscan,
             "IXSCAN" => Stage::Ixscan,
             "FETCH" => Stage::Fetch,
@@ -103,6 +133,32 @@ impl Stage {
             "DISTINCT_SCAN" => Stage::DistinctScan,
             "UPDATE" => Stage::UpdateStage,
             "DELETE" => Stage::DeleteStage,
+
+            // SBE engine (lowercase; MongoDB 8+).
+            "scan" => Stage::SbeScan,
+            "ixscan" => Stage::SbeIxscan,
+            "ixseek" => Stage::SbeIxseek,
+            "fetch" => Stage::SbeFetch,
+            "filter" => Stage::SbeFilter,
+            "project" => Stage::SbeProject,
+            "group" => Stage::SbeGroup,
+            "sort" => Stage::SbeSort,
+            "limit" => Stage::SbeLimit,
+            "skip" => Stage::SbeSkip,
+            "or" => Stage::SbeOr,
+            "unwind" => Stage::SbeUnwind,
+            "hash_lookup" => Stage::SbeHashLookup,
+            "merge" => Stage::SbeMerge,
+
+            // MongoDB 8 express fast paths — server emits both upper and
+            // lower-case forms across releases.
+            "EXPRESS_IXSCAN" | "express_ixscan" => Stage::ExpressIxscan,
+            "EXPRESS_CLUSTERED_IXSCAN" | "express_clustered_ixscan" => {
+                Stage::ExpressClusteredIxscan
+            }
+            "EXPRESS_UPDATE" | "express_update" => Stage::ExpressUpdate,
+            "EXPRESS_DELETE" | "express_delete" => Stage::ExpressDelete,
+
             _ => Stage::Other(OtherName::new(s.to_owned())),
         }
     }
@@ -152,6 +208,42 @@ mod tests {
         match Stage::from_wire_str("BRAND_NEW_STAGE") {
             Stage::Other(name) => assert_eq!(name.as_ref(), "brand_new_stage"),
             other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_wire_str_maps_sbe_lowercase_distinctly_from_classic() {
+        // Same conceptual operation, different execution engine. Folding
+        // these would lie about which engine ran the query.
+        assert_eq!(Stage::from_wire_str("scan"), Stage::SbeScan);
+        assert_ne!(Stage::from_wire_str("scan"), Stage::Collscan);
+        assert_eq!(Stage::from_wire_str("ixscan"), Stage::SbeIxscan);
+        assert_ne!(Stage::from_wire_str("ixscan"), Stage::Ixscan);
+    }
+
+    #[test]
+    fn from_wire_str_maps_sbe_only_stages() {
+        assert_eq!(Stage::from_wire_str("ixseek"), Stage::SbeIxseek);
+        assert_eq!(Stage::from_wire_str("filter"), Stage::SbeFilter);
+        assert_eq!(Stage::from_wire_str("project"), Stage::SbeProject);
+        assert_eq!(Stage::from_wire_str("group"), Stage::SbeGroup);
+    }
+
+    #[test]
+    fn from_wire_str_maps_express_fast_paths() {
+        // Server emits these in both upper and lower case across releases —
+        // both forms must round-trip to the same variant.
+        for s in ["EXPRESS_IXSCAN", "express_ixscan"] {
+            assert_eq!(Stage::from_wire_str(s), Stage::ExpressIxscan);
+        }
+        for s in ["EXPRESS_CLUSTERED_IXSCAN", "express_clustered_ixscan"] {
+            assert_eq!(Stage::from_wire_str(s), Stage::ExpressClusteredIxscan);
+        }
+        for s in ["EXPRESS_UPDATE", "express_update"] {
+            assert_eq!(Stage::from_wire_str(s), Stage::ExpressUpdate);
+        }
+        for s in ["EXPRESS_DELETE", "express_delete"] {
+            assert_eq!(Stage::from_wire_str(s), Stage::ExpressDelete);
         }
     }
 }

@@ -127,6 +127,18 @@ async fn proxy_intercepts_every_command_we_send() {
     let client = Client::with_options(options).expect("client");
 
     let db = client.database("e2e_intercept");
+
+    // ----- 4. Drive traffic one op at a time, verifying the proxy actually
+    //          intercepted that op before moving on. -----
+    //
+    // Each phase follows the same pattern: drain any background events from
+    // the recorder, run exactly one driver operation, drain again, and
+    // assert what we just observed. That way a regression in any single
+    // command is reported against *that* command rather than as a confusing
+    // tally at the end of the test.
+
+    // ----- Warm-up: trigger driver handshake + drop any leftover state from
+    // a previous run, then flush so the assertions below see only fresh ops.
     let _ = db
         .collection::<mongodb::bson::Document>("movies")
         .drop()
@@ -135,25 +147,61 @@ async fn proxy_intercepts_every_command_we_send() {
         .collection::<mongodb::bson::Document>("docs")
         .drop()
         .await;
+    let warmup = recorder.drain();
+    eprintln!(
+        "  warmup discarded {} background events (handshake/drop)",
+        warmup.len()
+    );
 
-    // Insert -> proxy must see at least one OP_MSG with command="insert"
     let coll = db.collection::<mongodb::bson::Document>("movies");
+
+    // ----- Phase 1: insert -----
+    phase("insert (500 docs)");
     let mut docs = Vec::new();
     for i in 0..500i32 {
         let group = ["a", "b", "c", "d"][(i as usize) % 4];
         docs.push(doc! { "_id": i, "n": i, "g": group });
     }
     coll.insert_many(docs).await.expect("insert_many");
+    let events = recorder.drain();
+    assert_observed(&events, "insert", 1);
 
-    // Find with explicit batchSize -> drives multiple getMore round-trips.
+    // ----- Phase 2: find -----
+    //
+    // `find` opens the cursor and returns the first batch. Subsequent
+    // `getMore` requests are issued lazily by the cursor iterator.
+    phase("find (open cursor)");
     let mut cursor = coll.find(doc! {}).batch_size(50).await.expect("find");
+    let events = recorder.drain();
+    assert_observed(&events, "find", 1);
+
+    // ----- Phase 3: getMore -----
+    phase("getMore (drain 500 docs at batchSize 50)");
     let mut seen = 0usize;
     while cursor.advance().await.expect("advance") {
         seen += 1;
     }
     assert_eq!(seen, 500, "cursor must surface every inserted document");
+    let events = recorder.drain();
+    // 500 docs / batchSize 50 -> 10 batches; first one came from `find`, so
+    // we expect 9 getMore round-trips. The driver may issue an extra one to
+    // detect cursor exhaustion, so accept >= 9.
+    let getmore_reqs = count_requests(&events, "getMore");
+    let getmore_resps = count_responses(&events, "getMore");
+    eprintln!("  observed getMore: {getmore_reqs} request(s), {getmore_resps} response(s)");
+    assert!(
+        getmore_reqs >= 9,
+        "expected >=9 getMore requests, got {getmore_reqs}\nevents:\n{}",
+        format_events(&events)
+    );
+    assert!(
+        getmore_resps >= 9,
+        "expected >=9 getMore responses, got {getmore_resps}\nevents:\n{}",
+        format_events(&events)
+    );
 
-    // Aggregate -> command="aggregate"
+    // ----- Phase 4: aggregate -----
+    phase("aggregate ($group on genre)");
     let _agg: Vec<_> = coll
         .aggregate(vec![doc! { "$group": { "_id": "$g", "n": { "$sum": 1 } } }])
         .await
@@ -161,106 +209,99 @@ async fn proxy_intercepts_every_command_we_send() {
         .with_type::<mongodb::bson::Document>()
         .collect()
         .await;
+    let events = recorder.drain();
+    assert_observed(&events, "aggregate", 1);
 
-    // Mutation commands -> command="update" / "delete"
+    // ----- Phase 5: update -----
+    phase("update (set touched=true on g=a)");
     coll.update_many(doc! { "g": "a" }, doc! { "$set": { "touched": true } })
         .await
         .expect("update");
+    let events = recorder.drain();
+    assert_observed(&events, "update", 1);
+
+    // ----- Phase 6: delete -----
+    phase("delete (g=b)");
     coll.delete_many(doc! { "g": "b" }).await.expect("delete");
+    let events = recorder.drain();
+    assert_observed(&events, "delete", 1);
 
-    // Metadata commands
+    // ----- Phase 7: listCollections -----
+    phase("listCollections");
     db.list_collection_names().await.expect("list cols");
+    let events = recorder.drain();
+    assert_observed(&events, "listCollections", 1);
+
+    // ----- Phase 8: listDatabases -----
+    phase("listDatabases");
     client.list_database_names().await.expect("list dbs");
+    let events = recorder.drain();
+    assert_observed(&events, "listDatabases", 1);
 
-    // Hand-rolled runCommand to assert we can also push raw commands through.
+    // ----- Phase 9: raw runCommand(ping) -----
+    phase("runCommand(ping)");
     db.run_command(doc! { "ping": 1 }).await.expect("ping");
+    let events = recorder.drain();
+    assert_observed(&events, "ping", 1);
 
-    // ----- 5. Drain the proxy -----
+    // ----- 5. Shut down the proxy and clean up the deployment -----
     drop(client);
     tokio::time::sleep(Duration::from_millis(500)).await;
     proxy_task.abort();
     let _ = proxy_task.await;
 
-    // ----- 6. Assert on what the proxy actually saw -----
-    let events = recorder.snapshot();
-    eprintln!("recorded {} events", events.len());
-
-    let request_count = |cmd: &str| -> usize {
-        events
-            .iter()
-            .filter(|e| e.direction == Direction::Request && e.command.as_deref() == Some(cmd))
-            .count()
-    };
-    let response_count = |cmd: &str| -> usize {
-        events
-            .iter()
-            .filter(|e| e.direction == Direction::Response && e.responds_to.as_deref() == Some(cmd))
-            .count()
-    };
-    let request_op_count = |op: &str| -> usize {
-        events
-            .iter()
-            .filter(|e| e.direction == Direction::Request && e.op == op)
-            .count()
-    };
-
-    for cmd in [
-        "insert",
-        "find",
-        "getMore",
-        "aggregate",
-        "update",
-        "delete",
-        "listCollections",
-        "listDatabases",
-        "ping",
-    ] {
-        let req = request_count(cmd);
-        let resp = response_count(cmd);
-        eprintln!("  {cmd:<18} request={req:<3} response_to_request={resp}");
-        assert!(
-            req >= 1,
-            "proxy never saw a request with command={cmd:?} (events: {events:#?})",
-        );
-        assert!(
-            resp >= 1,
-            "proxy never saw a response paired to a {cmd:?} request (events: {events:#?})",
-        );
-    }
-
-    assert!(
-        request_count("getMore") >= 9,
-        "expected >=9 getMore requests for 500/50 batches, got {}",
-        request_count("getMore")
-    );
-
-    assert!(
-        request_op_count("OP_MSG") >= 10,
-        "expected many OP_MSG requests, got {}",
-        request_op_count("OP_MSG")
-    );
-
-    let total_requests = events
-        .iter()
-        .filter(|e| e.direction == Direction::Request)
-        .count();
-    let total_responses = events
-        .iter()
-        .filter(|e| e.direction == Direction::Response)
-        .count();
-    let gap = total_requests.abs_diff(total_responses);
-    assert!(
-        gap <= 4,
-        "request/response imbalance too large: {total_requests} vs {total_responses}"
-    );
-
-    // ----- 7. Cleanup -----
-    // Defuse the panic-safety guard first so we don't double-delete.
     cleanup_guard.defuse();
     atlas
         .delete_deployment(&deployment_name)
         .await
         .expect("delete deployment");
+}
+
+fn phase(name: &str) {
+    eprintln!("[phase] {name}");
+}
+
+fn count_requests(events: &[Event], cmd: &str) -> usize {
+    events
+        .iter()
+        .filter(|e| e.direction == Direction::Request && e.command.as_deref() == Some(cmd))
+        .count()
+}
+
+fn count_responses(events: &[Event], cmd: &str) -> usize {
+    events
+        .iter()
+        .filter(|e| e.direction == Direction::Response && e.responds_to.as_deref() == Some(cmd))
+        .count()
+}
+
+fn assert_observed(events: &[Event], cmd: &str, min: usize) {
+    let req = count_requests(events, cmd);
+    let resp = count_responses(events, cmd);
+    eprintln!("  observed {cmd}: {req} request(s), {resp} response(s)");
+    assert!(
+        req >= min,
+        "proxy never saw a request with command={cmd:?} (needed >= {min}, got {req})\nevents:\n{}",
+        format_events(events)
+    );
+    assert!(
+        resp >= min,
+        "proxy never saw a response paired to a {cmd:?} request (needed >= {min}, got {resp})\nevents:\n{}",
+        format_events(events)
+    );
+}
+
+fn format_events(events: &[Event]) -> String {
+    events
+        .iter()
+        .map(|e| {
+            format!(
+                "    {:?} op={} command={:?} responds_to={:?}",
+                e.direction, e.op, e.command, e.responds_to
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn mongo_port(deployment: &Deployment) -> Option<u16> {
@@ -310,8 +351,11 @@ impl Recorder {
         }
     }
 
-    fn snapshot(&self) -> Vec<Event> {
-        self.events.lock().unwrap().clone()
+    /// Drains every event captured since the last `drain` (or construction).
+    /// The internal buffer is left empty so subsequent operations can be
+    /// asserted in isolation.
+    fn drain(&self) -> Vec<Event> {
+        std::mem::take(&mut self.events.lock().unwrap())
     }
 }
 

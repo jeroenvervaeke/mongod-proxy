@@ -1,14 +1,14 @@
 //! In-process end-to-end test.
 //!
-//! Boots a real `mongod` in Docker via [`bollard`], runs the proxy on a
-//! random local port in the same process, drives traffic through it with
-//! the official [`mongodb`] Rust driver, and asserts on the exact
-//! [`Message`] values the proxy intercepts.
+//! Boots a real `mongod` in Docker via [`atlas-local`](https://crates.io/crates/atlas-local)
+//! (MongoDB's own Atlas-Local management crate), runs the proxy on a random
+//! local port in the same process, drives traffic through it with the
+//! official [`mongodb`] Rust driver, and asserts on the exact [`Message`]
+//! values the proxy intercepts.
 //!
-//! Unlike the previous bash-based e2e harness, every step here is statically
-//! typed, every assertion runs against the structured wire-protocol model the
-//! proxy actually parses, and there is no `grep`-against-tracing-output
-//! fragility.
+//! Every step is statically typed and every assertion runs against the
+//! structured wire-protocol model the proxy actually parses — no
+//! `grep`-against-tracing-output fragility.
 //!
 //! ## Running
 //!
@@ -21,30 +21,22 @@
 //! ```
 
 use std::{
-    collections::HashMap,
     pin::Pin,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
-use bollard::{
-    Docker,
-    container::{
-        Config, CreateContainerOptions, RemoveContainerOptions, StartContainerOptions,
-        StopContainerOptions,
-    },
-    image::CreateImageOptions,
-    models::{HostConfig, PortBinding},
+use atlas_local::{
+    Client as AtlasClient,
+    models::{BindingType, CreateDeploymentOptions, Deployment, MongoDBPortBinding},
 };
+use bollard::Docker;
 use futures::{Stream, StreamExt};
 use mongod_proxy::{LogLayer, Proxy, message::Message, operation::Operation, serve};
 use mongodb::{Client, bson::doc, options::ClientOptions};
 use tokio::net::TcpListener;
 use tower_layer::Layer;
 use tower_service::Service;
-
-const MONGO_IMAGE: &str = "mongodb/mongodb-atlas-local:latest";
-const CONTAINER_LABEL: &str = "mongod-proxy-e2e-rust";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn proxy_intercepts_every_command_we_send() {
@@ -64,32 +56,54 @@ async fn proxy_intercepts_every_command_we_send() {
         }
     };
 
-    // ----- 1. Bring up the upstream mongod -----
-    let mongo = MongoContainer::start(&docker).await.expect("start mongo");
+    let atlas = AtlasClient::new(docker);
+
+    // ----- 1. Create the upstream Atlas-Local deployment -----
+    //
+    // `atlas-local` handles image pull, container create + start, and the
+    // wait-for-healthy loop for us. We pin the port binding to loopback so
+    // we can speak to it without `--network host`.
+    let deployment = atlas
+        .create_deployment(CreateDeploymentOptions {
+            wait_until_healthy: Some(true),
+            wait_until_healthy_timeout: Some(Duration::from_secs(120)),
+            mongodb_port_binding: Some(MongoDBPortBinding {
+                port: None, // let the daemon pick an ephemeral host port
+                binding_type: BindingType::Loopback,
+            }),
+            ..Default::default()
+        })
+        .await
+        .expect("create atlas-local deployment");
+
+    let deployment_name = deployment
+        .name
+        .clone()
+        .expect("atlas-local always assigns a name");
+    let host_port = mongo_port(&deployment).expect("deployment exposes a host port");
+
+    eprintln!(
+        "atlas-local deployment {} ({}) listening on 127.0.0.1:{host_port}",
+        deployment_name,
+        &deployment.container_id[..12]
+    );
+
+    // Cleanup guard fires even on panic — `atlas-local` removes the
+    // container for us via `delete_deployment`.
+    let cleanup_atlas = atlas.clone();
+    let cleanup_name = deployment_name.clone();
     let cleanup_guard = scopeguard::guard((), |_| {
-        // Schedule cleanup on panic too. We can't run async in Drop, so spawn
-        // and rely on the process not exiting too fast; in the happy path
-        // we call `mongo.stop()` explicitly below.
-        let docker = docker.clone();
-        let id = mongo.id.clone();
+        let atlas = cleanup_atlas.clone();
+        let name = cleanup_name.clone();
+        // We can't run async in Drop; spawn and rely on the runtime to
+        // outlive us. The happy path explicitly awaits delete below.
         tokio::spawn(async move {
-            let _ = docker
-                .stop_container(&id, Some(StopContainerOptions { t: 5 }))
-                .await;
+            let _ = atlas.delete_deployment(&name).await;
         });
     });
 
-    eprintln!(
-        "mongo container {} listening on 127.0.0.1:{}",
-        &mongo.id[..12],
-        mongo.host_port
-    );
-
-    // ----- 2. Wait for mongod to be ready (via direct driver connection) -----
-    let direct_uri = format!(
-        "mongodb://127.0.0.1:{}/?directConnection=true",
-        mongo.host_port
-    );
+    // ----- 2. (atlas-local already waited for HEALTHY; verify with the driver) -----
+    let direct_uri = format!("mongodb://127.0.0.1:{host_port}/?directConnection=true");
     wait_ready(&direct_uri).await.expect("mongo never ready");
 
     // ----- 3. Start the proxy on a random local port -----
@@ -98,7 +112,7 @@ async fn proxy_intercepts_every_command_we_send() {
     let proxy_port = listener.local_addr().unwrap().port();
     eprintln!("proxy listening on 127.0.0.1:{proxy_port}");
 
-    let proxy = Proxy::new("127.0.0.1", mongo.host_port, false)
+    let proxy = Proxy::new("127.0.0.1", host_port, false)
         .layer(LogLayer)
         .layer(recorder.layer());
 
@@ -171,7 +185,6 @@ async fn proxy_intercepts_every_command_we_send() {
     let events = recorder.snapshot();
     eprintln!("recorded {} events", events.len());
 
-    // Helper closures to count by predicate.
     let request_count = |cmd: &str| -> usize {
         events
             .iter()
@@ -191,8 +204,6 @@ async fn proxy_intercepts_every_command_we_send() {
             .count()
     };
 
-    // Every command the test issued must show up at least once on the
-    // request side, classified by the proxy from the first BSON key.
     for cmd in [
         "insert",
         "find",
@@ -217,24 +228,18 @@ async fn proxy_intercepts_every_command_we_send() {
         );
     }
 
-    // 500 documents at batchSize 50 -> at least 9 getMores (10 batches).
     assert!(
         request_count("getMore") >= 9,
         "expected >=9 getMore requests for 500/50 batches, got {}",
         request_count("getMore")
     );
 
-    // We connected to a `mongod`, so the driver handshake will emit at least
-    // one OP_QUERY hello on the very first connection; both wire formats
-    // must be exercised.
     assert!(
         request_op_count("OP_MSG") >= 10,
         "expected many OP_MSG requests, got {}",
         request_op_count("OP_MSG")
     );
 
-    // Every request that expected a reply must have one (modulo a few
-    // fire-and-forget endSessions on shutdown).
     let total_requests = events
         .iter()
         .filter(|e| e.direction == Direction::Request)
@@ -250,8 +255,16 @@ async fn proxy_intercepts_every_command_we_send() {
     );
 
     // ----- 7. Cleanup -----
-    drop(cleanup_guard);
-    mongo.stop(&docker).await.expect("stop mongo");
+    // Defuse the panic-safety guard first so we don't double-delete.
+    cleanup_guard.defuse();
+    atlas
+        .delete_deployment(&deployment_name)
+        .await
+        .expect("delete deployment");
+}
+
+fn mongo_port(deployment: &Deployment) -> Option<u16> {
+    deployment.port_bindings.as_ref().and_then(|b| b.port)
 }
 
 // ---------------------------------------------------------------------------
@@ -413,119 +426,6 @@ fn first_command_key(op: &Operation) -> Option<&str> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Docker container management via bollard.
-// ---------------------------------------------------------------------------
-
-struct MongoContainer {
-    id: String,
-    host_port: u16,
-}
-
-impl MongoContainer {
-    async fn start(docker: &Docker) -> Result<Self, Box<dyn std::error::Error>> {
-        ensure_image(docker, MONGO_IMAGE).await?;
-
-        let port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::from([(
-            "27017/tcp".to_string(),
-            Some(vec![PortBinding {
-                host_ip: Some("127.0.0.1".to_string()),
-                host_port: Some("0".to_string()),
-            }]),
-        )]);
-
-        let mut labels = HashMap::new();
-        labels.insert(CONTAINER_LABEL.to_string(), "1".to_string());
-
-        let config = Config {
-            image: Some(MONGO_IMAGE.to_string()),
-            env: Some(vec!["MONGOT_DISABLED=true".to_string()]),
-            labels: Some(labels),
-            host_config: Some(HostConfig {
-                port_bindings: Some(port_bindings),
-                auto_remove: Some(true),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        let name = format!(
-            "{CONTAINER_LABEL}-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let create = docker
-            .create_container(
-                Some(CreateContainerOptions {
-                    name: &name,
-                    platform: None,
-                }),
-                config,
-            )
-            .await?;
-        docker
-            .start_container(&create.id, None::<StartContainerOptions<String>>)
-            .await?;
-
-        // Resolve the host-side port the daemon picked for us.
-        let info = docker.inspect_container(&create.id, None).await?;
-        let host_port = info
-            .network_settings
-            .as_ref()
-            .and_then(|ns| ns.ports.as_ref())
-            .and_then(|ports| ports.get("27017/tcp").cloned())
-            .flatten()
-            .and_then(|bindings| bindings.into_iter().next())
-            .and_then(|b| b.host_port)
-            .ok_or("container did not expose host port for 27017/tcp")?
-            .parse::<u16>()?;
-
-        Ok(Self {
-            id: create.id,
-            host_port,
-        })
-    }
-
-    async fn stop(&self, docker: &Docker) -> Result<(), Box<dyn std::error::Error>> {
-        let _ = docker
-            .stop_container(&self.id, Some(StopContainerOptions { t: 5 }))
-            .await;
-        // `auto_remove: true` means the daemon removes the container when it
-        // exits, but be explicit in case the image config disabled it.
-        let _ = docker
-            .remove_container(
-                &self.id,
-                Some(RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
-            )
-            .await;
-        Ok(())
-    }
-}
-
-async fn ensure_image(docker: &Docker, image: &str) -> Result<(), Box<dyn std::error::Error>> {
-    if docker.inspect_image(image).await.is_ok() {
-        return Ok(());
-    }
-    eprintln!("pulling image {image} (first run only)");
-    let mut pull = docker.create_image(
-        Some(CreateImageOptions {
-            from_image: image,
-            ..Default::default()
-        }),
-        None,
-        None,
-    );
-    while let Some(chunk) = pull.next().await {
-        chunk?; // surface any pull error
-    }
-    Ok(())
-}
-
 async fn wait_ready(uri: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut options = ClientOptions::parse(uri).await?;
     options.server_selection_timeout = Some(Duration::from_secs(2));
@@ -550,6 +450,9 @@ async fn wait_ready(uri: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // Tiny inline scopeguard so we don't need another crate.
+//
+// The guard fires its closure on `Drop` *unless* `defuse` is called first —
+// the happy-path explicit cleanup defuses the guard so we don't double-delete.
 mod scopeguard {
     pub fn guard<T, F: FnOnce(T)>(value: T, on_drop: F) -> Guard<T, F> {
         Guard {
@@ -561,6 +464,15 @@ mod scopeguard {
     pub struct Guard<T, F: FnOnce(T)> {
         value: Option<T>,
         on_drop: Option<F>,
+    }
+
+    impl<T, F: FnOnce(T)> Guard<T, F> {
+        /// Disarm the guard so its `Drop` does nothing. Returns the wrapped
+        /// value back to the caller.
+        pub fn defuse(mut self) -> T {
+            self.on_drop = None;
+            self.value.take().expect("value lives until defuse")
+        }
     }
 
     impl<T, F: FnOnce(T)> Drop for Guard<T, F> {

@@ -94,7 +94,11 @@ jobs:
             .
             fuzz
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        # `--locked` is intentionally NOT passed: cargo-fuzz 0.13.1 ships a
+        # Cargo.lock pinned to rustix 0.36.5, which no longer builds on
+        # current nightly (uses removed unstable cfgs). Letting cargo resolve
+        # the latest semver-compatible patches picks up rustix 0.38+.
+        run: cargo install cargo-fuzz
       - name: Smoke-run wire_decoder
         run: cargo fuzz run wire_decoder -- -max_total_time=60 -timeout=10
 
@@ -111,18 +115,22 @@ jobs:
           # All four built-in checks: advisories, bans, licenses, sources.
           arguments: --workspace --all-features
 
-  # Verifies the crate builds on the declared MSRV (rust-version in Cargo.toml).
-  # If you bump the MSRV, bump the toolchain version below in the same commit.
+  # Verifies the library + binaries build on the declared MSRV
+  # (rust-version in Cargo.toml). Dev-dependencies (atlas-local, mongodb)
+  # have their own much-newer MSRVs and only get built by the regular
+  # `test` job on stable; they do not constrain downstream library users.
+  # If you bump the MSRV, bump the toolchain version below in the same
+  # commit.
   msrv:
     name: msrv
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85
+      - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: msrv
-      - run: cargo build --workspace --all-targets --all-features
+      - run: cargo build --workspace --all-features
 
   # Aggregator job — make this one "required" in branch protection.
   # Succeeds only when every job in `needs` succeeded.

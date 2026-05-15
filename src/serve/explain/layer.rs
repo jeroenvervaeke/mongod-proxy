@@ -60,9 +60,9 @@ impl<Sk: Clone> ExplainLayer<Sk> {
 /// Per-connection service produced by [`ExplainLayer`].
 ///
 /// `next_request_id` is wrapped in [`Arc`] so the service can be cloned
-/// into a `'static` boxed future without losing the shared counter.
-/// `Arc<AtomicI32>` is justified per rule 12 because `AtomicI32` is not
-/// `Copy`.
+/// into a `'static` boxed future and every clone keeps allocating ids
+/// from the same shared counter. `AtomicI32` is not `Copy`, so a non-`Arc`
+/// field would not survive the clone.
 pub struct ExplainService<S, Sk> {
     inner: S,
     sink: Sk,
@@ -205,26 +205,23 @@ where
 
     // Phase 1: classify + build explain. Borrows `req`; drops before
     // we consume `req` below.
-    let prepared: Option<(Command, ExplainRequestId, Result<Message, ExplainError<E>>)> =
-        classify(&req).map(|plan| {
-            let (rid_opt, result) = match alloc_request_id(counter) {
-                Err(e) => (None, Err(ExplainError::RequestIdExhausted(e))),
-                Ok(rid) => match build_explain(&plan, rid) {
-                    BuildExplainOutcome::Built(msg) => (Some(rid), Ok(*msg)),
-                    BuildExplainOutcome::UnsupportedShape(r) => {
-                        (Some(rid), Err(ExplainError::UnsupportedShape(r)))
-                    }
-                },
-            };
-            // For the exhausted-id case we still want to emit; carry a
-            // sentinel ExplainRequestId so the field is total. -1 is a
-            // valid ExplainRequestId (strictly negative); use it as the
-            // "no id was allocated" sentinel.
-            let rid = rid_opt.unwrap_or_else(|| {
-                ExplainRequestId::try_new(-1).expect("-1 is a valid ExplainRequestId")
-            });
-            (plan.into_command(), rid, result)
-        });
+    type Prepared<E> = (
+        Command,
+        Option<ExplainRequestId>,
+        Result<Message, ExplainError<E>>,
+    );
+    let prepared: Option<Prepared<E>> = classify(&req).map(|plan| {
+        let (rid, result) = match alloc_request_id(counter) {
+            Err(e) => (None, Err(ExplainError::RequestIdExhausted(e))),
+            Ok(rid) => match build_explain(&plan, rid) {
+                BuildExplainOutcome::Built(msg) => (Some(rid), Ok(*msg)),
+                BuildExplainOutcome::UnsupportedShape(r) => {
+                    (Some(rid), Err(ExplainError::UnsupportedShape(r)))
+                }
+            },
+        };
+        (plan.into_command(), rid, result)
+    });
 
     // Phase 2: forward original request. Stream is dropped at end of
     // this block, releasing any upstream guard before the explain call.
@@ -261,7 +258,7 @@ async fn run_explain<S, St, E>(
     command: Command,
     explain_msg: Message,
     client_request_id: RequestId,
-    explain_request_id: ExplainRequestId,
+    explain_request_id: Option<ExplainRequestId>,
 ) -> Result<ExplainEvent, ExplainError<E>>
 where
     S: Service<Message, Response = St, Error = E>,
@@ -314,7 +311,7 @@ fn raw_into_event(
     command: Command,
     raw: RawExplainReply,
     client_request_id: RequestId,
-    explain_request_id: ExplainRequestId,
+    explain_request_id: Option<ExplainRequestId>,
 ) -> Result<ExplainEvent, ExplainParseError> {
     use super::model::{AggregateTime, ExplainTotals, Namespace};
 
@@ -396,10 +393,6 @@ where
         }
     }
 }
-
-// Keep RequestId reachable through this module for downstream users.
-#[allow(dead_code)]
-fn _force_request_id_in_scope(_: RequestId) {}
 
 #[cfg(test)]
 mod tests {

@@ -49,7 +49,7 @@ bitflags! {
 }
 
 /// Failure modes for [`OperationReply::from_bytes`].
-#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error)]
 pub enum OperationReplyParseError {
     /// Body shorter than the unconditional minimum.
     #[error("not enough bytes, expected at least {min} bytes, got {actual}")]
@@ -58,23 +58,29 @@ pub enum OperationReplyParseError {
     /// bits only.
     #[error("unknown reply flag bits set: {0:#010x}")]
     UnknownFlagBits(u32),
-    /// Parsing the document at index `n` failed; `message` is the underlying
-    /// BSON error.
-    #[error("failed to parse document (n={n}), message: {message}")]
-    FailedToParseDocument { n: usize, message: String },
+    /// Parsing the document at index `n` failed.
+    #[error("failed to parse document (n={n}): {source}")]
+    FailedToParseDocument {
+        n: usize,
+        #[source]
+        source: bson::de::Error,
+    },
 }
 
 /// Failure modes for [`OperationReply::write_bytes`].
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error)]
 pub enum OperationReplyWriteError {
     /// BSON serialisation of a document failed.
     #[error("failed to serialize document: {0}")]
-    SerializeDocumentError(String),
+    SerializeDocumentError(#[from] bson::ser::Error),
     /// `documents.len()` doesn't fit in the `i32` `numberReturned` field.
     /// In practice this never happens — wire-protocol message size limits
     /// kick in long before two-billion-plus documents do.
     #[error("document count {0} exceeds i32::MAX")]
     TooManyDocuments(usize),
+    /// The fully assembled frame exceeded the wire-envelope upper bound.
+    #[error("message length {0} exceeds wire-envelope upper bound")]
+    MessageTooLarge(usize),
 }
 
 impl OperationReply {
@@ -123,12 +129,8 @@ impl OperationReply {
         let mut documents = Vec::new();
 
         for n in 0..num_docs {
-            let doc = Document::from_reader(&mut reader).map_err(|e| {
-                OperationReplyParseError::FailedToParseDocument {
-                    n,
-                    message: e.to_string(),
-                }
-            })?;
+            let doc = Document::from_reader(&mut reader)
+                .map_err(|source| OperationReplyParseError::FailedToParseDocument { n, source })?;
             documents.push(doc);
         }
 
@@ -163,18 +165,18 @@ impl OperationReply {
         // Serialize each doc directly into a single buffer to avoid Vec<Vec<u8>> flattening.
         let mut documents_bytes = Vec::new();
         for document in &self.documents {
-            document
-                .to_writer(&mut documents_bytes)
-                .map_err(|e| OperationReplyWriteError::SerializeDocumentError(e.to_string()))?;
+            document.to_writer(&mut documents_bytes)?;
         }
 
         let message_length = MessageHeader::size() + Self::min_len() + documents_bytes.len();
 
         dst.reserve(message_length);
 
+        let message_length_i32 = i32::try_from(message_length)
+            .map_err(|_| OperationReplyWriteError::MessageTooLarge(message_length))?;
         let header = MessageHeader {
-            message_length: MessageLength::try_new(message_length as i32)
-                .expect("message_length derived from serialised body is within wire envelope"),
+            message_length: MessageLength::try_new(message_length_i32)
+                .map_err(|_| OperationReplyWriteError::MessageTooLarge(message_length))?,
             op_code: OPCode::Reply,
             request_id,
             response_to,

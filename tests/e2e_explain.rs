@@ -20,13 +20,16 @@ use std::time::Duration;
 
 use atlas_local::{
     Client as AtlasClient,
-    models::{BindingType, CreateDeploymentOptions, Deployment, MongoDBPortBinding},
+    models::{BindingType, CreateDeploymentOptions, MongoDBPortBinding},
 };
 use bollard::Docker;
 use mongod_proxy::{Command, ExplainEvent, Proxy, serve};
 use mongodb::{Client, bson::doc, options::ClientOptions};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
+
+mod common;
+use common::{mongo_port, wait_ready};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn explain_layer_captures_typed_events_for_find_and_aggregate() {
@@ -200,28 +203,4 @@ async fn recv_event_with_timeout(
         .await
         .ok()
         .flatten()
-}
-
-async fn wait_ready(uri: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    loop {
-        let options = ClientOptions::parse(uri).await?;
-        let client = Client::with_options(options)?;
-        if client
-            .database("admin")
-            .run_command(doc! { "ping": 1 })
-            .await
-            .is_ok()
-        {
-            return Ok(());
-        }
-        if std::time::Instant::now() > deadline {
-            return Err("mongo never became ready".into());
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-}
-
-fn mongo_port(deployment: &Deployment) -> Option<u16> {
-    deployment.port_bindings.as_ref().and_then(|b| b.port)
 }

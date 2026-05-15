@@ -23,20 +23,23 @@
 use std::{
     pin::Pin,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use atlas_local::{
     Client as AtlasClient,
-    models::{BindingType, CreateDeploymentOptions, Deployment, MongoDBPortBinding},
+    models::{BindingType, CreateDeploymentOptions, MongoDBPortBinding},
 };
 use bollard::Docker;
 use futures::{Stream, StreamExt};
-use mongod_proxy::{LogLayer, Proxy, message::Message, operation::Operation, serve};
+use mongod_proxy::{LogLayer, Proxy, message::Message, serve};
 use mongodb::{Client, bson::doc, options::ClientOptions};
 use tokio::net::TcpListener;
 use tower_layer::Layer;
 use tower_service::Service;
+
+mod common;
+use common::{mongo_port, wait_ready};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn proxy_intercepts_every_command_we_send() {
@@ -250,7 +253,7 @@ async fn proxy_intercepts_every_command_we_send() {
     proxy_task.abort();
     let _ = proxy_task.await;
 
-    cleanup_guard.defuse();
+    scopeguard::ScopeGuard::into_inner(cleanup_guard);
     atlas
         .delete_deployment(&deployment_name)
         .await
@@ -302,10 +305,6 @@ fn format_events(events: &[Event]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-fn mongo_port(deployment: &Deployment) -> Option<u16> {
-    deployment.port_bindings.as_ref().and_then(|b| b.port)
 }
 
 // ---------------------------------------------------------------------------
@@ -398,10 +397,10 @@ where
     }
 
     fn call(&mut self, req: Message) -> Self::Future {
-        let command = first_command_key(&req.operation).map(str::to_owned);
+        let command = req.operation.command_name().map(str::to_owned);
         self.events.lock().unwrap().push(Event {
             direction: Direction::Request,
-            op: op_kind(&req.operation),
+            op: req.operation.op_kind(),
             command: command.clone(),
             responds_to: None,
             request_id: req.request_id.into(),
@@ -442,7 +441,7 @@ where
             std::task::Poll::Ready(Some(Ok(msg))) => {
                 self.events.lock().unwrap().push(Event {
                     direction: Direction::Response,
-                    op: op_kind(&msg.operation),
+                    op: msg.operation.op_kind(),
                     command: None,
                     responds_to: self.request_command.clone(),
                     request_id: msg.request_id.into(),
@@ -450,80 +449,6 @@ where
                 std::task::Poll::Ready(Some(Ok(msg)))
             }
             std::task::Poll::Ready(Some(Err(e))) => std::task::Poll::Ready(Some(Err(e))),
-        }
-    }
-}
-
-fn op_kind(op: &Operation) -> &'static str {
-    match op {
-        Operation::Message(_) => "OP_MSG",
-        Operation::Query(_) => "OP_QUERY",
-        Operation::Reply(_) => "OP_REPLY",
-    }
-}
-
-fn first_command_key(op: &Operation) -> Option<&str> {
-    match op {
-        Operation::Message(m) => m.command_name(),
-        Operation::Query(q) => q.query.keys().next().map(String::as_str),
-        Operation::Reply(_) => None,
-    }
-}
-
-async fn wait_ready(uri: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut options = ClientOptions::parse(uri).await?;
-    options.server_selection_timeout = Some(Duration::from_secs(2));
-    let client = Client::with_options(options)?;
-
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let mut last_err: Option<mongodb::error::Error> = None;
-    while Instant::now() < deadline {
-        match client
-            .database("admin")
-            .run_command(doc! { "ping": 1 })
-            .await
-        {
-            Ok(_) => return Ok(()),
-            Err(e) => {
-                last_err = Some(e);
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        }
-    }
-    Err(format!("mongo never accepted ping: last error = {last_err:?}").into())
-}
-
-// Tiny inline scopeguard so we don't need another crate.
-//
-// The guard fires its closure on `Drop` *unless* `defuse` is called first —
-// the happy-path explicit cleanup defuses the guard so we don't double-delete.
-mod scopeguard {
-    pub fn guard<T, F: FnOnce(T)>(value: T, on_drop: F) -> Guard<T, F> {
-        Guard {
-            value: Some(value),
-            on_drop: Some(on_drop),
-        }
-    }
-
-    pub struct Guard<T, F: FnOnce(T)> {
-        value: Option<T>,
-        on_drop: Option<F>,
-    }
-
-    impl<T, F: FnOnce(T)> Guard<T, F> {
-        /// Disarm the guard so its `Drop` does nothing. Returns the wrapped
-        /// value back to the caller.
-        pub fn defuse(mut self) -> T {
-            self.on_drop = None;
-            self.value.take().expect("value lives until defuse")
-        }
-    }
-
-    impl<T, F: FnOnce(T)> Drop for Guard<T, F> {
-        fn drop(&mut self) {
-            if let (Some(v), Some(f)) = (self.value.take(), self.on_drop.take()) {
-                f(v);
-            }
         }
     }
 }

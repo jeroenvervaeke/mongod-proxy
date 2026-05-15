@@ -12,7 +12,6 @@ use super::model::{
     KeysExamined, ServerErrorCode, ServerErrorCodeName, Stage,
 };
 
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RawExplainReply {
@@ -20,7 +19,6 @@ pub(crate) struct RawExplainReply {
     pub execution_stats: RawExecutionStats,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RawQueryPlanner {
@@ -31,7 +29,6 @@ pub(crate) struct RawQueryPlanner {
     pub namespace: String,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RawExecutionStats {
@@ -46,7 +43,6 @@ pub(crate) struct RawExecutionStats {
     pub execution_stages: RawPlanNode,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RawPlanNode {
@@ -87,7 +83,6 @@ pub(crate) struct RawPlanNode {
 /// Body of an `ok: 0` reply. Carried through to
 /// [`ExplainServerError::Rejected`](super::error::ExplainServerError) as
 /// typed fields.
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RawServerError {

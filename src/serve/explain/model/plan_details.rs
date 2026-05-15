@@ -163,14 +163,21 @@ impl BoundValue {
     }
 }
 
+/// Whether a bound is inclusive (`[`/`]`) or exclusive (`(`/`)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Inclusivity {
+    Inclusive,
+    Exclusive,
+}
+
 /// Half-open or closed interval on a single index field.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct IndexBoundRange {
     pub lower: BoundValue,
-    pub lower_inclusive: bool,
+    pub lower_inclusivity: Inclusivity,
     pub upper: BoundValue,
-    pub upper_inclusive: bool,
+    pub upper_inclusivity: Inclusivity,
 }
 
 impl IndexBoundRange {
@@ -182,18 +189,18 @@ impl IndexBoundRange {
         let first = chars
             .next()
             .ok_or_else(|| IndexBoundsParseError::empty(s))?;
-        let lower_inclusive = match first {
-            '[' => true,
-            '(' => false,
+        let lower_inclusivity = match first {
+            '[' => Inclusivity::Inclusive,
+            '(' => Inclusivity::Exclusive,
             _ => return Err(IndexBoundsParseError::bad_open(s)),
         };
         let last = s
             .chars()
             .next_back()
             .ok_or_else(|| IndexBoundsParseError::empty(s))?;
-        let upper_inclusive = match last {
-            ']' => true,
-            ')' => false,
+        let upper_inclusivity = match last {
+            ']' => Inclusivity::Inclusive,
+            ')' => Inclusivity::Exclusive,
             _ => return Err(IndexBoundsParseError::bad_close(s)),
         };
         let body = &s[1..s.len() - 1];
@@ -203,9 +210,9 @@ impl IndexBoundRange {
             .ok_or_else(|| IndexBoundsParseError::no_separator(s))?;
         Ok(IndexBoundRange {
             lower: BoundValue::parse(lo),
-            lower_inclusive,
+            lower_inclusivity,
             upper: BoundValue::parse(hi),
-            upper_inclusive,
+            upper_inclusivity,
         })
     }
 }
@@ -428,16 +435,16 @@ mod tests {
     fn bound_range_closed() {
         let r = IndexBoundRange::parse("[1999, 2001]").unwrap();
         assert_eq!(r.lower, BoundValue::Literal("1999".into()));
-        assert!(r.lower_inclusive);
+        assert_eq!(r.lower_inclusivity, Inclusivity::Inclusive);
         assert_eq!(r.upper, BoundValue::Literal("2001".into()));
-        assert!(r.upper_inclusive);
+        assert_eq!(r.upper_inclusivity, Inclusivity::Inclusive);
     }
 
     #[test]
     fn bound_range_left_open_right_closed() {
         let r = IndexBoundRange::parse("(0, 100]").unwrap();
-        assert!(!r.lower_inclusive);
-        assert!(r.upper_inclusive);
+        assert_eq!(r.lower_inclusivity, Inclusivity::Exclusive);
+        assert_eq!(r.upper_inclusivity, Inclusivity::Inclusive);
     }
 
     #[test]

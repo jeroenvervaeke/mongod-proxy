@@ -24,7 +24,6 @@
 use std::pin::Pin;
 
 use crate::message::Message;
-use crate::operation::Operation;
 use futures::Stream;
 use tower_layer::Layer;
 use tower_service::Service;
@@ -77,8 +76,8 @@ where
     fn call(&mut self, req: Message) -> Self::Future {
         info!(
             direction = "request",
-            op = op_kind(&req.operation),
-            command = command_name(&req.operation).unwrap_or(""),
+            op = req.operation.op_kind(),
+            command = req.operation.command_name().unwrap_or(""),
             request_id = %req.request_id,
             ?req,
             "received request"
@@ -117,7 +116,7 @@ where
             std::task::Poll::Ready(Some(Ok(message))) => {
                 info!(
                     direction = "response",
-                    op = op_kind(&message.operation),
+                    op = message.operation.op_kind(),
                     request_id = ?message.response_to,
                     response_id = %message.request_id,
                     ?message,
@@ -127,27 +126,5 @@ where
             }
             std::task::Poll::Ready(Some(Err(e))) => std::task::Poll::Ready(Some(Err(e))),
         }
-    }
-}
-
-fn op_kind(op: &Operation) -> &'static str {
-    match op {
-        Operation::Message(_) => "OP_MSG",
-        Operation::Query(_) => "OP_QUERY",
-        Operation::Reply(_) => "OP_REPLY",
-    }
-}
-
-/// Returns the BSON command name driving this operation, when one is identifiable.
-///
-/// For OP_MSG the convention is that the first key of the first body section
-/// is the command name (e.g. `"find"`, `"insert"`, `"hello"`). For OP_QUERY
-/// the first key of the query document is used. Server replies (OP_REPLY)
-/// don't carry a command name.
-fn command_name(op: &Operation) -> Option<&str> {
-    match op {
-        Operation::Message(m) => m.command_name(),
-        Operation::Query(q) => q.query.keys().next().map(String::as_str),
-        Operation::Reply(_) => None,
     }
 }

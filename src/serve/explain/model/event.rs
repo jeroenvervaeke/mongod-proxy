@@ -6,7 +6,7 @@ use crate::ids::{ExplainRequestId, RequestId};
 use super::{
     namespace::Namespace,
     newtypes::{AggregateTime, DocsExamined, DocsReturned, IndexName, KeysExamined, NodeTime},
-    open_vocab::Command,
+    open_vocab::{Command, Direction},
     plan_details::{Filter, IndexBounds, KeyPattern},
     stage::Stage,
 };
@@ -30,8 +30,8 @@ pub struct PlanNode {
     pub index_name: Option<IndexName>,
     pub key_pattern: Option<KeyPattern>,
     pub index_bounds: Option<IndexBounds>,
-    /// `"forward"` or `"backward"`. Present on most scan stages.
-    pub direction: Option<String>,
+    /// Scan direction. Present on most scan stages.
+    pub direction: Option<Direction>,
     pub filter: Option<Filter>,
     pub children: Vec<PlanNode>,
 }
@@ -60,8 +60,9 @@ pub struct ExplainEvent {
     pub client_request_id: RequestId,
     /// `request_id` the proxy stamped on the sideband explain request
     /// it issued upstream. Always strictly negative — disjoint from
-    /// driver-assigned ids by type.
-    pub explain_request_id: ExplainRequestId,
+    /// driver-assigned ids by type. `None` when the request id space was
+    /// exhausted and no explain was issued.
+    pub explain_request_id: Option<ExplainRequestId>,
 }
 
 /// Classification of an `ok` field that is neither a valid success nor a
@@ -91,7 +92,6 @@ impl MalformedOkShape {
     /// dispatched the numeric variants (Int32/Int64/finite-Double) in
     /// `probe_ok`. Used only from the `other =>` arm where numeric forms
     /// are unreachable.
-    #[allow(dead_code)]
     pub(crate) fn from_non_numeric_bson(b: &bson::Bson) -> MalformedOkShape {
         use bson::Bson;
         match b {

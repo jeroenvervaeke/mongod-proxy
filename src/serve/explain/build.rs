@@ -11,39 +11,18 @@ use crate::operation::op_msg::{OpMsgSection, OperationMessage, OperationMessageF
 use super::classify::ClassifiedRequest;
 use super::model::{Command, UnsupportedShape};
 
-/// Verbosity passed to the server's `explain` command.
-#[derive(Debug, Clone, Copy)]
-#[non_exhaustive]
-pub(crate) enum Verbosity {
-    #[allow(dead_code)]
-    QueryPlanner,
-    ExecutionStats,
-    #[allow(dead_code)]
-    AllPlansExecution,
-}
-
-impl Verbosity {
-    fn as_str(self) -> &'static str {
-        match self {
-            Verbosity::QueryPlanner => "queryPlanner",
-            Verbosity::ExecutionStats => "executionStats",
-            Verbosity::AllPlansExecution => "allPlansExecution",
-        }
-    }
-}
-
 /// Outcome of [`build_explain`]. `Built` carries the explain message ready
 /// to send; `UnsupportedShape` flags routine cases that classify admitted
 /// but the server cannot actually explain (multi-op write batches).
 pub(crate) enum BuildExplainOutcome {
     Built(Box<Message>),
-    #[allow(dead_code)]
     UnsupportedShape(UnsupportedShape),
 }
 
+const EXPLAIN_VERBOSITY: &str = "executionStats";
+
 /// Rewrite the classified plan into an explain Message stamped with the
 /// supplied [`ExplainRequestId`].
-#[allow(dead_code)]
 pub(crate) fn build_explain(
     plan: &ClassifiedRequest<'_>,
     request_id: ExplainRequestId,
@@ -67,7 +46,7 @@ pub(crate) fn build_explain(
 
     let mut envelope = Document::new();
     envelope.insert("explain", Bson::Document(inner));
-    envelope.insert("verbosity", Verbosity::ExecutionStats.as_str());
+    envelope.insert("verbosity", EXPLAIN_VERBOSITY);
     envelope.insert("$db", plan.database().as_ref());
 
     let req_id: RequestId = request_id.into();

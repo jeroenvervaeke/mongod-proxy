@@ -39,7 +39,6 @@ impl Write for BoundedWrite<'_> {
 /// bytes, appending `…[truncated]` when the cap was hit. The implementation
 /// short-circuits via [`std::fmt::Error`] so a huge document is never fully
 /// materialised in memory.
-#[allow(dead_code)]
 pub(crate) fn truncate_doc_preview(doc: &bson::Document, cap: usize) -> String {
     let mut buf = String::with_capacity(cap + 32);
     let mut bw = BoundedWrite { buf: &mut buf, cap };

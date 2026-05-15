@@ -76,9 +76,9 @@ pub enum MessageHeaderParseError {
 impl MessageHeader {
     /// On-the-wire size of a header in bytes (always 16).
     ///
-    /// Exposed as a function rather than a constant so consumers don't have
-    /// to import a hand-named constant in their `message_length` arithmetic.
-    pub fn size() -> usize {
+    /// `const fn` so it can be used in const contexts such as array sizes
+    /// and static-length arithmetic.
+    pub const fn size() -> usize {
         16
     }
 
@@ -166,7 +166,7 @@ mod tests {
     #[case::op_msg(op_msg_01::bytes())]
     #[case::op_query(op_query_01::bytes())]
     fn encode_decode(#[case] bytes: &[u8]) {
-        let header = MessageHeader::from_bytes(bytes).expect("encode should succeed");
+        let header = MessageHeader::from_bytes(bytes).expect("decode should succeed");
         let mut dst = BytesMut::new();
         header.write_bytes(&mut dst);
         assert_eq!(dst.as_ref(), bytes);

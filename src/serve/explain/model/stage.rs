@@ -107,7 +107,6 @@ impl<'de> serde::Deserialize<'de> for Stage {
 impl Stage {
     /// Single source of truth: wire-string → [`Stage`]. Used by both the
     /// custom `serde::Deserialize` impl and any internal classifier.
-    #[allow(dead_code)]
     pub(crate) fn from_wire_str(s: &str) -> Self {
         match s {
             // Classic query-plan engine (uppercase).

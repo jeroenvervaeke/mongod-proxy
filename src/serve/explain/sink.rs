@@ -125,7 +125,7 @@ mod tests {
                 children: vec![],
             },
             client_request_id: crate::ids::RequestId::new(1),
-            explain_request_id: crate::ids::ExplainRequestId::try_new(-1).unwrap(),
+            explain_request_id: Some(crate::ids::ExplainRequestId::try_new(-1).unwrap()),
         }
     }
 

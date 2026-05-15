@@ -1,0 +1,29 @@
+# `fuzz/` is intentionally NOT a member of the parent workspace — its
+# sanitizer-laden RUSTFLAGS must not leak into the proxy's normal build. The
+# empty `[workspace]` table below makes cargo treat it as its own workspace
+# root.
+[workspace]
+
+[package]
+name = "mongod-proxy-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+mongod-proxy = { path = ".." }
+tokio-util = { version = "0.7.14", features = ["codec"] }
+
+# cargo-fuzz convention: each binary is a fuzz target and is opted out of
+# regular `cargo build` so the parent workspace doesn't try to compile them
+# without the libFuzzer sanitizer flags.
+[[bin]]
+name = "wire_decoder"
+path = "fuzz_targets/wire_decoder.rs"
+test = false
+doc = false
+bench = false

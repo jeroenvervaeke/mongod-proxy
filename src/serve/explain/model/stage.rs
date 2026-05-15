@@ -1,6 +1,6 @@
 //! `Stage` — open-vocabulary enum of MongoDB plan-tree stage kinds.
 //!
-//! Cannot use the [`open_vocab_enum!`] macro because some variants carry
+//! Cannot use the `open_vocab_enum!` macro because some variants carry
 //! sub-enums (`Project(ProjectionKind)`, `And(AndKind)`).
 
 use super::newtypes::OtherName;

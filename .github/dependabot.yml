@@ -1,0 +1,41 @@
+version: 2
+updates:
+  # Cargo deps for the main workspace.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      # Bundle patch + minor bumps so unrelated PRs don't drown the queue.
+      cargo-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  # Cargo deps for the cargo-fuzz workspace (separate workspace root, so
+  # Dependabot needs an explicit directory entry).
+  - package-ecosystem: cargo
+    directory: /fuzz
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  # Pin-tracking for `actions/checkout`, `dtolnay/rust-toolchain`,
+  # `Swatinem/rust-cache`, `EmbarkStudios/cargo-deny-action`, etc.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      github-actions:
+        update-types:
+          - major
+          - minor
+          - patch

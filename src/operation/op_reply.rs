@@ -116,7 +116,11 @@ impl OperationReply {
 
         let mut reader = Cursor::new(&bytes[min_len..]);
         let num_docs = number_returned.max(0) as usize;
-        let mut documents = Vec::with_capacity(num_docs);
+        // SAFETY: `number_returned` is attacker-controlled; pre-allocating
+        // `Vec::with_capacity(num_docs)` was a remote OOM (a peer claiming
+        // i32::MAX docs reserves ~50 GiB up front). Let the Vec grow as docs
+        // are actually decoded — capped naturally by the frame body length.
+        let mut documents = Vec::new();
 
         for n in 0..num_docs {
             let doc = Document::from_reader(&mut reader).map_err(|e| {
@@ -218,5 +222,26 @@ mod tests {
         body.extend_from_slice(&0i32.to_le_bytes()); // number_returned
         let err = OperationReply::from_bytes(&body).unwrap_err();
         assert!(matches!(err, OperationReplyParseError::UnknownFlagBits(_)));
+    }
+
+    /// Regression: a peer-controlled `numberReturned` of `i32::MAX` used to
+    /// pre-allocate ~50 GiB via `Vec::with_capacity`, killing the proxy with
+    /// an OOM long before any document parsing started. Found by the
+    /// `wire_decoder` fuzz target. Parsing must fail cleanly with a
+    /// document-parse error instead.
+    #[test]
+    fn parse_does_not_pre_allocate_on_huge_number_returned() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u32.to_le_bytes()); // flags
+        body.extend_from_slice(&0i64.to_le_bytes()); // cursor_id
+        body.extend_from_slice(&0i32.to_le_bytes()); // starting_from
+        body.extend_from_slice(&i32::MAX.to_le_bytes()); // number_returned
+        // No documents follow — first iteration must fail to read a BSON
+        // length prefix and return a structured error, not OOM.
+        let err = OperationReply::from_bytes(&body).unwrap_err();
+        assert!(matches!(
+            err,
+            OperationReplyParseError::FailedToParseDocument { n: 0, .. }
+        ));
     }
 }

@@ -1,0 +1,157 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: stable
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: stable
+      - run: cargo build --workspace --all-targets --all-features
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: stable
+      # E2E tests under `tests/` self-skip when Docker is unreachable, so
+      # running --all-targets here is safe on a stock GitHub runner.
+      - run: cargo test --workspace --all-targets --all-features
+
+  # Builds the rustdoc with -D warnings so broken intra-doc links, missing
+  # items referenced from docs, and similar regressions fail CI instead of
+  # silently shipping in docs.rs (or the README's docs links).
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: stable
+      - run: cargo doc --workspace --no-deps --all-features
+
+  # Smoke-runs every cargo-fuzz target for a short time budget so the targets
+  # stay compilable and we catch trivial regressions on PRs. Real fuzzing
+  # campaigns should be run locally or on a longer-lived runner — 60 seconds
+  # per target is for liveness, not coverage.
+  fuzz:
+    name: fuzz
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: fuzz
+          workspaces: |
+            .
+            fuzz
+      - name: Install cargo-fuzz
+        # `--locked` is intentionally NOT passed: cargo-fuzz 0.13.1 ships a
+        # Cargo.lock pinned to rustix 0.36.5, which no longer builds on
+        # current nightly (uses removed unstable cfgs). Letting cargo resolve
+        # the latest semver-compatible patches picks up rustix 0.38+.
+        run: cargo install cargo-fuzz
+      - name: Smoke-run wire_decoder
+        run: cargo fuzz run wire_decoder -- -max_total_time=60 -timeout=10
+
+  # Audits the dependency graph for RUSTSEC advisories, banned licenses,
+  # yanked versions, and unknown sources. Config: deny.toml.
+  deny:
+    name: deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          # All four built-in checks: advisories, bans, licenses, sources.
+          arguments: --workspace --all-features
+
+  # Verifies the library + binaries build on the declared MSRV
+  # (rust-version in Cargo.toml). Dev-dependencies (atlas-local, mongodb)
+  # have their own much-newer MSRVs and only get built by the regular
+  # `test` job on stable; they do not constrain downstream library users.
+  # If you bump the MSRV, bump the toolchain version below in the same
+  # commit.
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: msrv
+      - run: cargo build --workspace --all-features
+
+  # Aggregator job — make this one "required" in branch protection.
+  # Succeeds only when every job in `needs` succeeded.
+  ci:
+    name: ci
+    if: always()
+    needs: [fmt, clippy, build, test, msrv, deny, docs, fuzz]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all jobs succeeded
+        run: |
+          if [ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped') }}" = "true" ]; then
+            echo "One or more required jobs did not succeed:"
+            echo "  fmt:    ${{ needs.fmt.result }}"
+            echo "  clippy: ${{ needs.clippy.result }}"
+            echo "  build:  ${{ needs.build.result }}"
+            echo "  test:   ${{ needs.test.result }}"
+            echo "  msrv:   ${{ needs.msrv.result }}"
+            echo "  deny:   ${{ needs.deny.result }}"
+            echo "  docs:   ${{ needs.docs.result }}"
+            echo "  fuzz:   ${{ needs.fuzz.result }}"
+            exit 1
+          fi
+          echo "All CI jobs succeeded."

@@ -2,8 +2,8 @@
 //! [`ExplainEvent`]s and typed [`ExplainError<E>`]s.
 //!
 //! No `Send + Sync + 'static` bound on the trait — bounds live on the
-//! `Layer<S>` / `Service<Message>` impl blocks of [`ExplainLayer`] where
-//! they actually matter. This lets `Rc<RefCell<_>>` test sinks compile.
+//! `Layer<S>` / `Service<Message>` impl blocks of [`super::ExplainLayer`]
+//! where they actually matter. This lets `Rc<RefCell<_>>` test sinks compile.
 
 use super::error::ExplainError;
 use super::model::ExplainEvent;

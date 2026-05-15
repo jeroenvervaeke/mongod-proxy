@@ -61,6 +61,19 @@ jobs:
       # running --all-targets here is safe on a stock GitHub runner.
       - run: cargo test --workspace --all-targets --all-features
 
+  # Audits the dependency graph for RUSTSEC advisories, banned licenses,
+  # yanked versions, and unknown sources. Config: deny.toml.
+  deny:
+    name: deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          # All four built-in checks: advisories, bans, licenses, sources.
+          arguments: --workspace --all-features
+
   # Verifies the crate builds on the declared MSRV (rust-version in Cargo.toml).
   # If you bump the MSRV, bump the toolchain version below in the same commit.
   msrv:
@@ -79,7 +92,7 @@ jobs:
   ci:
     name: ci
     if: always()
-    needs: [fmt, clippy, build, test, msrv]
+    needs: [fmt, clippy, build, test, msrv, deny]
     runs-on: ubuntu-latest
     steps:
       - name: Check all jobs succeeded
@@ -91,6 +104,7 @@ jobs:
             echo "  build:  ${{ needs.build.result }}"
             echo "  test:   ${{ needs.test.result }}"
             echo "  msrv:   ${{ needs.msrv.result }}"
+            echo "  deny:   ${{ needs.deny.result }}"
             exit 1
           fi
           echo "All CI jobs succeeded."

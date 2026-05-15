@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
+publish = false
 
 [dependencies]
 bitflags = "2.9.0"
@@ -21,7 +22,7 @@ tracing = { workspace = true }
 rustls-pki-types = "1.11.0"
 tokio-rustls = "0.26.2"
 webpki-roots = "1.0.0"
-hickory-resolver = "0.25.2"
+hickory-resolver = "0.26.1"
 
 [dev-dependencies]
 anyhow = "1.0.98"

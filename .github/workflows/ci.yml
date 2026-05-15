@@ -61,6 +61,27 @@ jobs:
       # running --all-targets here is safe on a stock GitHub runner.
       - run: cargo test --workspace --all-targets --all-features
 
+  # Smoke-runs every cargo-fuzz target for a short time budget so the targets
+  # stay compilable and we catch trivial regressions on PRs. Real fuzzing
+  # campaigns should be run locally or on a longer-lived runner — 60 seconds
+  # per target is for liveness, not coverage.
+  fuzz:
+    name: fuzz
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: fuzz
+          workspaces: |
+            .
+            fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Smoke-run wire_decoder
+        run: cargo fuzz run wire_decoder -- -max_total_time=60 -timeout=10
+
   # Audits the dependency graph for RUSTSEC advisories, banned licenses,
   # yanked versions, and unknown sources. Config: deny.toml.
   deny:
@@ -92,7 +113,7 @@ jobs:
   ci:
     name: ci
     if: always()
-    needs: [fmt, clippy, build, test, msrv, deny]
+    needs: [fmt, clippy, build, test, msrv, deny, fuzz]
     runs-on: ubuntu-latest
     steps:
       - name: Check all jobs succeeded
@@ -105,6 +126,7 @@ jobs:
             echo "  test:   ${{ needs.test.result }}"
             echo "  msrv:   ${{ needs.msrv.result }}"
             echo "  deny:   ${{ needs.deny.result }}"
+            echo "  fuzz:   ${{ needs.fuzz.result }}"
             exit 1
           fi
           echo "All CI jobs succeeded."

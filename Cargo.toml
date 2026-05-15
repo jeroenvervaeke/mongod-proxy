@@ -46,6 +46,8 @@ unbounded-sink = []
 
 [workspace]
 members = [".", "logger"]
+# `fuzz/` is its own crate so cargo-fuzz can apply sanitizer flags only there.
+exclude = ["fuzz"]
 
 [workspace.dependencies]
 futures = "0.3.0"

@@ -41,7 +41,7 @@ pub enum Operation {
 /// Failure modes for [`Operation::from_bytes`].
 ///
 /// Each variant flattens the per-opcode parse error.
-#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error)]
 pub enum OperationParseError {
     /// The OP_MSG body could not be parsed.
     #[error("failed to parse message: {0}")]
@@ -50,7 +50,7 @@ pub enum OperationParseError {
     #[error("failed to parse query: {0}")]
     FailedToParseQuery(#[from] OperationQueryParseError),
     /// The OP_REPLY body could not be parsed.
-    #[error("failed to reply query: {0}")]
+    #[error("failed to parse reply: {0}")]
     FailedToParseReply(#[from] OperationReplyParseError),
 }
 
@@ -69,6 +69,33 @@ pub enum OperationWriteError {
 }
 
 impl Operation {
+    /// Returns the wire-protocol kind label for this operation.
+    ///
+    /// Useful for structured logging without having to match the [`Operation`]
+    /// enum at every call site.
+    pub const fn op_kind(&self) -> &'static str {
+        match self {
+            Operation::Message(_) => "OP_MSG",
+            Operation::Query(_) => "OP_QUERY",
+            Operation::Reply(_) => "OP_REPLY",
+        }
+    }
+
+    /// Returns the BSON command name driving this operation, when one is
+    /// identifiable.
+    ///
+    /// For OP_MSG the first key of the first body section is the command
+    /// name (e.g. `"find"`, `"insert"`, `"hello"`). For OP_QUERY the first
+    /// key of the query document is used. Server replies (OP_REPLY) don't
+    /// carry a command name and return `None`.
+    pub fn command_name(&self) -> Option<&str> {
+        match self {
+            Operation::Message(m) => m.command_name(),
+            Operation::Query(q) => q.query.keys().next().map(String::as_str),
+            Operation::Reply(_) => None,
+        }
+    }
+
     /// Parses the body bytes that follow a [`MessageHeader`](crate::header::MessageHeader),
     /// dispatching on the opcode the header announced.
     ///

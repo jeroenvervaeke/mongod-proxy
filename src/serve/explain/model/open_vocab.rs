@@ -31,7 +31,6 @@ macro_rules! open_vocab_enum {
             /// Single source of truth: wire-string → enum.
             // Consumed by upcoming parse.rs / classify.rs modules; tests
             // already exercise it.
-            #[allow(dead_code)]
             pub(crate) fn from_wire_str(s: &str) -> Self {
                 match s {
                     $( $($pat)|+ => $Name::$variant, )+
@@ -42,7 +41,6 @@ macro_rules! open_vocab_enum {
             /// Owned-input flavour — avoids a re-allocation when the caller
             /// already owns the `String` and the value falls into the
             /// `Other` arm.
-            #[allow(dead_code)]
             pub(crate) fn from_wire_string(s: String) -> Self {
                 match s.as_str() {
                     $( $($pat)|+ => $Name::$variant, )+
@@ -91,7 +89,6 @@ impl Command {
     /// Parse a wire command-name into a known [`Command`], returning `None`
     /// for command names not modelled exhaustively. Used by `classify` as
     /// the explainable-command filter so unknown commands skip explain.
-    #[allow(dead_code)]
     pub(crate) fn from_command_name(s: &str) -> Option<Self> {
         match Self::from_wire_str(s) {
             Command::Other(_) => None,
@@ -108,6 +105,15 @@ open_vocab_enum! {
         NoWritesPerformed          => "NoWritesPerformed",
         ResumableChangeStreamError => "ResumableChangeStreamError",
         NetworkError               => "NetworkError",
+    }
+}
+
+open_vocab_enum! {
+    /// Scan direction on plan stages that walk an index or collection.
+    /// Wire form: `"forward"` or `"backward"`.
+    pub enum Direction {
+        Forward  => "forward",
+        Backward => "backward",
     }
 }
 

@@ -60,7 +60,7 @@ pub struct Message {
 }
 
 /// Failure modes for [`Message::from_bytes`].
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error)]
 pub enum MessageParseError {
     /// The first 16 bytes could not be parsed as a [`MessageHeader`].
     #[error("failed to parse header")]
@@ -72,7 +72,7 @@ pub enum MessageParseError {
 
 /// Failure modes for [`Message::from_headers_and_bytes`], i.e. parsing when
 /// the header is already known.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error)]
 pub enum MessageAndHeaderParseError {
     /// The header claims `expected` bytes but only `actual` are available.
     #[error("not enough bytes, expected={expected}, actual={actual}")]
@@ -180,15 +180,12 @@ mod tests {
     use crate::fixtures::messages::*;
 
     #[rstest]
-    #[case::plain_query_request(msg_00_query_request::bytes(), Ok(msg_00_query_request::message()))]
-    #[case::plain_query_response(
-        msg_00_query_response::bytes(),
-        Ok(msg_00_query_response::message())
-    )]
-    #[case::legacy_op_query(msg_01_legacy_op_query::bytes(), Ok(msg_01_legacy_op_query::message()))]
-    #[case::legacy_op_query(msg_01_legacy_op_reply::bytes(), Ok(msg_01_legacy_op_reply::message()))]
-    fn deserialize(#[case] bytes: &[u8], #[case] expected: Result<Message, MessageParseError>) {
-        let actual = Message::from_bytes(bytes);
+    #[case::plain_query_request(msg_00_query_request::bytes(), msg_00_query_request::message())]
+    #[case::plain_query_response(msg_00_query_response::bytes(), msg_00_query_response::message())]
+    #[case::legacy_op_query(msg_01_legacy_op_query::bytes(), msg_01_legacy_op_query::message())]
+    #[case::legacy_op_reply(msg_01_legacy_op_reply::bytes(), msg_01_legacy_op_reply::message())]
+    fn deserialize(#[case] bytes: &[u8], #[case] expected: Message) {
+        let actual = Message::from_bytes(bytes).expect("fixture parses");
 
         assert_eq!(expected, actual);
     }

@@ -21,7 +21,8 @@ use std::io::{self, IsTerminal};
 
 use anyhow::{Context, Result};
 use mongod_proxy::{
-    ExplainEvent, Filter, IndexBounds, IndexFieldKind, KeyPattern, PlanNode, Proxy, Stage, serve,
+    Direction, ExplainEvent, Filter, Inclusivity, IndexBounds, IndexFieldKind, KeyPattern,
+    PlanNode, Proxy, Stage, serve,
 };
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -88,13 +89,17 @@ async fn main() -> Result<()> {
 
 fn print_event(event: &ExplainEvent) {
     let total_ms = std::time::Duration::from(event.total.execution_time).as_millis();
+    let explain_req = event
+        .explain_request_id
+        .map(|r| r.to_string())
+        .unwrap_or_else(|| "<none>".to_owned());
     println!(
         "\n[{:?}] {}.{}  client_req={} explain_req={}  → {} docs in {}ms  (examined: {} docs, {} keys)",
         event.command,
         event.namespace.database(),
         event.namespace.collection(),
         event.client_request_id,
-        event.explain_request_id,
+        explain_req,
         event.total.n_returned,
         total_ms,
         event.total.docs_examined,
@@ -117,8 +122,8 @@ fn walk(node: &PlanNode, depth: usize) {
         .unwrap_or_default();
     let direction = node
         .direction
-        .as_deref()
-        .map(|d| format!(" dir={}", d))
+        .as_ref()
+        .map(|d| format!(" dir={}", format_direction(d)))
         .unwrap_or_default();
     println!(
         "{}{stage} n={}{}{} ms={}",
@@ -185,9 +190,23 @@ fn format_index_bounds(b: &IndexBounds) -> String {
 fn format_range(r: &mongod_proxy::IndexBoundRange) -> String {
     let lo = format_bound_value(&r.lower);
     let hi = format_bound_value(&r.upper);
-    let open = if r.lower_inclusive { '[' } else { '(' };
-    let close = if r.upper_inclusive { ']' } else { ')' };
+    let open = match r.lower_inclusivity {
+        Inclusivity::Inclusive => '[',
+        Inclusivity::Exclusive => '(',
+    };
+    let close = match r.upper_inclusivity {
+        Inclusivity::Inclusive => ']',
+        Inclusivity::Exclusive => ')',
+    };
     format!("{open}{lo}, {hi}{close}")
+}
+
+fn format_direction(d: &Direction) -> &'static str {
+    match d {
+        Direction::Forward => "forward",
+        Direction::Backward => "backward",
+        _ => "<other>",
+    }
 }
 
 fn format_bound_value(v: &mongod_proxy::BoundValue) -> String {

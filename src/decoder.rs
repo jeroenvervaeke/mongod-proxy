@@ -96,21 +96,21 @@ impl Decoder for WireDecoder {
             }
         }
 
-        {
-            // If we don't have a header or don't have enough data yet, wait for more data
-            let Some(next_header) = &self.next_header else {
-                return Ok(None);
-            };
-
-            if buf.len() < next_header.message_length.into_inner() as usize {
-                return Ok(None);
-            }
+        // If we don't have a header or don't have enough data yet, wait for more data
+        let Some(next_header) = &self.next_header else {
+            return Ok(None);
+        };
+        let frame_len = next_header.message_length.into_inner() as usize;
+        if buf.len() < frame_len {
+            return Ok(None);
         }
 
-        // At this point we have a header and enough data to parse the message
-        let header = self.next_header.take().unwrap();
-        // remove the entire message from the buffer
-        let message_bytes = buf.split_to(header.message_length.into_inner() as usize);
+        // Header + body present: take ownership of the header and split the frame off.
+        let header = self
+            .next_header
+            .take()
+            .expect("checked above via let-else borrow");
+        let message_bytes = buf.split_to(frame_len);
 
         // Parse message based on header and bytes
         Ok(Some(Message::from_headers_and_bytes(
@@ -146,7 +146,7 @@ mod tests {
         // Decode the first message
         assert_eq!(
             Some(msg_00_query_request::message()),
-            decoder.decode(&mut buf).expect("decode succceeds")
+            decoder.decode(&mut buf).expect("decode succeeds")
         );
 
         // Remaining number of bytes should be equal to second message
@@ -155,14 +155,14 @@ mod tests {
         // Decode the second message
         assert_eq!(
             Some(msg_00_query_response::message()),
-            decoder.decode(&mut buf).expect("decode succceeds")
+            decoder.decode(&mut buf).expect("decode succeeds")
         );
 
         // Remaining buffer should be empty
         assert!(buf.is_empty());
 
         // Make sure nothings left
-        assert_eq!(None, decoder.decode(&mut buf).expect("decode succceeds"));
+        assert_eq!(None, decoder.decode(&mut buf).expect("decode succeeds"));
     }
 
     #[test]

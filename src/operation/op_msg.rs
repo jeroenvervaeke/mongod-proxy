@@ -150,7 +150,7 @@ pub struct OperationMessage {
 }
 
 /// Failure modes for [`OperationMessage::from_bytes`].
-#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error)]
 pub enum OperationMessageParseError {
     /// Body shorter than the unconditional minimum (flag bits + first kind byte).
     #[error("not enough bytes, expected at least {min} bytes, got {actual}")]
@@ -168,24 +168,15 @@ pub enum OperationMessageParseError {
     /// A kind-1 section's self-declared size did not fit in the buffer.
     #[error("document sequence section size {size} out of range")]
     InvalidDocumentSequenceSize { size: i32 },
-    /// A kind-1 section's identifier (cstring) was malformed.
-    #[error("invalid document sequence identifier: {0}")]
-    InvalidDocumentSequenceIdentifier(String),
+    /// A kind-1 section's identifier ended without a NUL terminator.
+    #[error("document sequence identifier missing NUL terminator: {0}")]
+    DocumentSequenceIdentifierMissingNul(#[from] FromBytesUntilNulError),
+    /// A kind-1 section's identifier was not valid UTF-8.
+    #[error("document sequence identifier is not valid UTF-8: {0}")]
+    DocumentSequenceIdentifierNotUtf8(#[from] Utf8Error),
     /// BSON parsing of a section document failed.
     #[error("failed to parse bson: {0}")]
-    InvalidBson(String),
-}
-
-impl From<FromBytesUntilNulError> for OperationMessageParseError {
-    fn from(value: FromBytesUntilNulError) -> Self {
-        OperationMessageParseError::InvalidDocumentSequenceIdentifier(value.to_string())
-    }
-}
-
-impl From<Utf8Error> for OperationMessageParseError {
-    fn from(value: Utf8Error) -> Self {
-        OperationMessageParseError::InvalidDocumentSequenceIdentifier(value.to_string())
-    }
+    InvalidBson(#[from] bson::de::Error),
 }
 
 /// Failure modes for [`OperationMessage::write_bytes`].
@@ -198,6 +189,14 @@ pub enum OperationMessageWriteError {
     /// byte and so could not be written as a C string.
     #[error("document sequence identifier contains null byte: {0}")]
     IdentifierContainsNullByte(#[from] NulError),
+    /// A kind-1 document sequence section exceeded the `i32` size field
+    /// limit (≥ 2 GiB). Carries the actual byte size.
+    #[error("document sequence section size {0} exceeds i32::MAX")]
+    SectionTooLarge(usize),
+    /// The fully assembled frame exceeded the wire-envelope upper bound
+    /// (48 MiB). Carries the actual byte size.
+    #[error("message length {0} exceeds wire-envelope upper bound")]
+    MessageTooLarge(usize),
 }
 
 impl OperationMessage {
@@ -320,9 +319,11 @@ impl OperationMessage {
 
         dst.reserve(message_length);
 
+        let message_length_i32 = i32::try_from(message_length)
+            .map_err(|_| OperationMessageWriteError::MessageTooLarge(message_length))?;
         let header = MessageHeader {
-            message_length: MessageLength::try_new(message_length as i32)
-                .expect("message_length derived from serialised sections is within wire envelope"),
+            message_length: MessageLength::try_new(message_length_i32)
+                .map_err(|_| OperationMessageWriteError::MessageTooLarge(message_length))?,
             op_code: OPCode::Msg,
             request_id,
             response_to,
@@ -349,8 +350,7 @@ fn parse_sections(bytes: &[u8]) -> Result<Vec<OpMsgSection>, OperationMessagePar
         cursor.set_position(pos as u64 + 1);
         match kind {
             0 => {
-                let doc = Document::from_reader(&mut cursor)
-                    .map_err(|e| OperationMessageParseError::InvalidBson(e.to_string()))?;
+                let doc = Document::from_reader(&mut cursor)?;
                 sections.push(OpMsgSection::Body(doc));
             }
             1 => {
@@ -381,8 +381,7 @@ fn parse_sections(bytes: &[u8]) -> Result<Vec<OpMsgSection>, OperationMessagePar
 
                 let mut documents = Vec::new();
                 while (cursor.position() as usize) < payload_end {
-                    let doc = Document::from_reader(&mut cursor)
-                        .map_err(|e| OperationMessageParseError::InvalidBson(e.to_string()))?;
+                    let doc = Document::from_reader(&mut cursor)?;
                     documents.push(doc);
                 }
                 sections.push(OpMsgSection::DocumentSequence {
@@ -423,8 +422,11 @@ fn write_section(
             let size_field = size_of::<i32>();
             let section_size = size_field + identifier_bytes.len() + docs_bytes.len();
             // The size field is the size INCLUDING itself, NOT including the
-            // leading kind byte.
-            out.extend_from_slice(&(section_size as i32).to_le_bytes());
+            // leading kind byte. The wire format encodes it as i32, so reject
+            // sections that would silently wrap on cast.
+            let section_size_i32 = i32::try_from(section_size)
+                .map_err(|_| OperationMessageWriteError::SectionTooLarge(section_size))?;
+            out.extend_from_slice(&section_size_i32.to_le_bytes());
             out.extend_from_slice(identifier_bytes);
             out.extend_from_slice(&docs_bytes);
         }

@@ -133,26 +133,28 @@ where
     St: Stream<Item = Result<Message, E>> + Send + Unpin + 'static,
     E: Display + Send + 'static,
 {
-    /// Runs the accept loop until the listener errors out fatally.
+    /// Runs the accept loop until the listener returns an error.
     ///
     /// For each accepted TCP connection the upstream service is built in a
     /// dedicated tokio task so a slow upstream connect cannot stall the
     /// accept loop. Once the upstream service is ready, the per-connection
-    /// forwarding loop runs in the same spawned task.
+    /// forwarding loop runs in the same spawned task. Per-connection
+    /// errors are logged via `tracing::error!` and never bubble up.
     ///
     /// # Errors
     ///
-    /// Returns once `TcpListener::accept` itself fails. Per-connection
-    /// errors are logged via `tracing::error!` and never bubble up.
+    /// Returns [`ServeError::Accept`] when `TcpListener::accept` itself
+    /// fails. Tokio internally retries transient `EAGAIN`, so anything that
+    /// surfaces here indicates the listening socket is broken (e.g. file
+    /// descriptor closed, kernel resource exhaustion). Callers that want to
+    /// keep serving across such failures must reopen the listener and call
+    /// [`serve`] again.
     pub async fn run(mut self) -> Result<(), ServeError> {
         loop {
-            let (client_stream, addr) = match self.listener.accept().await {
-                Ok(pair) => pair,
-                Err(e) => {
-                    error!(error = %e, "failed to accept incoming connection");
-                    continue;
-                }
-            };
+            let (client_stream, addr) = self.listener.accept().await.map_err(|e| {
+                error!(error = %e, "failed to accept incoming connection; shutting down");
+                ServeError::Accept(e)
+            })?;
 
             // Build the upstream service in a dedicated task so a slow upstream
             // connect cannot stall the accept loop.
@@ -183,10 +185,12 @@ where
 enum AcceptClientError<E: Display> {
     #[error("failed to decode wire message from client: {0}")]
     DecodeFromClient(#[from] WireDecoderError),
-    #[error("failed to forward request to server: {0}")]
-    ForwardToRequestServer(E),
+    #[error("upstream service rejected request: {0}")]
+    UpstreamRequest(E),
+    #[error("upstream service errored while streaming response: {0}")]
+    UpstreamResponse(E),
     #[error("failed to forward response to client: {0}")]
-    ForwardToResponseClient(#[from] WireEncoderError),
+    EncodeToClient(#[from] WireEncoderError),
 }
 
 async fn accept_client_inner<S, St, E>(
@@ -209,14 +213,14 @@ where
         let mut response_stream = service
             .call(client_req)
             .await
-            .map_err(AcceptClientError::ForwardToRequestServer)?;
+            .map_err(AcceptClientError::UpstreamRequest)?;
 
         // Forward every reply the upstream produces for this request. In the
         // common case there is exactly one. In streaming-SDAM / exhaust mode
         // the upstream emits multiple replies (each with moreToCome) and we
         // must shuttle every one to the client until the terminal reply.
         while let Some(resp) = response_stream.next().await {
-            let resp = resp.map_err(AcceptClientError::ForwardToRequestServer)?;
+            let resp = resp.map_err(AcceptClientError::UpstreamResponse)?;
             client_writer.send(resp).await?;
         }
     }

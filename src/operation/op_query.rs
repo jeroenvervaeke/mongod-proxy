@@ -72,7 +72,7 @@ bitflags! {
 }
 
 /// Failure modes for [`OperationQuery::from_bytes`].
-#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error)]
 pub enum OperationQueryParseError {
     /// Body shorter than the unconditional minimum.
     #[error("not enough bytes, expected at least {min} bytes, got {actual}")]
@@ -89,25 +89,28 @@ pub enum OperationQueryParseError {
     InvalidUtf8CollectionName(#[from] Utf8Error),
     /// BSON parsing of the query document failed.
     #[error("failed to parse query: {0}")]
-    FailedToParseQuery(String),
+    FailedToParseQuery(#[source] bson::de::Error),
     /// BSON parsing of the projection document failed.
     #[error("failed to parse return fields selector: {0}")]
-    FailedToParseReturnFieldsSelector(String),
+    FailedToParseReturnFieldsSelector(#[source] bson::de::Error),
 }
 
 /// Failure modes for [`OperationQuery::write_bytes`].
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error)]
 pub enum OperationQueryWriteError {
     /// BSON serialisation of `query` failed.
     #[error("failed to serialize query: {0}")]
-    SerializeQueryError(String),
+    SerializeQueryError(#[source] bson::ser::Error),
     /// BSON serialisation of `return_fields_selector` failed.
     #[error("failed to serialize return field selector: {0}")]
-    SerializeReturnFieldSelectorError(String),
+    SerializeReturnFieldSelectorError(#[source] bson::ser::Error),
     /// `full_collection_name` contained an interior NUL byte and so cannot
     /// be encoded as a C string.
     #[error("collection name contains null byte: {0}")]
     CollectionNameContainsNullByte(#[from] NulError),
+    /// The fully assembled frame exceeded the wire-envelope upper bound.
+    #[error("message length {0} exceeds wire-envelope upper bound")]
+    MessageTooLarge(usize),
 }
 
 impl OperationQuery {
@@ -162,12 +165,13 @@ impl OperationQuery {
         let mut reader = Cursor::new(&bytes[8..]);
 
         let query = Document::from_reader(&mut reader)
-            .map_err(|e| OperationQueryParseError::FailedToParseQuery(e.to_string()))?;
+            .map_err(OperationQueryParseError::FailedToParseQuery)?;
 
         let return_fields_selector = if reader.has_remaining() {
-            Some(Document::from_reader(reader).map_err(|e| {
-                OperationQueryParseError::FailedToParseReturnFieldsSelector(e.to_string())
-            })?)
+            Some(
+                Document::from_reader(reader)
+                    .map_err(OperationQueryParseError::FailedToParseReturnFieldsSelector)?,
+            )
         } else {
             None
         };
@@ -198,13 +202,12 @@ impl OperationQuery {
         request_id: RequestId,
         response_to: Option<ResponseTo>,
     ) -> Result<(), OperationQueryWriteError> {
-        let query_bytes = bson::to_vec(&self.query)
-            .map_err(|e| OperationQueryWriteError::SerializeQueryError(e.to_string()))?;
+        let query_bytes =
+            bson::to_vec(&self.query).map_err(OperationQueryWriteError::SerializeQueryError)?;
 
         let return_fields_selector_bytes = match &self.return_fields_selector {
-            Some(doc) => bson::to_vec(doc).map_err(|e| {
-                OperationQueryWriteError::SerializeReturnFieldSelectorError(e.to_string())
-            })?,
+            Some(doc) => bson::to_vec(doc)
+                .map_err(OperationQueryWriteError::SerializeReturnFieldSelectorError)?,
             None => Vec::new(),
         };
 
@@ -221,9 +224,11 @@ impl OperationQuery {
 
         dst.reserve(message_length);
 
+        let message_length_i32 = i32::try_from(message_length)
+            .map_err(|_| OperationQueryWriteError::MessageTooLarge(message_length))?;
         let header = MessageHeader {
-            message_length: MessageLength::try_new(message_length as i32)
-                .expect("message_length derived from serialised body is within wire envelope"),
+            message_length: MessageLength::try_new(message_length_i32)
+                .map_err(|_| OperationQueryWriteError::MessageTooLarge(message_length))?,
             op_code: OPCode::Query,
             request_id,
             response_to,

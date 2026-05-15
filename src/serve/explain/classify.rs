@@ -22,7 +22,6 @@ pub(crate) struct ClassifiedRequest<'a> {
     pub(crate) doc_sequences: &'a [OpMsgSection],
 }
 
-#[allow(dead_code)]
 impl<'a> ClassifiedRequest<'a> {
     pub fn command(&self) -> &Command {
         &self.command
@@ -49,7 +48,6 @@ impl<'a> ClassifiedRequest<'a> {
 ///
 /// Borrows from `req`; the only allocation on the happy path is the
 /// [`Database`] newtype's owned `String`.
-#[allow(dead_code)]
 pub(crate) fn classify(req: &Message) -> Option<ClassifiedRequest<'_>> {
     let Operation::Message(op_msg) = &req.operation else {
         return None;

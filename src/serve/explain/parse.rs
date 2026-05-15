@@ -10,13 +10,10 @@ use std::time::Duration;
 use bson::{Bson, Document};
 
 use super::error::{ExplainParseError, ExplainServerError, NegativeDurationError};
-use super::model::{
-    ErrorLabel, MalformedOkShape, NodeTime, PlanNode, ServerErrorCode, ServerErrorCodeName,
-};
+use super::model::{Direction, MalformedOkShape, NodeTime, PlanNode};
 use super::wire::{RawExplainReply, RawPlanNode, RawServerError};
 
 /// Three explicit outcomes of probing the `ok` field of an explain reply.
-#[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq)]
 enum OkOutcome {
     Success,
@@ -27,7 +24,6 @@ enum OkOutcome {
 /// Probe the `ok` field directly on the borrowed [`Document`] without
 /// cloning it. Only valid numeric forms (Int32/Int64/finite-Double)
 /// produce `Success`/`Rejected`; anything else is `Malformed(_)`.
-#[allow(dead_code)]
 fn probe_ok(doc: &Document) -> OkOutcome {
     let Some(b) = doc.get("ok") else {
         return OkOutcome::Malformed(MalformedOkShape::Missing);
@@ -65,7 +61,6 @@ fn probe_ok(doc: &Document) -> OkOutcome {
 ///   - `Ok(Err(srv))`   — server returned `ok=0`; typed rejection.
 ///   - `Err(parse_err)` — wire-level parse failure (malformed `ok`,
 ///     deserialise failure, or malformed error body).
-#[allow(dead_code)]
 pub(crate) fn parse_reply_doc(
     doc: Document,
 ) -> Result<Result<RawExplainReply, ExplainServerError>, ExplainParseError> {
@@ -102,7 +97,6 @@ pub(crate) fn parse_reply_doc(
 
 /// Convert wire `i64` ms into a typed [`Duration`], producing a typed
 /// [`NegativeDurationError`] (not `serde::de::Error::custom`) on failure.
-#[allow(dead_code)]
 pub(crate) fn i64_ms_to_duration(
     field: &'static str,
     ms: i64,
@@ -116,7 +110,6 @@ pub(crate) fn i64_ms_to_duration(
 /// Recursively map [`RawPlanNode`] → [`PlanNode`]. Rejects "both children
 /// shapes present" with [`ExplainParseError::BothChildrenShapesPresent`]
 /// carrying the depth at which the violation was found.
-#[allow(dead_code)]
 pub(crate) fn to_plan_node(r: RawPlanNode, depth: usize) -> Result<PlanNode, ExplainParseError> {
     let execution_time = match r.execution_time_millis_estimate {
         None => None,
@@ -145,7 +138,7 @@ pub(crate) fn to_plan_node(r: RawPlanNode, depth: usize) -> Result<PlanNode, Exp
         index_name: r.index_name,
         key_pattern: r.key_pattern,
         index_bounds: r.index_bounds,
-        direction: r.direction,
+        direction: r.direction.map(Direction::from_wire_string),
         filter: r.filter,
         children,
     })
@@ -154,17 +147,9 @@ pub(crate) fn to_plan_node(r: RawPlanNode, depth: usize) -> Result<PlanNode, Exp
 // (raw_into_event lives in layer.rs where the per-request context — client
 // request_id, allocated explain_request_id — is in scope.)
 
-// Suppress unused-import warning for ErrorLabel / ServerErrorCode etc.
-// referenced only through `parse_reply_doc`'s match arms — the symbols
-// are required for compile-time type checking of the Rejected variant.
-const _: fn() = || {
-    let _: Option<ErrorLabel> = None;
-    let _: Option<ServerErrorCode> = None;
-    let _: Option<ServerErrorCodeName> = None;
-};
-
 #[cfg(test)]
 mod tests {
+    use super::super::model::{ServerErrorCode, ServerErrorCodeName};
     use super::*;
     use bson::doc;
 

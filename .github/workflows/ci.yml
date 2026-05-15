@@ -61,12 +61,25 @@ jobs:
       # running --all-targets here is safe on a stock GitHub runner.
       - run: cargo test --workspace --all-targets --all-features
 
+  # Verifies the crate builds on the declared MSRV (rust-version in Cargo.toml).
+  # If you bump the MSRV, bump the toolchain version below in the same commit.
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: msrv
+      - run: cargo build --workspace --all-targets --all-features
+
   # Aggregator job — make this one "required" in branch protection.
   # Succeeds only when every job in `needs` succeeded.
   ci:
     name: ci
     if: always()
-    needs: [fmt, clippy, build, test]
+    needs: [fmt, clippy, build, test, msrv]
     runs-on: ubuntu-latest
     steps:
       - name: Check all jobs succeeded
@@ -77,6 +90,7 @@ jobs:
             echo "  clippy: ${{ needs.clippy.result }}"
             echo "  build:  ${{ needs.build.result }}"
             echo "  test:   ${{ needs.test.result }}"
+            echo "  msrv:   ${{ needs.msrv.result }}"
             exit 1
           fi
           echo "All CI jobs succeeded."

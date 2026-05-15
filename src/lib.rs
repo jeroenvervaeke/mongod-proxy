@@ -2,7 +2,7 @@
 //!
 //! `mongod-proxy` accepts MongoDB driver connections, parses the wire-protocol
 //! frames on each connection, optionally passes them through a stack of
-//! [`tower`] layers (for logging, inspection, rate limiting, etc.), and
+//! `tower` layers (for logging, inspection, rate limiting, etc.), and
 //! forwards them to a real `mongod`. Both modern OP_MSG and legacy
 //! OP_QUERY / OP_REPLY frames are supported, including:
 //!
@@ -41,7 +41,7 @@
 //! ```
 //!
 //! The library is split into wire-level types (one type per OP code in
-//! [`operation`]) and a runtime ([`serve`]) that wires those types onto
+//! [`operation`]) and a runtime ([`mod@serve`]) that wires those types onto
 //! a `tokio` listener and a tower service stack.
 
 pub mod decoder;

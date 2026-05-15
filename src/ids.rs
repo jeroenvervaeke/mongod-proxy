@@ -29,8 +29,8 @@ impl From<ExplainRequestId> for RequestId {
 }
 
 /// `response_to` field from the MongoDB message header — only present on
-/// server replies, never on fresh client requests. Wraps [`NonZeroI32`] to
-/// preserve the niche optimisation on `Option<ResponseTo>`.
+/// server replies, never on fresh client requests. Wraps [`std::num::NonZeroI32`]
+/// to preserve the niche optimisation on `Option<ResponseTo>`.
 #[nutype(derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display, Into))]
 pub struct ResponseTo(std::num::NonZeroI32);
 

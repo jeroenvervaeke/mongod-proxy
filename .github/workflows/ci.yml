@@ -61,6 +61,22 @@ jobs:
       # running --all-targets here is safe on a stock GitHub runner.
       - run: cargo test --workspace --all-targets --all-features
 
+  # Builds the rustdoc with -D warnings so broken intra-doc links, missing
+  # items referenced from docs, and similar regressions fail CI instead of
+  # silently shipping in docs.rs (or the README's docs links).
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: stable
+      - run: cargo doc --workspace --no-deps --all-features
+
   # Smoke-runs every cargo-fuzz target for a short time budget so the targets
   # stay compilable and we catch trivial regressions on PRs. Real fuzzing
   # campaigns should be run locally or on a longer-lived runner — 60 seconds
@@ -113,7 +129,7 @@ jobs:
   ci:
     name: ci
     if: always()
-    needs: [fmt, clippy, build, test, msrv, deny, fuzz]
+    needs: [fmt, clippy, build, test, msrv, deny, docs, fuzz]
     runs-on: ubuntu-latest
     steps:
       - name: Check all jobs succeeded
@@ -126,6 +142,7 @@ jobs:
             echo "  test:   ${{ needs.test.result }}"
             echo "  msrv:   ${{ needs.msrv.result }}"
             echo "  deny:   ${{ needs.deny.result }}"
+            echo "  docs:   ${{ needs.docs.result }}"
             echo "  fuzz:   ${{ needs.fuzz.result }}"
             exit 1
           fi

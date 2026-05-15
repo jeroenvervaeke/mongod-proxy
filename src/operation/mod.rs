@@ -12,13 +12,12 @@
 //! The [`Operation`] enum is the discriminated union the rest of the crate
 //! uses to talk about an operation body abstractly.
 
-use std::num::NonZeroI32;
-
 use op_msg::{OperationMessage, OperationMessageParseError, OperationMessageWriteError};
 use op_query::{OperationQuery, OperationQueryParseError, OperationQueryWriteError};
 use op_reply::{OperationReply, OperationReplyParseError, OperationReplyWriteError};
 use tokio_util::bytes::BytesMut;
 
+use crate::ids::{RequestId, ResponseTo};
 use crate::op_code::OPCode;
 
 pub mod op_msg;
@@ -102,8 +101,8 @@ impl Operation {
     pub fn write_bytes(
         &self,
         dst: &mut BytesMut,
-        request_id: i32,
-        response_to: Option<NonZeroI32>,
+        request_id: RequestId,
+        response_to: Option<ResponseTo>,
     ) -> Result<(), OperationWriteError> {
         match self {
             Operation::Message(operation_message) => {

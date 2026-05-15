@@ -16,6 +16,7 @@ use crate::message::{Message, MessageWriteError};
 /// ```
 /// use bson::doc;
 /// use mongod_proxy::encoder::WireEncoder;
+/// use mongod_proxy::ids::RequestId;
 /// use mongod_proxy::message::Message;
 /// use mongod_proxy::operation::Operation;
 /// use mongod_proxy::operation::op_msg::{OpMsgSection, OperationMessage, OperationMessageFlags};
@@ -23,7 +24,7 @@ use crate::message::{Message, MessageWriteError};
 /// use tokio_util::codec::Encoder;
 ///
 /// let msg = Message {
-///     request_id: 1,
+///     request_id: RequestId::new(1),
 ///     response_to: None,
 ///     operation: Operation::Message(OperationMessage {
 ///         flags: OperationMessageFlags::empty(),

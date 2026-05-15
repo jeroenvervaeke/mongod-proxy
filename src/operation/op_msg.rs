@@ -8,7 +8,6 @@
 use std::{
     ffi::{CStr, CString, FromBytesUntilNulError, NulError},
     io::Cursor,
-    num::NonZeroI32,
     str::Utf8Error,
 };
 
@@ -16,7 +15,11 @@ use bitflags::bitflags;
 use bson::Document;
 use tokio_util::bytes::{BufMut, BytesMut};
 
-use crate::{header::MessageHeader, op_code::OPCode};
+use crate::{
+    header::MessageHeader,
+    ids::{MessageLength, RequestId, ResponseTo},
+    op_code::OPCode,
+};
 
 /// Mask of the bits the spec classifies as *required* (`0..16`).
 ///
@@ -85,6 +88,16 @@ impl OpMsgSection {
             OpMsgSection::DocumentSequence { .. } => None,
         }
     }
+
+    /// Consumes the section, returning the inner [`Document`] when the section
+    /// is a [`OpMsgSection::Body`]. Companion to [`as_body`](Self::as_body) for
+    /// callers that own the section and want to move the document out.
+    pub fn into_body(self) -> Option<Document> {
+        match self {
+            OpMsgSection::Body(doc) => Some(doc),
+            OpMsgSection::DocumentSequence { .. } => None,
+        }
+    }
 }
 
 /// Modern OP_MSG message body.
@@ -101,13 +114,14 @@ impl OpMsgSection {
 /// ```
 /// use bson::doc;
 /// use mongod_proxy::header::MessageHeader;
+/// use mongod_proxy::ids::RequestId;
 /// use mongod_proxy::message::Message;
 /// use mongod_proxy::operation::Operation;
 /// use mongod_proxy::operation::op_msg::{OpMsgSection, OperationMessage, OperationMessageFlags};
 /// use tokio_util::bytes::BytesMut;
 ///
 /// let msg = Message {
-///     request_id: 42,
+///     request_id: RequestId::new(42),
 ///     response_to: None,
 ///     operation: Operation::Message(OperationMessage {
 ///         flags: OperationMessageFlags::MORE_TO_COME,
@@ -278,8 +292,8 @@ impl OperationMessage {
     pub fn write_bytes(
         &self,
         dst: &mut BytesMut,
-        request_id: i32,
-        response_to: Option<NonZeroI32>,
+        request_id: RequestId,
+        response_to: Option<ResponseTo>,
     ) -> Result<(), OperationMessageWriteError> {
         // Pre-serialise every section so we know the on-the-wire length up
         // front (the header carries the total message_length).
@@ -307,7 +321,8 @@ impl OperationMessage {
         dst.reserve(message_length);
 
         let header = MessageHeader {
-            message_length: message_length as i32,
+            message_length: MessageLength::try_new(message_length as i32)
+                .expect("message_length derived from serialised sections is within wire envelope"),
             op_code: OPCode::Msg,
             request_id,
             response_to,
@@ -431,6 +446,22 @@ mod tests {
     }
 
     #[test]
+    fn into_body_consumes_body_section() {
+        let s = OpMsgSection::Body(doc! { "ping": 1 });
+        let d = s.into_body().expect("body returns Some");
+        assert_eq!(d, doc! { "ping": 1 });
+    }
+
+    #[test]
+    fn into_body_returns_none_for_document_sequence() {
+        let s = OpMsgSection::DocumentSequence {
+            identifier: "documents".to_owned(),
+            documents: vec![doc! { "x": 1 }],
+        };
+        assert!(s.into_body().is_none());
+    }
+
+    #[test]
     fn round_trip_preserves_more_to_come_flag() {
         let msg = OperationMessage {
             flags: OperationMessageFlags::MORE_TO_COME,
@@ -438,7 +469,7 @@ mod tests {
             checksum: None,
         };
         let mut buf = BytesMut::new();
-        msg.write_bytes(&mut buf, 1, None).unwrap();
+        msg.write_bytes(&mut buf, RequestId::new(1), None).unwrap();
         // Skip 16-byte header to reach flags.
         let raw_flags = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
         assert_eq!(
@@ -456,7 +487,7 @@ mod tests {
             checksum: Some(0xDEADBEEF),
         };
         let mut buf = BytesMut::new();
-        msg.write_bytes(&mut buf, 1, None).unwrap();
+        msg.write_bytes(&mut buf, RequestId::new(1), None).unwrap();
 
         let body = &buf[MessageHeader::size()..];
         let parsed = OperationMessage::from_bytes(body).unwrap();
@@ -506,7 +537,7 @@ mod tests {
             checksum: None,
         };
         let mut buf = BytesMut::new();
-        msg.write_bytes(&mut buf, 1, None).unwrap();
+        msg.write_bytes(&mut buf, RequestId::new(1), None).unwrap();
         let body = &buf[MessageHeader::size()..];
         let parsed = OperationMessage::from_bytes(body).unwrap();
         assert_eq!(parsed.flags, OperationMessageFlags::EXHAUST_ALLOWED);
@@ -533,7 +564,7 @@ mod tests {
             checksum: None,
         };
         let mut buf = BytesMut::new();
-        msg.write_bytes(&mut buf, 7, None).unwrap();
+        msg.write_bytes(&mut buf, RequestId::new(7), None).unwrap();
         let body = &buf[MessageHeader::size()..];
         let parsed = OperationMessage::from_bytes(body).unwrap();
         assert_eq!(parsed, msg);

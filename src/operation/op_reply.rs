@@ -3,13 +3,17 @@
 //! The server replies to an OP_QUERY (typically the handshake `isMaster` /
 //! `hello`) with this opcode. New cursor commands use OP_MSG instead.
 
-use std::{io::Cursor, num::NonZeroI32};
+use std::io::Cursor;
 
 use bitflags::bitflags;
 use bson::Document;
 use tokio_util::bytes::{BufMut, BytesMut};
 
-use crate::{header::MessageHeader, op_code::OPCode};
+use crate::{
+    header::MessageHeader,
+    ids::{MessageLength, RequestId, ResponseTo},
+    op_code::OPCode,
+};
 
 /// Legacy OP_REPLY body.
 ///
@@ -143,8 +147,8 @@ impl OperationReply {
     pub fn write_bytes(
         &self,
         dst: &mut BytesMut,
-        request_id: i32,
-        response_to: Option<NonZeroI32>,
+        request_id: RequestId,
+        response_to: Option<ResponseTo>,
     ) -> Result<(), OperationReplyWriteError> {
         let number_returned: i32 = self
             .documents
@@ -165,7 +169,8 @@ impl OperationReply {
         dst.reserve(message_length);
 
         let header = MessageHeader {
-            message_length: message_length as i32,
+            message_length: MessageLength::try_new(message_length as i32)
+                .expect("message_length derived from serialised body is within wire envelope"),
             op_code: OPCode::Reply,
             request_id,
             response_to,
@@ -196,7 +201,9 @@ mod tests {
             documents: vec![doc! { "a": 1 }, doc! { "b": 2 }, doc! { "c": 3 }],
         };
         let mut buf = BytesMut::new();
-        reply.write_bytes(&mut buf, 1, None).unwrap();
+        reply
+            .write_bytes(&mut buf, RequestId::new(1), None)
+            .unwrap();
         let body = &buf[MessageHeader::size()..];
         let parsed = OperationReply::from_bytes(body).unwrap();
         assert_eq!(parsed, reply);

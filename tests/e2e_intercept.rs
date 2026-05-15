@@ -404,7 +404,7 @@ where
             op: op_kind(&req.operation),
             command: command.clone(),
             responds_to: None,
-            request_id: req.request_id,
+            request_id: req.request_id.into(),
         });
 
         let fut = self.inner.call(req);
@@ -445,7 +445,7 @@ where
                     op: op_kind(&msg.operation),
                     command: None,
                     responds_to: self.request_command.clone(),
-                    request_id: msg.request_id,
+                    request_id: msg.request_id.into(),
                 });
                 std::task::Poll::Ready(Some(Ok(msg)))
             }

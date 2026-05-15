@@ -142,6 +142,37 @@ impl<L> Proxy<L> {
     pub fn enable_logging(self) -> Proxy<Stack<LogLayer, L>> {
         self.layer(LogLayer)
     }
+
+    /// Convenience for `self.layer(ExplainLayer::new())`.
+    ///
+    /// Captures explainable client commands (`find`, `aggregate`, …) and
+    /// emits a typed `tracing::info!` event with the executed plan and
+    /// per-stage timing. No user-supplied sink is wired — use
+    /// [`enable_explain_with_sink`](Self::enable_explain_with_sink) to
+    /// consume typed [`ExplainEvent`](crate::ExplainEvent)s programmatically.
+    pub fn enable_explain(
+        self,
+    ) -> Proxy<Stack<crate::serve::explain::ExplainLayer<crate::serve::explain::TracingOnly>, L>>
+    {
+        self.layer(crate::serve::explain::ExplainLayer::new())
+    }
+
+    /// Convenience for `self.layer(ExplainLayer::with_sink(sink))`.
+    ///
+    /// `sink` receives a typed [`ExplainEvent`](crate::ExplainEvent) for
+    /// every explainable client command and a typed
+    /// [`ExplainError`](crate::ExplainError) for every failure. The sink
+    /// `Clone`s once per accepted connection — keep it O(1) (refcount or
+    /// `Copy`).
+    pub fn enable_explain_with_sink<Sk>(
+        self,
+        sink: Sk,
+    ) -> Proxy<Stack<crate::serve::explain::ExplainLayer<Sk>, L>>
+    where
+        Sk: Clone,
+    {
+        self.layer(crate::serve::explain::ExplainLayer::with_sink(sink))
+    }
 }
 
 impl<L> Service<SocketAddr> for Proxy<L>
@@ -208,6 +239,12 @@ where
 ///
 /// Construct via [`ProxyClient::forward_to`]; or via [`Proxy::call`] which
 /// builds one per accepted client connection.
+///
+/// `Clone` is cheap (single `Arc::clone`) and exists so middleware layers
+/// that need to issue more than one call through the per-connection
+/// service (e.g. `ExplainLayer`'s sideband explain) can move a handle
+/// into their boxed future.
+#[derive(Clone)]
 pub struct ProxyClient {
     inner: Arc<Mutex<ProxyClientInner>>,
 }
@@ -443,6 +480,7 @@ mod tests {
     use tokio_util::bytes::BytesMut;
 
     use super::*;
+    use crate::ids::{RequestId, ResponseTo};
     use crate::operation::op_msg::{OpMsgSection, OperationMessage, OperationMessageFlags};
 
     fn build_msg(
@@ -451,8 +489,8 @@ mod tests {
         response_to: Option<NonZeroI32>,
     ) -> Message {
         Message {
-            request_id,
-            response_to,
+            request_id: RequestId::new(request_id),
+            response_to: response_to.map(ResponseTo::new),
             operation: Operation::Message(OperationMessage {
                 flags,
                 sections: vec![OpMsgSection::Body(doc! { "n": request_id })],
@@ -517,9 +555,9 @@ mod tests {
         let r1 = stream.next().await.expect("first reply").expect("ok");
         let r2 = stream.next().await.expect("second reply").expect("ok");
         let r3 = stream.next().await.expect("third reply").expect("ok");
-        assert_eq!(r1.request_id, 101);
-        assert_eq!(r2.request_id, 102);
-        assert_eq!(r3.request_id, 103);
+        assert_eq!(r1.request_id, RequestId::new(101));
+        assert_eq!(r2.request_id, RequestId::new(102));
+        assert_eq!(r3.request_id, RequestId::new(103));
         assert!(more_to_come(&r1.operation));
         assert!(more_to_come(&r2.operation));
         assert!(!more_to_come(&r3.operation));
@@ -551,7 +589,7 @@ mod tests {
             .expect("call succeeds");
 
         let r = stream.next().await.expect("reply").expect("ok");
-        assert_eq!(r.request_id, 200);
+        assert_eq!(r.request_id, RequestId::new(200));
         assert!(stream.next().await.is_none());
     }
 
@@ -593,7 +631,7 @@ mod tests {
         drop(upstream);
 
         let first = stream.next().await.expect("first reply").expect("ok reply");
-        assert_eq!(first.request_id, 100);
+        assert_eq!(first.request_id, RequestId::new(100));
         assert!(more_to_come(&first.operation));
 
         let eof = stream

@@ -4,6 +4,7 @@ use std::num::NonZeroI32;
 
 use tokio_util::bytes::BytesMut;
 
+use crate::ids::{MessageLength, MessageLengthError, RequestId, ResponseTo};
 use crate::op_code::{OPCode, OPCodeParseError};
 
 /// Standard MongoDB wire-protocol message header.
@@ -26,14 +27,15 @@ use crate::op_code::{OPCode, OPCodeParseError};
 ///
 /// ```
 /// use mongod_proxy::header::MessageHeader;
+/// use mongod_proxy::ids::{MessageLength, RequestId, ResponseTo};
 /// use mongod_proxy::op_code::OPCode;
 /// use std::num::NonZeroI32;
 /// use tokio_util::bytes::BytesMut;
 ///
 /// let header = MessageHeader {
-///     message_length: 32,
-///     request_id: 7,
-///     response_to: NonZeroI32::new(3),
+///     message_length: MessageLength::try_new(32).unwrap(),
+///     request_id: RequestId::new(7),
+///     response_to: NonZeroI32::new(3).map(ResponseTo::new),
 ///     op_code: OPCode::Msg,
 /// };
 /// let mut buf = BytesMut::new();
@@ -44,14 +46,13 @@ use crate::op_code::{OPCode, OPCodeParseError};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MessageHeader {
     /// Total length of the frame in bytes, including the 16-byte header.
-    pub message_length: i32,
+    pub message_length: MessageLength,
     /// Identifier chosen by the sender. Replies use this in [`Self::response_to`].
-    pub request_id: i32,
+    pub request_id: RequestId,
     /// `Some(n)` if this is a reply to request `n`; `None` if it is a
-    /// fresh request. Modelled as `Option<NonZeroI32>` rather than a raw
-    /// `i32` so the on-the-wire "no response_to" sentinel (`0`) cannot be
-    /// confused with a valid id.
-    pub response_to: Option<NonZeroI32>,
+    /// fresh request. Wraps [`NonZeroI32`] so the on-the-wire "no
+    /// response_to" sentinel (`0`) cannot be confused with a valid id.
+    pub response_to: Option<ResponseTo>,
     /// Identifies the wire-protocol operation this frame carries.
     pub op_code: OPCode,
 }
@@ -66,6 +67,10 @@ pub enum MessageHeaderParseError {
     /// The four opcode bytes did not match any supported opcode.
     #[error("invalid opcode: {0}")]
     InvalidOPCode(#[from] OPCodeParseError),
+    /// The `message_length` field did not satisfy the protocol envelope
+    /// (less than 16 bytes or greater than 48 MiB).
+    #[error("invalid message length: {0}")]
+    InvalidMessageLength(#[from] MessageLengthError),
 }
 
 impl MessageHeader {
@@ -95,13 +100,21 @@ impl MessageHeader {
             return Err(MessageHeaderParseError::TooFewBytes(len));
         }
 
+        let raw_length = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let message_length = MessageLength::try_new(raw_length)?;
+        let request_id =
+            RequestId::new(i32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]));
+        let response_to = NonZeroI32::new(i32::from_le_bytes([
+            bytes[8], bytes[9], bytes[10], bytes[11],
+        ]))
+        .map(ResponseTo::new);
+        let op_code = OPCode::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]])?;
+
         Ok(MessageHeader {
-            message_length: i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
-            request_id: i32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
-            response_to: NonZeroI32::new(i32::from_le_bytes([
-                bytes[8], bytes[9], bytes[10], bytes[11],
-            ])),
-            op_code: OPCode::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]])?,
+            message_length,
+            request_id,
+            response_to,
+            op_code,
         })
     }
 
@@ -110,9 +123,10 @@ impl MessageHeader {
     /// Appends exactly [`Self::size`] bytes. Does not touch any existing
     /// contents of `dst`.
     pub fn write_bytes(&self, dst: &mut BytesMut) {
-        let message_length_bytes = i32::to_le_bytes(self.message_length);
-        let request_id_bytes = i32::to_le_bytes(self.request_id);
-        let response_to_bytes = i32::to_le_bytes(self.response_to.map_or(0, i32::from));
+        let message_length_bytes = i32::to_le_bytes(self.message_length.into_inner());
+        let request_id_bytes = i32::to_le_bytes(self.request_id.into_inner());
+        let response_to_bytes =
+            i32::to_le_bytes(self.response_to.map_or(0, |r| r.into_inner().get()));
         let op_code_bytes = self.op_code.to_le_bytes();
 
         dst.extend_from_slice(&message_length_bytes);

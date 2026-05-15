@@ -1,6 +1,8 @@
 //! Public output types produced by the explain inspector for the success
 //! and "unsupported shape" / "malformed reply" paths.
 
+use crate::ids::{ExplainRequestId, RequestId};
+
 use super::{
     namespace::Namespace,
     newtypes::{AggregateTime, DocsExamined, DocsReturned, IndexName, KeysExamined, NodeTime},
@@ -52,6 +54,14 @@ pub struct ExplainEvent {
     pub namespace: Namespace,
     pub total: ExplainTotals,
     pub plan: PlanNode,
+    /// `request_id` from the original client OP_MSG that triggered this
+    /// explain. Lets sinks correlate explain output with the wider
+    /// client-traffic flow.
+    pub client_request_id: RequestId,
+    /// `request_id` the proxy stamped on the sideband explain request
+    /// it issued upstream. Always strictly negative — disjoint from
+    /// driver-assigned ids by type.
+    pub explain_request_id: ExplainRequestId,
 }
 
 /// Classification of an `ok` field that is neither a valid success nor a

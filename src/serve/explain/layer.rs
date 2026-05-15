@@ -201,20 +201,29 @@ where
     Sk: ExplainSink<E>,
     E: std::error::Error + Send + Sync + 'static,
 {
+    let client_request_id = req.request_id;
+
     // Phase 1: classify + build explain. Borrows `req`; drops before
     // we consume `req` below.
-    let prepared: Option<(Command, Result<Message, ExplainError<E>>)> =
+    let prepared: Option<(Command, ExplainRequestId, Result<Message, ExplainError<E>>)> =
         classify(&req).map(|plan| {
-            let result = match alloc_request_id(counter) {
-                Err(e) => Err(ExplainError::RequestIdExhausted(e)),
+            let (rid_opt, result) = match alloc_request_id(counter) {
+                Err(e) => (None, Err(ExplainError::RequestIdExhausted(e))),
                 Ok(rid) => match build_explain(&plan, rid) {
-                    BuildExplainOutcome::Built(msg) => Ok(*msg),
+                    BuildExplainOutcome::Built(msg) => (Some(rid), Ok(*msg)),
                     BuildExplainOutcome::UnsupportedShape(r) => {
-                        Err(ExplainError::UnsupportedShape(r))
+                        (Some(rid), Err(ExplainError::UnsupportedShape(r)))
                     }
                 },
             };
-            (plan.into_command(), result)
+            // For the exhausted-id case we still want to emit; carry a
+            // sentinel ExplainRequestId so the field is total. -1 is a
+            // valid ExplainRequestId (strictly negative); use it as the
+            // "no id was allocated" sentinel.
+            let rid = rid_opt.unwrap_or_else(|| {
+                ExplainRequestId::try_new(-1).expect("-1 is a valid ExplainRequestId")
+            });
+            (plan.into_command(), rid, result)
         });
 
     // Phase 2: forward original request. Stream is dropped at end of
@@ -225,12 +234,21 @@ where
     };
 
     // Phase 3: run explain if prepared.
-    let Some((command, build_outcome)) = prepared else {
+    let Some((command, explain_request_id, build_outcome)) = prepared else {
         return Ok(replies);
     };
     let result = match build_outcome {
         Err(prebuilt_err) => Err(prebuilt_err),
-        Ok(explain_msg) => run_explain(inner, command.clone(), explain_msg).await,
+        Ok(explain_msg) => {
+            run_explain(
+                inner,
+                command.clone(),
+                explain_msg,
+                client_request_id,
+                explain_request_id,
+            )
+            .await
+        }
     };
     emit_or_log(sink, &command, result);
     Ok(replies)
@@ -242,6 +260,8 @@ async fn run_explain<S, St, E>(
     inner: &mut S,
     command: Command,
     explain_msg: Message,
+    client_request_id: RequestId,
+    explain_request_id: ExplainRequestId,
 ) -> Result<ExplainEvent, ExplainError<E>>
 where
     S: Service<Message, Response = St, Error = E>,
@@ -263,7 +283,12 @@ where
         Ok(r) => r,
         Err(server_err) => return Err(ExplainError::Server(server_err)),
     };
-    Ok(raw_into_event(command, raw)?)
+    Ok(raw_into_event(
+        command,
+        raw,
+        client_request_id,
+        explain_request_id,
+    )?)
 }
 
 /// Pop the first reply, unwrap its OP_MSG body, return the body document.
@@ -288,6 +313,8 @@ fn extract_body(mut replies: Replies) -> Result<bson::Document, ExplainParseErro
 fn raw_into_event(
     command: Command,
     raw: RawExplainReply,
+    client_request_id: RequestId,
+    explain_request_id: ExplainRequestId,
 ) -> Result<ExplainEvent, ExplainParseError> {
     use super::model::{AggregateTime, ExplainTotals, Namespace};
 
@@ -307,6 +334,8 @@ fn raw_into_event(
             execution_time,
         },
         plan,
+        client_request_id,
+        explain_request_id,
     })
 }
 

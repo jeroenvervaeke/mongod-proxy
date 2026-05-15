@@ -124,6 +124,8 @@ mod tests {
                 filter: None,
                 children: vec![],
             },
+            client_request_id: crate::ids::RequestId::new(1),
+            explain_request_id: crate::ids::ExplainRequestId::try_new(-1).unwrap(),
         }
     }
 

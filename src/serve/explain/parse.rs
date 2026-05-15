@@ -11,8 +11,7 @@ use bson::{Bson, Document};
 
 use super::error::{ExplainParseError, ExplainServerError, NegativeDurationError};
 use super::model::{
-    AggregateTime, ErrorLabel, ExplainEvent, ExplainTotals, MalformedOkShape, Namespace, NodeTime,
-    PlanNode, ServerErrorCode, ServerErrorCodeName,
+    ErrorLabel, MalformedOkShape, NodeTime, PlanNode, ServerErrorCode, ServerErrorCodeName,
 };
 use super::wire::{RawExplainReply, RawPlanNode, RawServerError};
 
@@ -152,32 +151,8 @@ pub(crate) fn to_plan_node(r: RawPlanNode, depth: usize) -> Result<PlanNode, Exp
     })
 }
 
-/// Map a [`RawExplainReply`] to a public [`ExplainEvent`], parsing the
-/// namespace explicitly so the typed [`NamespaceParseError`](super::model::NamespaceParseError)
-/// survives as [`ExplainParseError::BadNamespace`].
-#[allow(dead_code)]
-pub(crate) fn raw_into_event(
-    command: super::model::Command,
-    raw: RawExplainReply,
-) -> Result<ExplainEvent, ExplainParseError> {
-    let namespace = Namespace::parse(raw.query_planner.namespace)?;
-    let execution_time = AggregateTime::from(i64_ms_to_duration(
-        "executionTimeMillis",
-        raw.execution_stats.execution_time_millis,
-    )?);
-    let plan = to_plan_node(raw.execution_stats.execution_stages, 0)?;
-    Ok(ExplainEvent {
-        command,
-        namespace,
-        total: ExplainTotals {
-            n_returned: raw.execution_stats.n_returned,
-            docs_examined: raw.execution_stats.total_docs_examined,
-            keys_examined: raw.execution_stats.total_keys_examined,
-            execution_time,
-        },
-        plan,
-    })
-}
+// (raw_into_event lives in layer.rs where the per-request context — client
+// request_id, allocated explain_request_id — is in scope.)
 
 // Suppress unused-import warning for ErrorLabel / ServerErrorCode etc.
 // referenced only through `parse_reply_doc`'s match arms — the symbols

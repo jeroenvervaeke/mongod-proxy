@@ -89,10 +89,12 @@ async fn main() -> Result<()> {
 fn print_event(event: &ExplainEvent) {
     let total_ms = std::time::Duration::from(event.total.execution_time).as_millis();
     println!(
-        "\n[{:?}] {}.{}  → {} docs in {}ms  (examined: {} docs, {} keys)",
+        "\n[{:?}] {}.{}  client_req={} explain_req={}  → {} docs in {}ms  (examined: {} docs, {} keys)",
         event.command,
         event.namespace.database(),
         event.namespace.collection(),
+        event.client_request_id,
+        event.explain_request_id,
         event.total.n_returned,
         total_ms,
         event.total.docs_examined,

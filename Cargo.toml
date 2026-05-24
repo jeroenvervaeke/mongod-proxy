@@ -10,7 +10,7 @@ publish = false
 bitflags = "2.9.0"
 bson = "2.15.0"
 futures = { workspace = true }
-nutype = { version = "0.6", features = ["serde"] }
+nutype = { version = "0.7", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2.0.12"
 tokio = { workspace = true }

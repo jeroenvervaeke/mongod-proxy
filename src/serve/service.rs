@@ -34,6 +34,7 @@ use crate::{
     encoder::{WireEncoder, WireEncoderError},
     message::Message,
     operation::{Operation, op_msg::OperationMessageFlags},
+    serve::rewrite_hello::RewriteHelloLayer,
 };
 
 /// Ensures rustls has a usable [`CryptoProvider`](tokio_rustls::rustls::crypto::CryptoProvider).
@@ -141,6 +142,21 @@ impl<L> Proxy<L> {
     /// `direction`, `op`, `command`, and identifier fields.
     pub fn enable_logging(self) -> Proxy<Stack<LogLayer, L>> {
         self.layer(LogLayer)
+    }
+
+    /// Convenience for `self.layer(RewriteHelloLayer)`.
+    ///
+    /// Strips the replica-set discovery fields (`setName`, `hosts`,
+    /// `primary`, `me`, `passives`, `arbiters`, …) from every `hello` /
+    /// `isMaster` reply so SDAM-enabled drivers classify the upstream as a
+    /// `Standalone` and keep their traffic on the proxy socket. Without
+    /// this layer, drivers must use `?directConnection=true` in the URI to
+    /// reach the proxy at all when the upstream is a replica set or mongos.
+    ///
+    /// See [`RewriteHelloLayer`] for the full rationale and the list of
+    /// fields stripped.
+    pub fn rewrite_hello(self) -> Proxy<Stack<RewriteHelloLayer, L>> {
+        self.layer(RewriteHelloLayer)
     }
 
     /// Convenience for `self.layer(ExplainLayer::new())`.

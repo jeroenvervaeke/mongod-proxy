@@ -24,6 +24,7 @@
 //! // Build the upstream factory. `Proxy` is a tower `Service<SocketAddr>` that
 //! // produces a fresh `Service<Message>` for every incoming client connection.
 //! let proxy = Proxy::new("127.0.0.1", 27017, /* use_tls = */ false)
+//!     .rewrite_hello()  // accept driver URIs without directConnection=true
 //!     .layer(LogLayer); // log every parsed request and response
 //!
 //! serve(listener, proxy).await.unwrap();
@@ -67,4 +68,9 @@ pub use serve::explain::{
     ReplayStream, RequestIdExhausted, ServerErrorCode, ServerErrorCodeError, ServerErrorCodeName,
     Stage, TracingOnly, UnsupportedShape,
 };
-pub use serve::{log::LogLayer, serve, service::Proxy};
+pub use serve::{
+    log::LogLayer,
+    rewrite_hello::{RewriteHelloLayer, RewriteHelloService, RewriteHelloStream},
+    serve,
+    service::Proxy,
+};

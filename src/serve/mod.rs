@@ -23,6 +23,7 @@ use crate::{
 
 pub mod explain;
 pub mod log;
+pub mod rewrite_hello;
 pub mod service;
 
 /// Failure modes for the [`Serve`] future.

@@ -66,7 +66,7 @@ async fn main() -> Result<()> {
     eprintln!("explain inspector:");
     eprintln!("  listening on {listen_addr}");
     eprintln!("  forwarding to {upstream_host}:{upstream_port} (tls={use_tls})");
-    eprintln!("  point your driver at: mongodb://{listen_addr}/?directConnection=true");
+    eprintln!("  point your driver at: mongodb://{listen_addr}/");
 
     let (tx, mut rx) = mpsc::channel::<ExplainEvent>(1024);
 
@@ -80,7 +80,9 @@ async fn main() -> Result<()> {
         }
     });
 
-    let proxy = Proxy::new(upstream_host, upstream_port, use_tls).enable_explain_with_sink(tx);
+    let proxy = Proxy::new(upstream_host, upstream_port, use_tls)
+        .rewrite_hello()
+        .enable_explain_with_sink(tx);
 
     serve(listener, proxy).await.context("run mongodb proxy")?;
     let _ = consumer.await;

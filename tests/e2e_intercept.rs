@@ -116,6 +116,7 @@ async fn proxy_intercepts_every_command_we_send() {
     eprintln!("proxy listening on 127.0.0.1:{proxy_port}");
 
     let proxy = Proxy::new("127.0.0.1", host_port, false)
+        .rewrite_hello()
         .layer(LogLayer)
         .layer(recorder.layer());
 
@@ -123,8 +124,12 @@ async fn proxy_intercepts_every_command_we_send() {
         let _ = serve(listener, proxy).await;
     });
 
-    // ----- 4. Drive traffic via the official driver, THROUGH the proxy -----
-    let proxy_uri = format!("mongodb://127.0.0.1:{proxy_port}/?directConnection=true");
+    // ----- 4. Drive traffic via the official driver, THROUGH the proxy.
+    //          Note: no `directConnection=true` — `rewrite_hello()` strips
+    //          the replica-set discovery fields so the driver classifies
+    //          the proxy as a Standalone and keeps traffic on this socket
+    //          instead of dialling the upstream's container hostname.
+    let proxy_uri = format!("mongodb://127.0.0.1:{proxy_port}/");
     let mut options = ClientOptions::parse(&proxy_uri).await.expect("parse uri");
     options.server_selection_timeout = Some(Duration::from_secs(10));
     let client = Client::with_options(options).expect("client");

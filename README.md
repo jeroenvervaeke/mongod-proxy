@@ -28,12 +28,18 @@ including:
   flagged `moreToCome` until a terminal reply)
 - checksum-bearing `OP_MSG` frames
 
-Two built-in layers ship with the crate:
+Built-in layers shipping with the crate:
 
 - `LogLayer` — logs every parsed request and response via `tracing`.
 - `ExplainLayer` — transparently re-issues every explainable command as
   `explain`, parses the plan tree, and forwards the typed `ExplainEvent` to a
   sink (channel, file, custom observer). See `examples/explain.rs`.
+- `RewriteHelloLayer` — strips the replica-set discovery fields (`setName`,
+  `hosts`, `primary`, `me`, …) from every `hello` / `isMaster` reply so
+  SDAM-enabled drivers keep their traffic on the proxy socket instead of
+  reconnecting directly to upstream. Required for connection URIs that
+  *don't* set `directConnection=true` against a replica-set or mongos
+  upstream.
 
 ## Example
 
@@ -51,15 +57,19 @@ async fn main() -> std::io::Result<()> {
     // `Proxy` is a tower `Service<SocketAddr>` that produces a fresh
     // `Service<Message>` for every incoming client connection.
     let proxy = Proxy::new("127.0.0.1", 27017, /* use_tls = */ false)
+        .rewrite_hello()  // accept driver URIs without directConnection=true
         .layer(LogLayer); // log every parsed request and response
 
     serve(listener, proxy).await
 }
 ```
 
-Point any MongoDB driver at `mongodb://127.0.0.1:27018/?directConnection=true`
-and traffic flows through the proxy unchanged, with every frame parsed and
-logged.
+Point any MongoDB driver at `mongodb://127.0.0.1:27018/` and traffic flows
+through the proxy unchanged, with every frame parsed and logged. The
+`rewrite_hello()` call rewrites the `hello` / `isMaster` reply so the
+driver sees the proxy as a `Standalone` and doesn't try to reconnect
+directly to the upstream addresses it discovers; drop that call (or use
+`?directConnection=true` in the URI) to disable the rewrite.
 
 A runnable example that captures executed query plans lives at
 [`examples/explain.rs`](examples/explain.rs):

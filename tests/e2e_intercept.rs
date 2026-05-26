@@ -7,11 +7,21 @@
 //! with the official [`mongodb`] Rust driver, and asserts on the exact
 //! [`Message`] values the proxy intercepts.
 //!
-//! The test body is shared across both topologies via `#[rstest]` so a
-//! regression in either path is reported against the specific case (e.g.
-//! `proxy_intercepts_every_command_we_send::case_2_replica_set`). The
-//! standalone case guards against breakage on the no-discovery path; the
-//! replica-set case exercises the `rewrite_hello` layer end-to-end.
+//! The test body is shared across the full {standalone, replica-set} ×
+//! {default URI, `?directConnection=true`} matrix via `#[rstest]`, so a
+//! regression in any one path is reported against the specific case
+//! (e.g. `proxy_intercepts_every_command_we_send::case_3_replica_set_default`).
+//!
+//! - Standalone + default URI: `rewrite_hello` is a no-op (no `setName`
+//!   on the wire); the case catches regressions on the proxy's standalone
+//!   path.
+//! - Standalone + `directConnection=true`: driver bypasses SDAM entirely;
+//!   the case catches handshake regressions in the proxy.
+//! - Replica-set + default URI: the case `rewrite_hello` exists for —
+//!   verifies the driver stays on the proxy socket instead of dialling
+//!   the upstream container hostname.
+//! - Replica-set + `directConnection=true`: original supported URI shape;
+//!   the case catches regressions to that path.
 //!
 //! Every step is statically typed and every assertion runs against the
 //! structured wire-protocol model the proxy actually parses — no
@@ -45,10 +55,15 @@ mod common;
 use common::{DeploymentKind, TestDeployment, try_connect_docker};
 
 #[rstest]
-#[case::standalone(DeploymentKind::Standalone)]
-#[case::replica_set(DeploymentKind::ReplicaSet)]
+#[case::standalone_default(DeploymentKind::Standalone, false)]
+#[case::standalone_direct(DeploymentKind::Standalone, true)]
+#[case::replica_set_default(DeploymentKind::ReplicaSet, false)]
+#[case::replica_set_direct(DeploymentKind::ReplicaSet, true)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn proxy_intercepts_every_command_we_send(#[case] kind: DeploymentKind) {
+async fn proxy_intercepts_every_command_we_send(
+    #[case] kind: DeploymentKind,
+    #[case] direct_connection: bool,
+) {
     // Self-skip on hosts without a daemon (developer laptops without Docker).
     let Some(docker) = try_connect_docker().await else {
         return;
@@ -60,9 +75,9 @@ async fn proxy_intercepts_every_command_we_send(#[case] kind: DeploymentKind) {
         .expect("start deployment");
     let host_port = deployment.host_port;
     eprintln!(
-        "[{}] {} listening on 127.0.0.1:{host_port}",
+        "[{} / directConnection={direct_connection}] {} listening on 127.0.0.1:{host_port}",
         kind.label(),
-        deployment.label
+        deployment.label,
     );
 
     // Cleanup guard fires even on panic. We capture a cheap clone of the
@@ -93,13 +108,17 @@ async fn proxy_intercepts_every_command_we_send(#[case] kind: DeploymentKind) {
     });
 
     // ----- 3. Drive traffic via the official driver, THROUGH the proxy.
-    //          Note: no `directConnection=true` — for the replica-set
-    //          upstream, `rewrite_hello()` strips the discovery fields so
-    //          the driver classifies the proxy as a Standalone and keeps
-    //          traffic on this socket. For the standalone upstream the
-    //          rewrite is a no-op; the test still passes because there's
-    //          nothing to rewrite away.
-    let proxy_uri = format!("mongodb://127.0.0.1:{proxy_port}/");
+    //          The URI shape is parameterised: when `direct_connection` is
+    //          false (default URI) the driver runs SDAM and would dial
+    //          upstream's container hostname directly against a replica
+    //          set without `rewrite_hello()`. When true, the driver
+    //          short-circuits SDAM and uses just this address. Both must
+    //          work against both topologies.
+    let proxy_uri = if direct_connection {
+        format!("mongodb://127.0.0.1:{proxy_port}/?directConnection=true")
+    } else {
+        format!("mongodb://127.0.0.1:{proxy_port}/")
+    };
     let mut options = ClientOptions::parse(&proxy_uri).await.expect("parse uri");
     options.server_selection_timeout = Some(Duration::from_secs(10));
     let client = Client::with_options(options).expect("client");

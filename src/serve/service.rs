@@ -11,6 +11,7 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     sync::{Arc, Once},
+    task::{Context, Poll},
 };
 
 use futures::{SinkExt, Stream, StreamExt};
@@ -34,6 +35,7 @@ use crate::{
     encoder::{WireEncoder, WireEncoderError},
     message::Message,
     operation::{Operation, op_msg::OperationMessageFlags},
+    serve::rewrite_hello::{RewriteHelloLayer, RewriteHelloService},
 };
 
 /// Ensures rustls has a usable [`CryptoProvider`](tokio_rustls::rustls::crypto::CryptoProvider).
@@ -81,6 +83,12 @@ pub struct Proxy<L> {
     destination_name: String,
     destination_port: u16,
     tls_connector: Option<Arc<TlsConnector>>,
+    /// When true, every per-connection service has a [`RewriteHelloLayer`]
+    /// inserted *between* the user-supplied layer stack and the inner
+    /// [`ProxyClient`], so `hello` / `isMaster` replies get their
+    /// topology-discovery fields stripped. On by default; flip via
+    /// [`disable_rewrite_hello`](Self::disable_rewrite_hello).
+    rewrite_hello: bool,
 
     proxy_layer: L,
 }
@@ -93,6 +101,17 @@ impl Proxy<Identity> {
     /// TLS client using the standard `webpki-roots` trust anchors and SNI
     /// derived from `destination_name`. When false the upstream socket is
     /// plain TCP.
+    ///
+    /// The resulting proxy has the `hello` / `isMaster` rewrite **on by
+    /// default** so SDAM-enabled drivers (`mongodb://host:port/` with no
+    /// `directConnection=true`) classify the proxy as a `Standalone` and
+    /// keep every request on this socket instead of dialling the
+    /// upstream addresses they would otherwise discover. Almost every
+    /// user wants this — see the [`rewrite_hello`](crate::serve::rewrite_hello)
+    /// module for the full rationale and the list of fields stripped.
+    /// Opt out with [`disable_rewrite_hello`](Proxy::disable_rewrite_hello)
+    /// only when you specifically need the upstream's topology visible to
+    /// drivers.
     pub fn new(destination_name: impl Into<String>, destination_port: u16, use_tls: bool) -> Self {
         let tls_connector = if use_tls {
             install_default_crypto_provider();
@@ -112,6 +131,7 @@ impl Proxy<Identity> {
             destination_name: destination_name.into(),
             destination_port,
             tls_connector,
+            rewrite_hello: true,
 
             proxy_layer: Identity::new(),
         }
@@ -129,9 +149,33 @@ impl<L> Proxy<L> {
             destination_name: self.destination_name,
             destination_port: self.destination_port,
             tls_connector: self.tls_connector,
+            rewrite_hello: self.rewrite_hello,
 
             proxy_layer: Stack::new(layer, self.proxy_layer),
         }
+    }
+
+    /// Turns off the default `hello` / `isMaster` rewrite.
+    ///
+    /// **You probably don't want to call this.** With the rewrite off,
+    /// SDAM-enabled drivers read the upstream's `setName` / `hosts` /
+    /// `primary` / `me` from the hello reply and *open fresh TCP
+    /// connections directly to those advertised addresses* — bypassing
+    /// the proxy entirely for everything after the handshake. The proxy
+    /// won't error; it just stops seeing requests, silently breaking
+    /// every layer in the stack (logging, explain, custom middleware).
+    ///
+    /// Disabling is appropriate only when you specifically need the
+    /// upstream's topology visible to drivers (driver-side SDAM testing,
+    /// using the proxy as a transparent observability tap), and you've
+    /// arranged for the driver to reach the proxy some other way (e.g.
+    /// `?directConnection=true` in the URI).
+    ///
+    /// See [`RewriteHelloLayer`] for the full rationale and the list of
+    /// fields the rewrite strips.
+    pub fn disable_rewrite_hello(mut self) -> Self {
+        self.rewrite_hello = false;
+        self
     }
 
     /// Convenience for `self.layer(LogLayer)`.
@@ -177,18 +221,15 @@ impl<L> Proxy<L> {
 
 impl<L> Service<SocketAddr> for Proxy<L>
 where
-    L: Clone + Layer<ProxyClient> + Send + 'static,
+    L: Clone + Layer<RewriteHelloService<ProxyClient>> + Send + 'static,
     L::Service: Service<Message>,
 {
     type Response = L::Service;
     type Error = ProxyClientForwardError;
     type Future = ProxyClientCreationFuture<L::Service>;
 
-    fn poll_ready(
-        &mut self,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        std::task::Poll::Ready(Ok(()))
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
     }
 
     fn call(&mut self, _req: SocketAddr) -> Self::Future {
@@ -197,11 +238,19 @@ where
         let tls_connector = self.tls_connector.clone();
 
         let layer = self.proxy_layer.clone();
+        // Innermost wrap. When disabled the layer becomes a pass-through
+        // (still walks every reply but never mutates), so the type stack
+        // stays stable regardless of the toggle.
+        let rewrite_layer = if self.rewrite_hello {
+            RewriteHelloLayer::enabled()
+        } else {
+            RewriteHelloLayer::disabled()
+        };
 
         ProxyClientCreationFuture(Box::pin(async move {
             ProxyClient::forward_to(destination_name, destination_port, tls_connector)
                 .await
-                .map(|s| layer.layer(s))
+                .map(|s| layer.layer(rewrite_layer.layer(s)))
         }))
     }
 }
@@ -222,10 +271,7 @@ where
 {
     type Output = Result<S, ProxyClientForwardError>;
 
-    fn poll(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.0.as_mut().poll(cx)
     }
 }
@@ -365,30 +411,27 @@ impl ProxyResponseStream {
 impl Stream for ProxyResponseStream {
     type Item = Result<Message, ProxyClientRequestError>;
 
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let guard = match &mut self.state {
-            ProxyResponseStreamState::Done => return std::task::Poll::Ready(None),
+            ProxyResponseStreamState::Done => return Poll::Ready(None),
             ProxyResponseStreamState::Streaming(guard) => guard,
         };
 
         match guard.server_reader.poll_next_unpin(cx) {
-            std::task::Poll::Pending => std::task::Poll::Pending,
-            std::task::Poll::Ready(None) => {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => {
                 self.state = ProxyResponseStreamState::Done;
-                std::task::Poll::Ready(Some(Err(ProxyClientRequestError::EndOfStream)))
+                Poll::Ready(Some(Err(ProxyClientRequestError::EndOfStream)))
             }
-            std::task::Poll::Ready(Some(Err(e))) => {
+            Poll::Ready(Some(Err(e))) => {
                 self.state = ProxyResponseStreamState::Done;
-                std::task::Poll::Ready(Some(Err(e.into())))
+                Poll::Ready(Some(Err(e.into())))
             }
-            std::task::Poll::Ready(Some(Ok(msg))) => {
+            Poll::Ready(Some(Ok(msg))) => {
                 if !more_to_come(&msg.operation) {
                     self.state = ProxyResponseStreamState::Done;
                 }
-                std::task::Poll::Ready(Some(Ok(msg)))
+                Poll::Ready(Some(Ok(msg)))
             }
         }
     }
@@ -400,15 +443,12 @@ impl Service<Message> for ProxyClient {
 
     type Future = ProxyClientRequestFuture;
 
-    fn poll_ready(
-        &mut self,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         // ProxyClient owns a single upstream socket and is used by exactly one
         // accept_client_inner task that issues request/response serially. The
         // Arc<Mutex<...>> exists only to satisfy the 'static bound on the future;
         // it is never contended, so always-ready is correct.
-        std::task::Poll::Ready(Ok(()))
+        Poll::Ready(Ok(()))
     }
 
     fn call(&mut self, req: Message) -> Self::Future {
@@ -462,10 +502,7 @@ pub struct ProxyClientRequestFuture(
 impl Future for ProxyClientRequestFuture {
     type Output = Result<ProxyResponseStream, ProxyClientRequestError>;
 
-    fn poll(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.0.as_mut().poll(cx)
     }
 }

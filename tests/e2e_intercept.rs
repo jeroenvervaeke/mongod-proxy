@@ -1,10 +1,27 @@
 //! In-process end-to-end test.
 //!
-//! Boots a real `mongod` in Docker via [`atlas-local`](https://crates.io/crates/atlas-local)
-//! (MongoDB's own Atlas-Local management crate), runs the proxy on a random
-//! local port in the same process, drives traffic through it with the
-//! official [`mongodb`] Rust driver, and asserts on the exact [`Message`]
-//! values the proxy intercepts.
+//! Boots a real `mongod` in Docker (either a vanilla standalone via
+//! [`bollard`] or a single-node replica set via
+//! [`atlas-local`](https://crates.io/crates/atlas-local)), runs the proxy
+//! on a random local port in the same process, drives traffic through it
+//! with the official [`mongodb`] Rust driver, and asserts on the exact
+//! [`Message`] values the proxy intercepts.
+//!
+//! The test body is shared across the full {standalone, replica-set} ×
+//! {default URI, `?directConnection=true`} matrix via `#[rstest]`, so a
+//! regression in any one path is reported against the specific case
+//! (e.g. `proxy_intercepts_every_command_we_send::case_3_replica_set_default`).
+//!
+//! - Standalone + default URI: the default `hello` rewrite is a no-op
+//!   here (no `setName` on the wire); the case catches regressions on
+//!   the proxy's standalone path.
+//! - Standalone + `directConnection=true`: driver bypasses SDAM entirely;
+//!   the case catches handshake regressions in the proxy.
+//! - Replica-set + default URI: the case the default `hello` rewrite
+//!   exists for — verifies the driver stays on the proxy socket instead
+//!   of dialling the upstream container hostname.
+//! - Replica-set + `directConnection=true`: original supported URI shape;
+//!   the case catches regressions to that path.
 //!
 //! Every step is statically typed and every assertion runs against the
 //! structured wire-protocol model the proxy actually parses — no
@@ -26,95 +43,64 @@ use std::{
     time::Duration,
 };
 
-use atlas_local::{
-    Client as AtlasClient,
-    models::{BindingType, CreateDeploymentOptions, MongoDBPortBinding},
-};
-use bollard::Docker;
 use futures::{Stream, StreamExt};
 use mongod_proxy::{LogLayer, Proxy, message::Message, serve};
 use mongodb::{Client, bson::doc, options::ClientOptions};
+use rstest::rstest;
 use tokio::net::TcpListener;
 use tower_layer::Layer;
 use tower_service::Service;
 
 mod common;
-use common::{mongo_port, wait_ready};
+use common::{DeploymentKind, TestDeployment, try_connect_docker};
 
+#[rstest]
+#[case::standalone_default(DeploymentKind::Standalone, false)]
+#[case::standalone_direct(DeploymentKind::Standalone, true)]
+#[case::replica_set_default(DeploymentKind::ReplicaSet, false)]
+#[case::replica_set_direct(DeploymentKind::ReplicaSet, true)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn proxy_intercepts_every_command_we_send() {
-    // Detect Docker before doing anything else. Lets the test self-skip on
-    // hosts without a daemon (developer laptops without Docker installed).
-    let docker = match Docker::connect_with_local_defaults() {
-        Ok(d) => match d.ping().await {
-            Ok(_) => d,
-            Err(e) => {
-                eprintln!("skipping: docker daemon unreachable ({e})");
-                return;
-            }
-        },
-        Err(e) => {
-            eprintln!("skipping: docker not configured ({e})");
-            return;
-        }
+async fn proxy_intercepts_every_command_we_send(
+    #[case] kind: DeploymentKind,
+    #[case] direct_connection: bool,
+) {
+    // Self-skip on hosts without a daemon (developer laptops without Docker).
+    let Some(docker) = try_connect_docker().await else {
+        return;
     };
 
-    let atlas = AtlasClient::new(docker);
-
-    // ----- 1. Create the upstream Atlas-Local deployment -----
-    //
-    // `atlas-local` handles image pull, container create + start, and the
-    // wait-for-healthy loop for us. We pin the port binding to loopback so
-    // we can speak to it without `--network host`.
-    let deployment = atlas
-        .create_deployment(CreateDeploymentOptions {
-            wait_until_healthy: Some(true),
-            wait_until_healthy_timeout: Some(Duration::from_secs(120)),
-            mongodb_port_binding: Some(MongoDBPortBinding {
-                port: None, // let the daemon pick an ephemeral host port
-                binding_type: BindingType::Loopback,
-            }),
-            ..Default::default()
-        })
+    // ----- 1. Create the upstream deployment (standalone or replica set).
+    let deployment = TestDeployment::start(&docker, kind)
         .await
-        .expect("create atlas-local deployment");
-
-    let deployment_name = deployment
-        .name
-        .clone()
-        .expect("atlas-local always assigns a name");
-    let host_port = mongo_port(&deployment).expect("deployment exposes a host port");
-
+        .expect("start deployment");
+    let host_port = deployment.host_port;
     eprintln!(
-        "atlas-local deployment {} ({}) listening on 127.0.0.1:{host_port}",
-        deployment_name,
-        &deployment.container_id[..12]
+        "[{} / directConnection={direct_connection}] {} listening on 127.0.0.1:{host_port}",
+        kind.label(),
+        deployment.label,
     );
 
-    // Cleanup guard fires even on panic — `atlas-local` removes the
-    // container for us via `delete_deployment`.
-    let cleanup_atlas = atlas.clone();
-    let cleanup_name = deployment_name.clone();
-    let cleanup_guard = scopeguard::guard((), |_| {
-        let atlas = cleanup_atlas.clone();
-        let name = cleanup_name.clone();
-        // We can't run async in Drop; spawn and rely on the runtime to
+    // Cleanup guard fires even on panic. We capture a cheap clone of the
+    // cleanup handle so the happy-path `shutdown()` below can still own
+    // `deployment` for the metadata access during the test body.
+    let cleanup_handle = deployment.cleanup_handle();
+    let cleanup_guard = scopeguard::guard(cleanup_handle, |h| {
+        // Can't run async in Drop; spawn and rely on the runtime to
         // outlive us. The happy path explicitly awaits delete below.
         tokio::spawn(async move {
-            let _ = atlas.delete_deployment(&name).await;
+            let _ = h.shutdown().await;
         });
     });
 
-    // ----- 2. (atlas-local already waited for HEALTHY; verify with the driver) -----
-    let direct_uri = format!("mongodb://127.0.0.1:{host_port}/?directConnection=true");
-    wait_ready(&direct_uri).await.expect("mongo never ready");
-
-    // ----- 3. Start the proxy on a random local port -----
+    // ----- 2. Start the proxy on a random local port -----
     let recorder = Recorder::new();
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind proxy");
     let proxy_port = listener.local_addr().unwrap().port();
     eprintln!("proxy listening on 127.0.0.1:{proxy_port}");
 
+    // The `hello` / `isMaster` rewrite is on by default — the replica-set
+    // case relies on it so the driver doesn't reconnect to the upstream
+    // container hostname.
     let proxy = Proxy::new("127.0.0.1", host_port, false)
         .layer(LogLayer)
         .layer(recorder.layer());
@@ -123,8 +109,19 @@ async fn proxy_intercepts_every_command_we_send() {
         let _ = serve(listener, proxy).await;
     });
 
-    // ----- 4. Drive traffic via the official driver, THROUGH the proxy -----
-    let proxy_uri = format!("mongodb://127.0.0.1:{proxy_port}/?directConnection=true");
+    // ----- 3. Drive traffic via the official driver, THROUGH the proxy.
+    //          The URI shape is parameterised: when `direct_connection` is
+    //          false (default URI) the driver runs SDAM and — against a
+    //          replica-set upstream — would dial the container hostname
+    //          directly if the proxy weren't rewriting `hello` replies by
+    //          default. When true, the driver short-circuits SDAM and
+    //          uses just this address. Both must work against both
+    //          topologies.
+    let proxy_uri = if direct_connection {
+        format!("mongodb://127.0.0.1:{proxy_port}/?directConnection=true")
+    } else {
+        format!("mongodb://127.0.0.1:{proxy_port}/")
+    };
     let mut options = ClientOptions::parse(&proxy_uri).await.expect("parse uri");
     options.server_selection_timeout = Some(Duration::from_secs(10));
     let client = Client::with_options(options).expect("client");
@@ -247,17 +244,16 @@ async fn proxy_intercepts_every_command_we_send() {
     let events = recorder.drain();
     assert_observed(&events, "ping", 1);
 
-    // ----- 5. Shut down the proxy and clean up the deployment -----
+    // ----- 4. Shut down the proxy and clean up the deployment -----
     drop(client);
     tokio::time::sleep(Duration::from_millis(500)).await;
     proxy_task.abort();
     let _ = proxy_task.await;
 
-    scopeguard::ScopeGuard::into_inner(cleanup_guard);
-    atlas
-        .delete_deployment(&deployment_name)
-        .await
-        .expect("delete deployment");
+    // Defuse the panic-time cleanup guard so the happy-path explicit
+    // shutdown below isn't racing the background-spawned one.
+    let _ = scopeguard::ScopeGuard::into_inner(cleanup_guard);
+    deployment.shutdown().await.expect("shutdown deployment");
 }
 
 fn phase(name: &str) {

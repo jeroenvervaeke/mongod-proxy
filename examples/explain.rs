@@ -66,7 +66,7 @@ async fn main() -> Result<()> {
     eprintln!("explain inspector:");
     eprintln!("  listening on {listen_addr}");
     eprintln!("  forwarding to {upstream_host}:{upstream_port} (tls={use_tls})");
-    eprintln!("  point your driver at: mongodb://{listen_addr}/?directConnection=true");
+    eprintln!("  point your driver at: mongodb://{listen_addr}/");
 
     let (tx, mut rx) = mpsc::channel::<ExplainEvent>(1024);
 

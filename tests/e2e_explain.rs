@@ -100,7 +100,10 @@ async fn explain_layer_captures_typed_events_for_find_and_aggregate() {
         let _ = serve(listener, proxy).await;
     });
 
-    let proxy_uri = format!("mongodb://127.0.0.1:{proxy_port}/?directConnection=true");
+    // No `directConnection=true` in the URI — `Proxy::new` has the
+    // `hello` / `isMaster` rewrite on by default, so the driver classifies
+    // the proxy as a Standalone and keeps traffic on this socket.
+    let proxy_uri = format!("mongodb://127.0.0.1:{proxy_port}/");
     let mut options = ClientOptions::parse(&proxy_uri).await.expect("parse uri");
     options.server_selection_timeout = Some(Duration::from_secs(10));
     let client = Client::with_options(options).expect("client");

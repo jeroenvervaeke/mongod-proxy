@@ -40,6 +40,29 @@
 //! [`Proxy`](crate::Proxy) bakes an *enabled* [`RewriteHelloLayer`] into
 //! every connection by default. **Almost every user should leave it on.**
 //!
+//! # What's *not* modified
+//!
+//! The rewrite is gated entirely on the **request command name**
+//! (`hello` / `isMaster` / `ismaster`). Every other command —
+//! `find`, `insert`, `aggregate`, `update`, `delete`, `getMore`, … —
+//! passes both ways through the layer untouched, regardless of what
+//! field names happen to appear in the payload. In particular:
+//!
+//! - **Requests are never modified.** The layer only wraps the *reply*
+//!   stream; every byte of every command is forwarded upstream
+//!   verbatim. You can `insert` documents whose fields happen to be
+//!   named `setName`, `hosts`, `primary`, etc. and they reach mongod
+//!   exactly as you sent them.
+//! - **`find`/`aggregate`/`getMore` responses pass through verbatim.**
+//!   If those user documents come back in a `cursor.firstBatch`, the
+//!   rewrite never runs (the request command was `find`, not `hello`)
+//!   and you get them back byte-for-byte.
+//! - **Only top-level fields of the hello reply are stripped.** Even
+//!   when the rewrite *does* run, it only removes top-level keys from
+//!   the reply body — it doesn't recurse into nested documents or
+//!   arrays. So nothing inside `cursor.firstBatch.[N]` could ever be
+//!   touched (and hello replies don't carry user data there anyway).
+//!
 //! # When to disable it
 //!
 //! Calling [`Proxy::disable_rewrite_hello`](crate::Proxy::disable_rewrite_hello)
@@ -365,6 +388,32 @@ mod tests {
     }
 
     #[test]
+    fn is_hello_request_gates_on_command_name_not_payload_contents() {
+        // A user inserts/queries with field names that happen to overlap
+        // the topology-discovery list. The gate is on the *first* key
+        // (the command name), so these must not be misclassified as
+        // hello requests — otherwise the layer would strip those fields
+        // out of the response body on the way back.
+        assert!(!is_hello_request(&op_msg_body(doc! {
+            "find": "coll",
+            "filter": { "setName": "user-stored-value" },
+            "$db": "x",
+        })));
+        assert!(!is_hello_request(&op_msg_body(doc! {
+            "insert": "coll",
+            "$db": "x",
+            // Even if a hello-named field appears further down in the
+            // command body, the first key is `insert`.
+            "hello": 1,
+        })));
+        assert!(!is_hello_request(&op_msg_body(doc! {
+            "aggregate": "coll",
+            "pipeline": [ { "$match": { "hosts": "anything" } } ],
+            "$db": "x",
+        })));
+    }
+
+    #[test]
     fn strip_topology_fields_removes_replica_set_metadata() {
         let mut doc = doc! {
             "isWritablePrimary": true,
@@ -467,6 +516,99 @@ mod tests {
         };
         let msg = s.next().await.unwrap().unwrap();
         assert_eq!(first_body(&msg), &before);
+    }
+
+    #[tokio::test]
+    async fn find_response_with_user_documents_named_like_topology_fields_round_trips() {
+        // Regression guard for the obvious worry: an application stores
+        // documents whose top-level field names overlap with
+        // TOPOLOGY_DISCOVERY_FIELDS (perfectly legal — those names
+        // aren't reserved at the BSON level). When `find` brings them
+        // back in `cursor.firstBatch`, the proxy MUST hand them through
+        // byte-for-byte. The rewrite is gated on the *request* being
+        // hello, so for a `find` request `rewrite` is false and the
+        // response stream wrapper is a pure pass-through.
+        let reply = op_msg_body(doc! {
+            "cursor": {
+                "firstBatch": [
+                    doc! {
+                        "_id": 1,
+                        "setName": "user-stored-value",
+                        "hosts": ["arbitrary", "user", "data"],
+                        "primary": "could-be-anything",
+                    },
+                    doc! { "_id": 2, "me": "another-user-doc" },
+                ],
+                "id": 0_i64,
+                "ns": "app.things",
+            },
+            "ok": 1.0,
+        });
+        let before = first_body(&reply).clone();
+        let inner = stream::iter(vec![Ok::<_, std::io::Error>(reply)]);
+        // rewrite=false models the production path: request was `find`,
+        // so `is_hello_request` returned false and the service set the
+        // stream's flag accordingly.
+        let mut s = RewriteHelloStream {
+            inner,
+            rewrite: false,
+        };
+        let msg = s.next().await.unwrap().unwrap();
+        assert_eq!(
+            first_body(&msg),
+            &before,
+            "find response must be byte-identical regardless of payload",
+        );
+    }
+
+    #[tokio::test]
+    async fn rewrite_only_touches_top_level_fields_of_the_reply_body() {
+        // Even when rewriting (request *was* hello), the strip only
+        // removes top-level keys of the reply body — never recurses
+        // into nested documents or arrays. This makes the safety
+        // properties of the layer compositional: nothing inside an
+        // embedded document could ever be touched.
+        let reply = op_msg_body(doc! {
+            "isWritablePrimary": true,
+            "setName": "rs0",                            // top-level, stripped
+            "ok": 1.0,
+            "nested_payload": {
+                // Same field names, but nested — must survive.
+                "setName": "deep-value",
+                "hosts": ["deep1", "deep2"],
+                "primary": "deep-primary",
+            },
+            "array_payload": [
+                doc! { "setName": "in-array" },
+            ],
+        });
+        let inner = stream::iter(vec![Ok::<_, std::io::Error>(reply)]);
+        let mut s = RewriteHelloStream {
+            inner,
+            rewrite: true,
+        };
+        let msg = s.next().await.unwrap().unwrap();
+        let body = first_body(&msg);
+        // Top-level was stripped.
+        assert!(!body.contains_key("setName"));
+        // Nested copies survive verbatim.
+        let nested = body
+            .get_document("nested_payload")
+            .expect("nested doc preserved");
+        assert_eq!(
+            nested.get_str("setName").ok(),
+            Some("deep-value"),
+            "nested setName must not be touched",
+        );
+        assert!(nested.contains_key("hosts"));
+        assert!(nested.contains_key("primary"));
+        let array = body.get_array("array_payload").expect("array preserved");
+        let elem = array[0].as_document().expect("array element preserved");
+        assert_eq!(
+            elem.get_str("setName").ok(),
+            Some("in-array"),
+            "setName inside an array element must not be touched",
+        );
     }
 
     #[tokio::test]

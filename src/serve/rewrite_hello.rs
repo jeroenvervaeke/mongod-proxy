@@ -1,36 +1,83 @@
 //! Tower [`Layer`] that lets clients connect through the proxy without
 //! `directConnection=true`.
 //!
-//! When a MongoDB driver opens a connection *without* `directConnection=true`,
-//! it runs Server Discovery and Monitoring: it sends `hello` / `isMaster` and
-//! reads the topology fields from the reply (`setName`, `hosts`, `primary`,
-//! `me`, `passives`, `arbiters`) to learn the real replica-set members. It
-//! then opens new TCP connections **directly** to those addresses, bypassing
-//! the proxy entirely.
+//! # What it does
 //!
-//! [`RewriteHelloLayer`] intercepts every `hello` / `isMaster` reply and
-//! strips those discovery fields so the driver classifies the upstream as a
-//! `Standalone` and keeps all traffic on the proxy socket. Without this
-//! layer, drivers must use `mongodb://host:port/?directConnection=true` to
-//! reach the proxy at all (against any replica-set or mongos upstream).
+//! [`RewriteHelloLayer`] intercepts every `hello` / `isMaster` reply on its
+//! way back to the client and removes the replica-set / sharded-cluster
+//! *discovery* fields:
+//!
+//! - `setName`, `setVersion`, `electionId`, `topologyVersion`
+//! - `hosts`, `passives`, `arbiters`, `primary`, `me`
+//! - `secondary`, `arbiterOnly`, `passive`, `hidden`, `tags`, `lastWrite`
+//! - `isreplicaset`
+//!
+//! The hello reply still carries everything the driver needs to drive the
+//! connection (`isWritablePrimary`, `maxBsonObjectSize`,
+//! `maxWriteBatchSize`, `minWireVersion`, `maxWireVersion`,
+//! `logicalSessionTimeoutMinutes`, etc.) — only the *topology-discovery*
+//! fields disappear. The driver classifies the upstream as a `Standalone`
+//! and keeps issuing every subsequent request on the original socket.
+//!
+//! # Why the default is on
+//!
+//! Without the rewrite, an SDAM-enabled driver
+//! (`mongodb://host:port/` with no `directConnection=true`) reads the
+//! upstream's `setName` / `hosts` / `primary` / `me` from the hello reply
+//! and *opens fresh TCP connections directly to those advertised
+//! addresses* — addresses that point at the upstream `mongod`, not at the
+//! proxy. The proxy then sees the initial handshake and nothing else; all
+//! application traffic flows around it.
+//!
+//! That breaks every reasonable use of this crate (logging, the explain
+//! inspector, any custom tower layer), and the failure mode is silent on
+//! the proxy side: it doesn't error, it just stops seeing requests. The
+//! historical workaround was to make every consumer append
+//! `?directConnection=true` to every URI — fragile, easy to forget,
+//! impossible to enforce across teams. The rewrite makes
+//! `mongodb://proxy/` "just work".
+//!
+//! [`Proxy`](crate::Proxy) bakes an *enabled* [`RewriteHelloLayer`] into
+//! every connection by default. **Almost every user should leave it on.**
+//!
+//! # When to disable it
+//!
+//! Calling [`Proxy::disable_rewrite_hello`](crate::Proxy::disable_rewrite_hello)
+//! is appropriate only when you specifically want the upstream's real
+//! topology visible to drivers, e.g.:
+//!
+//! - You're using the proxy as an SDAM observability tap and *want* the
+//!   driver to see real `hosts` / `primary` values so you can study how
+//!   it would behave in production.
+//! - You're testing driver-side SDAM behaviour and the proxy is
+//!   transparent on purpose.
+//!
+//! With the rewrite off you must arrange for the driver to reach the
+//! proxy explicitly (e.g. `?directConnection=true` in the URI), otherwise
+//! it will bypass the proxy as described above. There is **no security
+//! gain** from disabling — the rewrite never inspects or modifies user
+//! data, only `hello` replies.
 //!
 //! # Examples
 //!
-//! ```
-//! use mongod_proxy::{Proxy, RewriteHelloLayer};
-//!
-//! // Driver URIs like `mongodb://127.0.0.1:27018/` (no directConnection)
-//! // now reach the proxy instead of bypassing it.
-//! let proxy = Proxy::new("127.0.0.1", 27017, false).layer(RewriteHelloLayer);
-//! # let _ = proxy;
-//! ```
-//!
-//! Or via the convenience method on [`Proxy`](crate::Proxy):
+//! The default — rewrite on — needs no extra wiring:
 //!
 //! ```
 //! use mongod_proxy::Proxy;
 //!
-//! let proxy = Proxy::new("127.0.0.1", 27017, false).rewrite_hello();
+//! // Driver URIs like `mongodb://127.0.0.1:27018/` (no directConnection)
+//! // reach the proxy as a Standalone and stay on this socket.
+//! let proxy = Proxy::new("127.0.0.1", 27017, false);
+//! # let _ = proxy;
+//! ```
+//!
+//! Opt out when you specifically need the upstream's topology to surface
+//! through:
+//!
+//! ```
+//! use mongod_proxy::Proxy;
+//!
+//! let proxy = Proxy::new("127.0.0.1", 27017, false).disable_rewrite_hello();
 //! # let _ = proxy;
 //! ```
 
@@ -76,16 +123,56 @@ const TOPOLOGY_DISCOVERY_FIELDS: &[&str] = &[
 ];
 
 /// Tower [`Layer`] that rewrites `hello` / `isMaster` replies so non-direct
-/// connection URIs work through the proxy. See the [module docs](self) for
-/// details.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct RewriteHelloLayer;
+/// connection URIs work through the proxy.
+///
+/// See the [module docs](self) for what the rewrite does, why it's on by
+/// default on [`Proxy`](crate::Proxy), and when you might want to turn it
+/// off. The short version: **leave it on** unless you specifically need
+/// the upstream's topology visible to drivers; with it off, SDAM-enabled
+/// drivers bypass the proxy entirely after the handshake.
+///
+/// The `enabled` flag is captured at construction time and threaded through
+/// each per-connection [`RewriteHelloService`]. When `false` the service
+/// becomes a pure pass-through — used inside [`Proxy`](crate::Proxy) so
+/// the type stack stays stable regardless of whether
+/// [`disable_rewrite_hello`](crate::Proxy::disable_rewrite_hello) was
+/// called.
+#[derive(Clone, Copy, Debug)]
+pub struct RewriteHelloLayer {
+    enabled: bool,
+}
+
+impl Default for RewriteHelloLayer {
+    /// Returns an enabled layer — the rewrite is active by default.
+    fn default() -> Self {
+        Self::enabled()
+    }
+}
+
+impl RewriteHelloLayer {
+    /// Construct a layer that strips topology-discovery fields from every
+    /// `hello` / `isMaster` reply.
+    pub const fn enabled() -> Self {
+        Self { enabled: true }
+    }
+
+    /// Construct a layer that passes every reply through verbatim. Useful
+    /// only as a no-op placeholder when something downstream still needs
+    /// the layer in the type stack but you want to surface the upstream's
+    /// real topology to the driver.
+    pub const fn disabled() -> Self {
+        Self { enabled: false }
+    }
+}
 
 impl<S> Layer<S> for RewriteHelloLayer {
     type Service = RewriteHelloService<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        RewriteHelloService { inner }
+        RewriteHelloService {
+            inner,
+            enabled: self.enabled,
+        }
     }
 }
 
@@ -93,10 +180,16 @@ impl<S> Layer<S> for RewriteHelloLayer {
 ///
 /// On each request it remembers whether the request was a `hello` /
 /// `isMaster` (the only commands whose replies carry topology-discovery
-/// fields) and, if so, wraps the reply stream in a [`RewriteHelloStream`]
-/// that strips those fields from every message it yields.
+/// fields) *and* whether rewriting is enabled, and only then wraps the
+/// reply stream in a [`RewriteHelloStream`] that strips those fields.
+///
+/// `Clone` is derived so the service can be wrapped by layers like
+/// [`ExplainLayer`](crate::ExplainLayer) that need a cloneable inner
+/// service to drive sideband requests.
+#[derive(Clone)]
 pub struct RewriteHelloService<S> {
     inner: S,
+    enabled: bool,
 }
 
 impl<S, St, E> Service<Message> for RewriteHelloService<S>
@@ -118,7 +211,7 @@ where
     }
 
     fn call(&mut self, req: Message) -> Self::Future {
-        let rewrite = is_hello_request(&req);
+        let rewrite = self.enabled && is_hello_request(&req);
         let fut = self.inner.call(req);
         Box::pin(async move {
             let inner = fut.await?;
@@ -385,5 +478,35 @@ mod tests {
         };
         let err = s.next().await.unwrap().unwrap_err();
         assert_eq!(err.to_string(), "boom");
+    }
+
+    #[tokio::test]
+    async fn disabled_service_passes_hello_reply_through_verbatim() {
+        // When the service is constructed disabled, even a hello reply
+        // with full topology metadata must pass through verbatim — the
+        // service flips `rewrite` to false at call time.
+        let reply = op_msg_body(doc! {
+            "isWritablePrimary": true,
+            "setName": "rs0",
+            "hosts": ["upstream:27017"],
+            "primary": "upstream:27017",
+            "me": "upstream:27017",
+            "ok": 1.0,
+        });
+        let before = first_body(&reply).clone();
+        let inner = stream::iter(vec![Ok::<_, std::io::Error>(reply)]);
+        // Simulate the path through the service: a hello *request* came
+        // in but `enabled` is false, so the resulting stream sets
+        // `rewrite=false` and leaves the reply alone.
+        let mut s = RewriteHelloStream {
+            inner,
+            rewrite: false,
+        };
+        let msg = s.next().await.unwrap().unwrap();
+        assert_eq!(
+            first_body(&msg),
+            &before,
+            "disabled service must not strip any fields"
+        );
     }
 }

@@ -80,9 +80,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    let proxy = Proxy::new(upstream_host, upstream_port, use_tls)
-        .rewrite_hello()
-        .enable_explain_with_sink(tx);
+    let proxy = Proxy::new(upstream_host, upstream_port, use_tls).enable_explain_with_sink(tx);
 
     serve(listener, proxy).await.context("run mongodb proxy")?;
     let _ = consumer.await;

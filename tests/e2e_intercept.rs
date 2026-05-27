@@ -12,14 +12,14 @@
 //! regression in any one path is reported against the specific case
 //! (e.g. `proxy_intercepts_every_command_we_send::case_3_replica_set_default`).
 //!
-//! - Standalone + default URI: `rewrite_hello` is a no-op (no `setName`
-//!   on the wire); the case catches regressions on the proxy's standalone
-//!   path.
+//! - Standalone + default URI: the default `hello` rewrite is a no-op
+//!   here (no `setName` on the wire); the case catches regressions on
+//!   the proxy's standalone path.
 //! - Standalone + `directConnection=true`: driver bypasses SDAM entirely;
 //!   the case catches handshake regressions in the proxy.
-//! - Replica-set + default URI: the case `rewrite_hello` exists for —
-//!   verifies the driver stays on the proxy socket instead of dialling
-//!   the upstream container hostname.
+//! - Replica-set + default URI: the case the default `hello` rewrite
+//!   exists for — verifies the driver stays on the proxy socket instead
+//!   of dialling the upstream container hostname.
 //! - Replica-set + `directConnection=true`: original supported URI shape;
 //!   the case catches regressions to that path.
 //!
@@ -98,8 +98,10 @@ async fn proxy_intercepts_every_command_we_send(
     let proxy_port = listener.local_addr().unwrap().port();
     eprintln!("proxy listening on 127.0.0.1:{proxy_port}");
 
+    // The `hello` / `isMaster` rewrite is on by default — the replica-set
+    // case relies on it so the driver doesn't reconnect to the upstream
+    // container hostname.
     let proxy = Proxy::new("127.0.0.1", host_port, false)
-        .rewrite_hello()
         .layer(LogLayer)
         .layer(recorder.layer());
 
@@ -109,11 +111,12 @@ async fn proxy_intercepts_every_command_we_send(
 
     // ----- 3. Drive traffic via the official driver, THROUGH the proxy.
     //          The URI shape is parameterised: when `direct_connection` is
-    //          false (default URI) the driver runs SDAM and would dial
-    //          upstream's container hostname directly against a replica
-    //          set without `rewrite_hello()`. When true, the driver
-    //          short-circuits SDAM and uses just this address. Both must
-    //          work against both topologies.
+    //          false (default URI) the driver runs SDAM and — against a
+    //          replica-set upstream — would dial the container hostname
+    //          directly if the proxy weren't rewriting `hello` replies by
+    //          default. When true, the driver short-circuits SDAM and
+    //          uses just this address. Both must work against both
+    //          topologies.
     let proxy_uri = if direct_connection {
         format!("mongodb://127.0.0.1:{proxy_port}/?directConnection=true")
     } else {

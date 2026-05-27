@@ -40,9 +40,7 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("bind tcp socket on {listen_addr}"))?;
 
-    let proxy = Proxy::new(upstream_host, upstream_port, use_tls)
-        .rewrite_hello()
-        .enable_logging();
+    let proxy = Proxy::new(upstream_host, upstream_port, use_tls).enable_logging();
 
     serve(listener, proxy).await.context("run mongodb proxy")?;
 

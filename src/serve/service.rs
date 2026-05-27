@@ -34,7 +34,7 @@ use crate::{
     encoder::{WireEncoder, WireEncoderError},
     message::Message,
     operation::{Operation, op_msg::OperationMessageFlags},
-    serve::rewrite_hello::RewriteHelloLayer,
+    serve::rewrite_hello::{RewriteHelloLayer, RewriteHelloService},
 };
 
 /// Ensures rustls has a usable [`CryptoProvider`](tokio_rustls::rustls::crypto::CryptoProvider).
@@ -82,6 +82,12 @@ pub struct Proxy<L> {
     destination_name: String,
     destination_port: u16,
     tls_connector: Option<Arc<TlsConnector>>,
+    /// When true, every per-connection service has a [`RewriteHelloLayer`]
+    /// inserted *between* the user-supplied layer stack and the inner
+    /// [`ProxyClient`], so `hello` / `isMaster` replies get their
+    /// topology-discovery fields stripped. On by default; flip via
+    /// [`disable_rewrite_hello`](Self::disable_rewrite_hello).
+    rewrite_hello: bool,
 
     proxy_layer: L,
 }
@@ -94,6 +100,17 @@ impl Proxy<Identity> {
     /// TLS client using the standard `webpki-roots` trust anchors and SNI
     /// derived from `destination_name`. When false the upstream socket is
     /// plain TCP.
+    ///
+    /// The resulting proxy has the `hello` / `isMaster` rewrite **on by
+    /// default** so SDAM-enabled drivers (`mongodb://host:port/` with no
+    /// `directConnection=true`) classify the proxy as a `Standalone` and
+    /// keep every request on this socket instead of dialling the
+    /// upstream addresses they would otherwise discover. Almost every
+    /// user wants this — see the [`rewrite_hello`](crate::serve::rewrite_hello)
+    /// module for the full rationale and the list of fields stripped.
+    /// Opt out with [`disable_rewrite_hello`](Proxy::disable_rewrite_hello)
+    /// only when you specifically need the upstream's topology visible to
+    /// drivers.
     pub fn new(destination_name: impl Into<String>, destination_port: u16, use_tls: bool) -> Self {
         let tls_connector = if use_tls {
             install_default_crypto_provider();
@@ -113,6 +130,7 @@ impl Proxy<Identity> {
             destination_name: destination_name.into(),
             destination_port,
             tls_connector,
+            rewrite_hello: true,
 
             proxy_layer: Identity::new(),
         }
@@ -130,9 +148,33 @@ impl<L> Proxy<L> {
             destination_name: self.destination_name,
             destination_port: self.destination_port,
             tls_connector: self.tls_connector,
+            rewrite_hello: self.rewrite_hello,
 
             proxy_layer: Stack::new(layer, self.proxy_layer),
         }
+    }
+
+    /// Turns off the default `hello` / `isMaster` rewrite.
+    ///
+    /// **You probably don't want to call this.** With the rewrite off,
+    /// SDAM-enabled drivers read the upstream's `setName` / `hosts` /
+    /// `primary` / `me` from the hello reply and *open fresh TCP
+    /// connections directly to those advertised addresses* — bypassing
+    /// the proxy entirely for everything after the handshake. The proxy
+    /// won't error; it just stops seeing requests, silently breaking
+    /// every layer in the stack (logging, explain, custom middleware).
+    ///
+    /// Disabling is appropriate only when you specifically need the
+    /// upstream's topology visible to drivers (driver-side SDAM testing,
+    /// using the proxy as a transparent observability tap), and you've
+    /// arranged for the driver to reach the proxy some other way (e.g.
+    /// `?directConnection=true` in the URI).
+    ///
+    /// See [`RewriteHelloLayer`] for the full rationale and the list of
+    /// fields the rewrite strips.
+    pub fn disable_rewrite_hello(mut self) -> Self {
+        self.rewrite_hello = false;
+        self
     }
 
     /// Convenience for `self.layer(LogLayer)`.
@@ -142,21 +184,6 @@ impl<L> Proxy<L> {
     /// `direction`, `op`, `command`, and identifier fields.
     pub fn enable_logging(self) -> Proxy<Stack<LogLayer, L>> {
         self.layer(LogLayer)
-    }
-
-    /// Convenience for `self.layer(RewriteHelloLayer)`.
-    ///
-    /// Strips the replica-set discovery fields (`setName`, `hosts`,
-    /// `primary`, `me`, `passives`, `arbiters`, …) from every `hello` /
-    /// `isMaster` reply so SDAM-enabled drivers classify the upstream as a
-    /// `Standalone` and keep their traffic on the proxy socket. Without
-    /// this layer, drivers must use `?directConnection=true` in the URI to
-    /// reach the proxy at all when the upstream is a replica set or mongos.
-    ///
-    /// See [`RewriteHelloLayer`] for the full rationale and the list of
-    /// fields stripped.
-    pub fn rewrite_hello(self) -> Proxy<Stack<RewriteHelloLayer, L>> {
-        self.layer(RewriteHelloLayer)
     }
 
     /// Convenience for `self.layer(ExplainLayer::new())`.
@@ -193,7 +220,7 @@ impl<L> Proxy<L> {
 
 impl<L> Service<SocketAddr> for Proxy<L>
 where
-    L: Clone + Layer<ProxyClient> + Send + 'static,
+    L: Clone + Layer<RewriteHelloService<ProxyClient>> + Send + 'static,
     L::Service: Service<Message>,
 {
     type Response = L::Service;
@@ -213,11 +240,19 @@ where
         let tls_connector = self.tls_connector.clone();
 
         let layer = self.proxy_layer.clone();
+        // Innermost wrap. When disabled the layer becomes a pass-through
+        // (still walks every reply but never mutates), so the type stack
+        // stays stable regardless of the toggle.
+        let rewrite_layer = if self.rewrite_hello {
+            RewriteHelloLayer::enabled()
+        } else {
+            RewriteHelloLayer::disabled()
+        };
 
         ProxyClientCreationFuture(Box::pin(async move {
             ProxyClient::forward_to(destination_name, destination_port, tls_connector)
                 .await
-                .map(|s| layer.layer(s))
+                .map(|s| layer.layer(rewrite_layer.layer(s)))
         }))
     }
 }

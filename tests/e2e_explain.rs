@@ -94,17 +94,15 @@ async fn explain_layer_captures_typed_events_for_find_and_aggregate() {
     let proxy_port = listener.local_addr().unwrap().port();
     eprintln!("proxy listening on 127.0.0.1:{proxy_port}");
 
-    let proxy = Proxy::new("127.0.0.1", host_port, false)
-        .rewrite_hello()
-        .enable_explain_with_sink(tx);
+    let proxy = Proxy::new("127.0.0.1", host_port, false).enable_explain_with_sink(tx);
 
     let proxy_task = tokio::spawn(async move {
         let _ = serve(listener, proxy).await;
     });
 
-    // No `directConnection=true` in the URI — `rewrite_hello()` strips the
-    // replica-set discovery fields from `hello` replies so the driver
-    // classifies the proxy as a Standalone and keeps traffic on this socket.
+    // No `directConnection=true` in the URI — `Proxy::new` has the
+    // `hello` / `isMaster` rewrite on by default, so the driver classifies
+    // the proxy as a Standalone and keeps traffic on this socket.
     let proxy_uri = format!("mongodb://127.0.0.1:{proxy_port}/");
     let mut options = ClientOptions::parse(&proxy_uri).await.expect("parse uri");
     options.server_selection_timeout = Some(Duration::from_secs(10));

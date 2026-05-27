@@ -6,7 +6,13 @@
 //! [`service`] module is exposed for users who want to build their own
 //! upstream service.
 
-use std::{fmt::Display, marker::PhantomData, net::SocketAddr, pin::Pin};
+use std::{
+    fmt::Display,
+    marker::PhantomData,
+    net::SocketAddr,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use futures::{Stream, sink::SinkExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -116,10 +122,7 @@ pub struct ServeFuture(Pin<Box<dyn Future<Output = Result<(), ServeError>> + Sen
 impl Future for ServeFuture {
     type Output = Result<(), ServeError>;
 
-    fn poll(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.0.as_mut().poll(cx)
     }
 }

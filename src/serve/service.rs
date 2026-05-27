@@ -11,6 +11,7 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     sync::{Arc, Once},
+    task::{Context, Poll},
 };
 
 use futures::{SinkExt, Stream, StreamExt};
@@ -227,11 +228,8 @@ where
     type Error = ProxyClientForwardError;
     type Future = ProxyClientCreationFuture<L::Service>;
 
-    fn poll_ready(
-        &mut self,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        std::task::Poll::Ready(Ok(()))
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
     }
 
     fn call(&mut self, _req: SocketAddr) -> Self::Future {
@@ -273,10 +271,7 @@ where
 {
     type Output = Result<S, ProxyClientForwardError>;
 
-    fn poll(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.0.as_mut().poll(cx)
     }
 }
@@ -416,30 +411,27 @@ impl ProxyResponseStream {
 impl Stream for ProxyResponseStream {
     type Item = Result<Message, ProxyClientRequestError>;
 
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let guard = match &mut self.state {
-            ProxyResponseStreamState::Done => return std::task::Poll::Ready(None),
+            ProxyResponseStreamState::Done => return Poll::Ready(None),
             ProxyResponseStreamState::Streaming(guard) => guard,
         };
 
         match guard.server_reader.poll_next_unpin(cx) {
-            std::task::Poll::Pending => std::task::Poll::Pending,
-            std::task::Poll::Ready(None) => {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => {
                 self.state = ProxyResponseStreamState::Done;
-                std::task::Poll::Ready(Some(Err(ProxyClientRequestError::EndOfStream)))
+                Poll::Ready(Some(Err(ProxyClientRequestError::EndOfStream)))
             }
-            std::task::Poll::Ready(Some(Err(e))) => {
+            Poll::Ready(Some(Err(e))) => {
                 self.state = ProxyResponseStreamState::Done;
-                std::task::Poll::Ready(Some(Err(e.into())))
+                Poll::Ready(Some(Err(e.into())))
             }
-            std::task::Poll::Ready(Some(Ok(msg))) => {
+            Poll::Ready(Some(Ok(msg))) => {
                 if !more_to_come(&msg.operation) {
                     self.state = ProxyResponseStreamState::Done;
                 }
-                std::task::Poll::Ready(Some(Ok(msg)))
+                Poll::Ready(Some(Ok(msg)))
             }
         }
     }
@@ -451,15 +443,12 @@ impl Service<Message> for ProxyClient {
 
     type Future = ProxyClientRequestFuture;
 
-    fn poll_ready(
-        &mut self,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         // ProxyClient owns a single upstream socket and is used by exactly one
         // accept_client_inner task that issues request/response serially. The
         // Arc<Mutex<...>> exists only to satisfy the 'static bound on the future;
         // it is never contended, so always-ready is correct.
-        std::task::Poll::Ready(Ok(()))
+        Poll::Ready(Ok(()))
     }
 
     fn call(&mut self, req: Message) -> Self::Future {
@@ -513,10 +502,7 @@ pub struct ProxyClientRequestFuture(
 impl Future for ProxyClientRequestFuture {
     type Output = Result<ProxyResponseStream, ProxyClientRequestError>;
 
-    fn poll(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.0.as_mut().poll(cx)
     }
 }

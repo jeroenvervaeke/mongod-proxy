@@ -21,7 +21,10 @@
 //! # let _ = proxy;
 //! ```
 
-use std::pin::Pin;
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use crate::message::Message;
 use futures::Stream;
@@ -66,10 +69,7 @@ where
     type Error = E;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, E>> + Send + 'static>>;
 
-    fn poll_ready(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.service.poll_ready(cx)
     }
 
@@ -106,14 +106,11 @@ where
 {
     type Item = Result<Message, E>;
 
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match Pin::new(&mut self.inner).poll_next(cx) {
-            std::task::Poll::Pending => std::task::Poll::Pending,
-            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
-            std::task::Poll::Ready(Some(Ok(message))) => {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Ready(Some(Ok(message))) => {
                 info!(
                     direction = "response",
                     op = message.operation.op_kind(),
@@ -122,9 +119,9 @@ where
                     ?message,
                     "received response"
                 );
-                std::task::Poll::Ready(Some(Ok(message)))
+                Poll::Ready(Some(Ok(message)))
             }
-            std::task::Poll::Ready(Some(Err(e))) => std::task::Poll::Ready(Some(Err(e))),
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
         }
     }
 }

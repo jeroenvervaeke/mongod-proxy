@@ -82,4 +82,4 @@ pub use serve::{
     serve,
     service::Proxy,
 };
-pub use srv::{SrvHost, SrvResolveError};
+pub use srv::{LookupFailure, SrvHost, SrvResolveError};

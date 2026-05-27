@@ -136,6 +136,52 @@ impl Proxy<Identity> {
             proxy_layer: Identity::new(),
         }
     }
+
+    /// Creates a new proxy whose upstream is the first host returned by
+    /// an SRV lookup for `srv_hostname` — i.e. the `mongodb+srv://`
+    /// connection-string convention.
+    ///
+    /// Queries `_mongodb._tcp.<srv_hostname>` (see [`crate::srv`]) and
+    /// uses the first record as the upstream `host:port`. Per the SRV
+    /// spec, TLS to the upstream defaults to enabled; pass `use_tls =
+    /// false` only when forwarding to a test deployment that does not
+    /// terminate TLS itself.
+    ///
+    /// The proxy is single-upstream, so subsequent SRV records are
+    /// ignored. The default `hello` / `isMaster` rewrite (see
+    /// [`Proxy::new`]) keeps the driver pinned to this socket instead of
+    /// trying to dial the other replica-set members.
+    ///
+    /// SRV resolution happens once, here. If the underlying records
+    /// change while the proxy is running, restart the process to
+    /// re-resolve.
+    ///
+    /// # Errors
+    ///
+    /// See [`crate::srv::SrvResolveError`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use mongod_proxy::Proxy;
+    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    /// // `mongodb+srv://cluster0.foo.mongodb.net/` → SRV lookup, first host wins.
+    /// let proxy = Proxy::from_srv("cluster0.foo.mongodb.net", true).await?;
+    /// # let _ = proxy;
+    /// # Ok(()) }
+    /// ```
+    pub async fn from_srv(
+        srv_hostname: &str,
+        use_tls: bool,
+    ) -> Result<Self, crate::srv::SrvResolveError> {
+        let hosts = crate::srv::resolve(srv_hostname).await?;
+        // `resolve` returns Err(NoRecords) on an empty vec, so first is always Some.
+        let first = hosts
+            .into_iter()
+            .next()
+            .expect("srv::resolve guarantees at least one record on Ok");
+        Ok(Self::new(first.host, first.port, use_tls))
+    }
 }
 
 impl<L> Proxy<L> {

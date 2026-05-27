@@ -33,6 +33,11 @@
 //! # Ok(()) }
 //! ```
 //!
+//! To forward to an Atlas-style `mongodb+srv://` deployment, use
+//! [`Proxy::from_srv`] instead of `Proxy::new`: it resolves the SRV
+//! hostname (`_mongodb._tcp.<hostname>`) at startup and forwards to the
+//! first record. See the [`srv`] module for the lookup itself.
+//!
 //! # Architecture
 //!
 //! ```text
@@ -55,6 +60,7 @@ pub mod message;
 pub mod op_code;
 pub mod operation;
 pub mod serve;
+pub mod srv;
 
 #[cfg(test)]
 mod fixtures;
@@ -76,3 +82,4 @@ pub use serve::{
     serve,
     service::Proxy,
 };
+pub use srv::{SrvHost, SrvResolveError};

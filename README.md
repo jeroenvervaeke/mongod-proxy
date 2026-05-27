@@ -68,6 +68,48 @@ async fn main() -> std::io::Result<()> {
 Point any MongoDB driver at `mongodb://127.0.0.1:27018/` and traffic flows
 through the proxy unchanged, with every frame parsed and logged.
 
+## `mongodb+srv://` (SRV connection strings)
+
+When the upstream is an Atlas cluster — or any MongoDB deployment behind a
+`mongodb+srv://` URI — use `Proxy::from_srv` to resolve the SRV record at
+startup and forward to the first advertised host:
+
+```rust
+use mongod_proxy::{Proxy, serve};
+use tokio::net::TcpListener;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:27018").await?;
+
+    // Looks up `_mongodb._tcp.cluster0.foo.mongodb.net`, takes the first SRV
+    // record, and forwards to it. TLS defaults match the SRV spec — pass
+    // `false` only against a non-TLS test deployment.
+    let proxy = Proxy::from_srv("cluster0.foo.mongodb.net", /* use_tls = */ true)
+        .await?
+        .enable_logging();
+
+    serve(listener, proxy).await?;
+    Ok(())
+}
+```
+
+The proxy is single-upstream, so subsequent SRV records are ignored; the
+default [`hello` rewrite](#hello--ismaster-rewrite-on-by-default) keeps
+the client driver pinned to the proxy socket rather than dialling the
+other replica-set members it would otherwise discover. SRV resolution
+runs once at construction — restart the process to pick up changes to
+the records.
+
+The MongoDB `TXT` record (which carries driver-side `authSource` /
+`replicaSet` / `loadBalanced` options) is intentionally *not* fetched:
+the proxy is wire-level and doesn't act on those, so pass them through
+in the client-facing connection string instead.
+
+The `logger` binary picks this up via the `MONGOD_PROXY_UPSTREAM_SRV`
+env var (which takes precedence over `MONGOD_PROXY_UPSTREAM_HOST` /
+`_PORT` when set, and defaults TLS to on to match the SRV spec).
+
 ## `hello` / `isMaster` rewrite (on by default)
 
 Without help, an SDAM-enabled MongoDB driver

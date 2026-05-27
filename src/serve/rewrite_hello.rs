@@ -104,7 +104,10 @@
 //! # let _ = proxy;
 //! ```
 
-use std::pin::Pin;
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use bson::Document;
 use futures::Stream;
@@ -226,10 +229,7 @@ where
     type Error = E;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, E>> + Send + 'static>>;
 
-    fn poll_ready(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
     }
 
@@ -257,19 +257,16 @@ where
 {
     type Item = Result<Message, E>;
 
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match Pin::new(&mut self.inner).poll_next(cx) {
-            std::task::Poll::Pending => std::task::Poll::Pending,
-            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
-            std::task::Poll::Ready(Some(Err(e))) => std::task::Poll::Ready(Some(Err(e))),
-            std::task::Poll::Ready(Some(Ok(mut msg))) => {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+            Poll::Ready(Some(Ok(mut msg))) => {
                 if self.rewrite {
                     strip_topology_from_message(&mut msg);
                 }
-                std::task::Poll::Ready(Some(Ok(msg)))
+                Poll::Ready(Some(Ok(msg)))
             }
         }
     }

@@ -182,6 +182,82 @@ impl Proxy<Identity> {
             .expect("srv::resolve guarantees at least one record on Ok");
         Ok(Self::new(first.host, first.port, use_tls))
     }
+
+    /// Constructs a proxy from any MongoDB connection string — both
+    /// `mongodb://host[:port][,host[:port]…]/…` and
+    /// `mongodb+srv://hostname/…` are accepted.
+    ///
+    /// Callers don't have to inspect the scheme themselves: this routes
+    /// to [`Proxy::new`] for plain URIs and to [`Proxy::from_srv`] for
+    /// SRV URIs. For multi-host plain URIs the first host wins (the
+    /// proxy is single-upstream); the default
+    /// [`hello` rewrite](crate::RewriteHelloLayer) keeps the client
+    /// driver pinned to the proxy socket regardless.
+    ///
+    /// TLS follows the URI:
+    ///
+    /// - `mongodb://` defaults to **off** unless the URI carries
+    ///   `?tls=true` or `?ssl=true`.
+    /// - `mongodb+srv://` defaults to **on** (per the SRV spec) unless
+    ///   the URI carries `?tls=false` / `?ssl=false`.
+    ///
+    /// Everything else in the URI — user/password, database name, every
+    /// other query option — is intentionally ignored. The proxy is
+    /// wire-level; the client driver forwards those options to the
+    /// upstream itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FromUriError::Parse`] for any URI shape rejected by
+    /// [`crate::uri::ConnectionUriError`], or [`FromUriError::Srv`] if
+    /// the SRV lookup fails on a `mongodb+srv://` URI.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use mongod_proxy::Proxy;
+    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    /// // Plain URI: TLS defaults to off, port defaults to 27017.
+    /// let proxy = Proxy::from_uri("mongodb://127.0.0.1:27017/").await?;
+    /// # let _ = proxy;
+    /// // SRV URI: TLS defaults to on; the SRV record supplies the port.
+    /// let proxy = Proxy::from_uri("mongodb+srv://cluster0.foo.mongodb.net/").await?;
+    /// # let _ = proxy;
+    /// # Ok(()) }
+    /// ```
+    pub async fn from_uri(uri: &str) -> Result<Self, FromUriError> {
+        let parsed = crate::uri::parse(uri).map_err(FromUriError::Parse)?;
+        match parsed.scheme {
+            crate::uri::Scheme::Mongodb => {
+                // Spec default for non-SRV URIs: TLS off, port 27017.
+                let port = parsed.port.unwrap_or(27017);
+                let use_tls = parsed.tls.unwrap_or(false);
+                Ok(Self::new(parsed.host, port, use_tls))
+            }
+            crate::uri::Scheme::MongodbSrv => {
+                // Spec default for SRV URIs: TLS on.
+                let use_tls = parsed.tls.unwrap_or(true);
+                Self::from_srv(&parsed.host, use_tls)
+                    .await
+                    .map_err(FromUriError::Srv)
+            }
+        }
+    }
+}
+
+/// Failure modes for [`Proxy::from_uri`].
+#[derive(Debug, thiserror::Error)]
+pub enum FromUriError {
+    /// The URI did not parse: bad scheme, missing host, invalid port,
+    /// invalid `tls=` value, etc. See
+    /// [`ConnectionUriError`](crate::ConnectionUriError) for the full
+    /// list.
+    #[error("invalid connection string: {0}")]
+    Parse(#[from] crate::uri::ConnectionUriError),
+    /// The SRV lookup for a `mongodb+srv://` URI failed. See
+    /// [`SrvResolveError`](crate::SrvResolveError) for the full list.
+    #[error("SRV resolution failed: {0}")]
+    Srv(#[from] crate::srv::SrvResolveError),
 }
 
 impl<L> Proxy<L> {

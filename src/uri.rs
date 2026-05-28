@@ -188,7 +188,9 @@ fn parse_tls_option(query: Option<&str>) -> Result<Option<bool>, ConnectionUriEr
         }
     }
     match (tls, ssl) {
-        (Some(t), Some(s)) if t != s => Err(ConnectionUriError::ConflictingTlsSsl { tls: t, ssl: s }),
+        (Some(t), Some(s)) if t != s => {
+            Err(ConnectionUriError::ConflictingTlsSsl { tls: t, ssl: s })
+        }
         (Some(t), _) | (None, Some(t)) => Ok(Some(t)),
         (None, None) => Ok(None),
     }
@@ -209,7 +211,12 @@ fn parse_bool(key: &'static str, value: &str) -> Result<bool, ConnectionUriError
 mod tests {
     use super::*;
 
-    fn parsed(scheme: Scheme, host: &str, port: Option<u16>, tls: Option<bool>) -> ParsedConnectionUri {
+    fn parsed(
+        scheme: Scheme,
+        host: &str,
+        port: Option<u16>,
+        tls: Option<bool>,
+    ) -> ParsedConnectionUri {
         ParsedConnectionUri {
             scheme,
             host: host.to_owned(),

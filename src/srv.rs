@@ -300,8 +300,7 @@ mod tests {
 
     fn lookup_returning(records: Vec<RawSrvRecord>) -> MockSrvLookup {
         let mut mock = MockSrvLookup::new();
-        mock.expect_lookup()
-            .returning(move |_| Ok(records.clone()));
+        mock.expect_lookup().returning(move |_| Ok(records.clone()));
         mock
     }
 
@@ -354,12 +353,18 @@ mod tests {
 
     #[test]
     fn strip_trailing_dot_removes_single_trailing_dot() {
-        assert_eq!(strip_trailing_dot("host.example.com.".into()), "host.example.com");
+        assert_eq!(
+            strip_trailing_dot("host.example.com.".into()),
+            "host.example.com"
+        );
     }
 
     #[test]
     fn strip_trailing_dot_leaves_undotted_string_alone() {
-        assert_eq!(strip_trailing_dot("host.example.com".into()), "host.example.com");
+        assert_eq!(
+            strip_trailing_dot("host.example.com".into()),
+            "host.example.com"
+        );
     }
 
     #[test]

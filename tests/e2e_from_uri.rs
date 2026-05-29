@@ -35,7 +35,11 @@ use std::{env, time::Duration};
 
 use futures::TryStreamExt;
 use mongod_proxy::{Proxy, serve};
-use mongodb::{Client, bson::doc, options::ClientOptions};
+use mongodb::{
+    Client,
+    bson::doc,
+    options::{ClientOptions, Credential},
+};
 use tokio::net::TcpListener;
 
 const ENV_URI: &str = "MONGOD_PROXY_E2E_ATLAS_URI";
@@ -71,27 +75,40 @@ async fn proxy_forwards_traffic_when_built_from_uri_secret() {
         let _ = serve(listener, proxy.enable_logging()).await;
     });
 
-    // ----- 3. Construct a driver URI that points at the proxy -----
+    // ----- 3. Build driver options pointing at the proxy ---------------
     //
-    // Strategy: reuse the secret's user-info verbatim (Atlas needs the
-    // real credentials to complete SASL) but rewrite the host segment
-    // to point at the proxy and the scheme to plain `mongodb://` since
-    // the proxy serves cleartext. `directConnection=true` keeps the
-    // driver from running SDAM against the (rewritten) hello reply.
-    let user_info = extract_user_info(&atlas_uri);
-    let driver_uri = match user_info {
-        Some(ui) => format!("mongodb://{ui}@127.0.0.1:{proxy_port}/?directConnection=true"),
-        None => format!("mongodb://127.0.0.1:{proxy_port}/?directConnection=true"),
-    };
+    // The driver URI we hand to `ClientOptions::parse` deliberately
+    // carries NO credentials: if parsing ever panicked (it shouldn't —
+    // the URI is statically valid), the panic message would otherwise
+    // echo the secret in plaintext, and GitHub Actions' secret masking
+    // only matches the exact stored value. Credentials are set on the
+    // resulting `ClientOptions` directly — `Credential`'s `Debug` impl
+    // is hardcoded to `REDACTED`, so even `{options:?}` is safe.
+    //
+    // `directConnection=true` keeps the driver from running SDAM
+    // against the (rewritten) hello reply.
+    let mut options = ClientOptions::parse(format!(
+        "mongodb://127.0.0.1:{proxy_port}/?directConnection=true"
+    ))
+    .await
+    .expect("static driver URI must parse");
 
-    let mut options = ClientOptions::parse(&driver_uri)
-        .await
-        .expect("parse driver URI");
+    if let Some((user, pass)) = extract_user_password(&atlas_uri) {
+        // Atlas needs the real credentials to complete SASL upstream.
+        // Username always present, password optional (matches MongoDB's
+        // own credential parsing).
+        options.credential = Some(
+            Credential::builder()
+                .username(user.to_owned())
+                .password(pass.map(str::to_owned))
+                .build(),
+        );
+    }
     // The upstream connect over TLS + the SRV resolution above already
     // burn a few hundred ms; give server selection some headroom over
     // the driver's 30s default to absorb a slow Atlas cold-start.
     options.server_selection_timeout = Some(Duration::from_secs(30));
-    let client = Client::with_options(options).expect("client");
+    let client = Client::with_options(options).expect("build mongodb client");
 
     // ----- 4. Drive a few representative commands through the proxy --
     //
@@ -172,17 +189,25 @@ async fn proxy_forwards_traffic_when_built_from_uri_secret() {
     let _ = proxy_task.await;
 }
 
-/// Pulls `user[:pass]` out of `mongodb[+srv]://user:pass@host/...`.
+/// Pulls `(user, Option<pass>)` out of `mongodb[+srv]://user:pass@host/...`.
 ///
 /// Mirrors the rightmost-`@` rule the URI parser applies, so passwords
-/// containing literal `@` survive without percent-decoding.
-fn extract_user_info(uri: &str) -> Option<&str> {
+/// containing literal `@` survive without percent-decoding. The username
+/// is always present in the user-info segment; the password is optional
+/// (URIs of the shape `mongodb://user@host` are valid).
+///
+/// Returns `None` if the URI has no user-info segment at all.
+fn extract_user_password(uri: &str) -> Option<(&str, Option<&str>)> {
     let after_scheme = uri.split_once("://").map(|(_, r)| r).unwrap_or(uri);
     let before_query = after_scheme
         .split_once('?')
         .map(|(b, _)| b)
         .unwrap_or(after_scheme);
-    before_query.rsplit_once('@').map(|(u, _)| u)
+    let (user_info, _) = before_query.rsplit_once('@')?;
+    match user_info.split_once(':') {
+        Some((user, pass)) => Some((user, Some(pass))),
+        None => Some((user_info, None)),
+    }
 }
 
 /// 16 hex chars sourced from the nanosecond clock. Cheap, distinct per

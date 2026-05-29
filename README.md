@@ -85,9 +85,13 @@ async fn main() -> anyhow::Result<()> {
     // `mongodb://` and `mongodb+srv://` both work. For SRV URIs the
     // `_mongodb._tcp.<hostname>` record is resolved at startup, every
     // advertised host is probed, and the replica-set primary is used as
-    // the upstream. TLS defaults match the URI scheme — off for
-    // `mongodb://`, on for `mongodb+srv://` — and can be overridden via
-    // `?tls=true|false` in the URI itself.
+    // the upstream. A multi-host plain seed list
+    // (`mongodb://h1,h2,h3/`) gets the same treatment — each host is
+    // probed and the primary is selected — while a single-host
+    // `mongodb://host/` is used verbatim with no probe. TLS defaults
+    // match the URI scheme — off for `mongodb://`, on for
+    // `mongodb+srv://` — and can be overridden via `?tls=true|false` in
+    // the URI itself.
     let proxy = Proxy::from_uri("mongodb+srv://cluster0.foo.mongodb.net/")
         .await?
         .enable_logging();
@@ -97,16 +101,17 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-For SRV URIs the proxy is still single-upstream — it forwards to the one
-replica-set primary it selects, and the default [`hello`
-rewrite](#hello--ismaster-rewrite-on-by-default) keeps the client driver
-pinned to the proxy socket rather than dialling the other replica-set
-members it would otherwise discover. The primary is selected at startup
-and then kept current: a background task re-resolves SRV and re-probes on
-a fixed interval (60s by default), swapping the upstream target if the
-replica set fails over, so the proxy recovers without a restart. Use
-`Proxy::from_srv_with(hostname, use_tls, FailoverConfig::…)` to tune the
-interval or opt out of the background loop.
+For SRV and multi-host URIs the proxy is still single-upstream — it
+forwards to the one replica-set primary it selects, and the default
+[`hello` rewrite](#hello--ismaster-rewrite-on-by-default) keeps the
+client driver pinned to the proxy socket rather than dialling the other
+replica-set members it would otherwise discover. The primary is selected
+at startup and then kept current: a background task re-probes on a fixed
+interval (60s by default) — re-resolving SRV for SRV URIs, or re-probing
+the static seed list for multi-host plain URIs — and swaps the upstream
+target if the replica set fails over, so the proxy recovers without a
+restart. Use `Proxy::from_srv_with(hostname, use_tls, FailoverConfig::…)`
+to tune the interval or opt out of the background loop for SRV URIs.
 
 Everything else in the URI — user/password, database name, every option
 beyond `tls` / `ssl` — is intentionally *dropped*. The proxy is

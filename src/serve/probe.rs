@@ -390,7 +390,9 @@ mod tests {
         let hosts = vec![host("hang", 27017), host("primary", 27017)];
         let start = tokio::time::Instant::now();
 
-        let picked = select_primary(&hosts, &ScriptedProbe).await.expect("primary");
+        let picked = select_primary(&hosts, &ScriptedProbe)
+            .await
+            .expect("primary");
 
         assert_eq!(picked.host, "primary");
         assert!(
@@ -410,7 +412,9 @@ mod tests {
             host("slow-primary", 27017),
         ];
 
-        let picked = select_primary(&hosts, &ScriptedProbe).await.expect("primary");
+        let picked = select_primary(&hosts, &ScriptedProbe)
+            .await
+            .expect("primary");
         assert_eq!(picked.host, "slow-primary");
     }
 

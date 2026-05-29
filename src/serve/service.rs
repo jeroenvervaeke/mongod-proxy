@@ -265,13 +265,14 @@ impl Proxy<Identity> {
         let hosts = crate::srv::resolve(srv_hostname).await?;
         let tls_connector = use_tls.then(default_tls_connector);
         let probe = crate::serve::probe::HelloProbe::new(tls_connector.clone());
+        let probe_timeout = failover.probe_timeout;
         let attempted = hosts.len();
-        let target = select_target(&hosts, &probe).await.ok_or_else(|| {
-            crate::srv::SrvResolveError::NoPrimary {
+        let target = select_target(&hosts, &probe, probe_timeout)
+            .await
+            .ok_or_else(|| crate::srv::SrvResolveError::NoPrimary {
                 hostname: srv_hostname.to_owned(),
                 attempted,
-            }
-        })?;
+            })?;
 
         if let Some(interval) = failover.reprobe_interval {
             let hostname = srv_hostname.to_owned();
@@ -283,7 +284,7 @@ impl Proxy<Identity> {
             spawn_reprobe_loop(interval, &target, move || {
                 let hostname = hostname.clone();
                 let probe = crate::serve::probe::HelloProbe::new(tls.clone());
-                async move { resolve_and_select(&hostname, &probe).await }
+                async move { resolve_and_select(&hostname, &probe, probe_timeout).await }
             });
         }
 
@@ -381,11 +382,13 @@ impl Proxy<Identity> {
     ) -> Result<Self, FromUriError> {
         let tls_connector = use_tls.then(default_tls_connector);
         let probe = crate::serve::probe::HelloProbe::new(tls_connector.clone());
-        let target = select_target(&hosts, &probe)
-            .await
-            .ok_or(FromUriError::NoPrimary {
-                attempted: hosts.len(),
-            })?;
+        let probe_timeout = failover.probe_timeout;
+        let target =
+            select_target(&hosts, &probe, probe_timeout)
+                .await
+                .ok_or(FromUriError::NoPrimary {
+                    attempted: hosts.len(),
+                })?;
 
         if let Some(interval) = failover.reprobe_interval {
             let tls = tls_connector.clone();
@@ -394,7 +397,7 @@ impl Proxy<Identity> {
             spawn_reprobe_loop(interval, &target, move || {
                 let probe = crate::serve::probe::HelloProbe::new(tls.clone());
                 let hosts = hosts.clone();
-                async move { reselect_seed_list(&hosts, &probe).await }
+                async move { reselect_seed_list(&hosts, &probe, probe_timeout).await }
             });
         }
 
@@ -412,6 +415,13 @@ impl Proxy<Identity> {
 /// The loop re-resolves SRV and re-selects the primary on
 /// [`reprobe_interval`](Self::reprobe_interval), swapping the upstream
 /// target in place when it changes.
+///
+/// It also carries the per-host
+/// [`probe_timeout`](Self::probe_timeout) used by *both* the one-shot
+/// startup selection and every background re-probe, so a deployment that
+/// cold-starts slowly (Atlas free-tier) or sits behind a high-latency
+/// link can widen the budget instead of failing startup with a spurious
+/// [`SrvResolveError::NoPrimary`](crate::srv::SrvResolveError::NoPrimary).
 #[derive(Debug, Clone)]
 pub struct FailoverConfig {
     /// How often to re-resolve SRV and re-select the primary. `None`
@@ -419,31 +429,62 @@ pub struct FailoverConfig {
     /// primary is used for the proxy's whole lifetime and a failover
     /// requires a restart.
     pub reprobe_interval: Option<Duration>,
+    /// Per-host budget for the dial + `hello` round-trip during primary
+    /// selection (startup and every re-probe). Hosts slower than this are
+    /// treated as non-primary. Defaults to 5s; raise it for clusters that
+    /// cold-start slowly (Atlas free-tier), lower it to fail fast on a
+    /// local network.
+    pub probe_timeout: Duration,
 }
 
 impl Default for FailoverConfig {
-    /// Re-probe every 60 seconds.
+    /// Re-probe every 60 seconds with the default per-host probe timeout.
     fn default() -> Self {
         Self {
             reprobe_interval: Some(DEFAULT_REPROBE_INTERVAL),
+            probe_timeout: crate::serve::probe::DEFAULT_PROBE_TIMEOUT,
         }
     }
 }
 
 impl FailoverConfig {
-    /// Re-probe on the given interval.
+    /// Re-probe on the given interval, keeping the default per-host probe
+    /// timeout. Chain [`with_probe_timeout`](Self::with_probe_timeout) to
+    /// also widen the budget.
     pub fn every(interval: Duration) -> Self {
         Self {
             reprobe_interval: Some(interval),
+            ..Self::default()
         }
     }
 
     /// Never re-probe: capture the primary once at startup and keep it
     /// for the proxy's whole lifetime (a failover then needs a restart).
+    /// The per-host probe timeout still applies to that one-shot startup
+    /// selection.
     pub fn disabled() -> Self {
         Self {
             reprobe_interval: None,
+            ..Self::default()
         }
+    }
+
+    /// Sets the per-host probe timeout (see
+    /// [`probe_timeout`](Self::probe_timeout)), used by both the startup
+    /// selection and any background re-probe. Returns `self` for
+    /// chaining:
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use mongod_proxy::FailoverConfig;
+    ///
+    /// // A cluster that cold-starts slowly: widen the budget to 20s.
+    /// let cfg = FailoverConfig::default().with_probe_timeout(Duration::from_secs(20));
+    /// assert_eq!(cfg.probe_timeout, Duration::from_secs(20));
+    /// ```
+    pub fn with_probe_timeout(mut self, probe_timeout: Duration) -> Self {
+        self.probe_timeout = probe_timeout;
+        self
     }
 }
 
@@ -453,11 +494,15 @@ impl FailoverConfig {
 /// Returns `None` when no host responds as the primary. Generic over the
 /// probe so the multi-host selection wiring can be unit-tested with a
 /// mock instead of real sockets.
-async fn select_target<P>(hosts: &[crate::srv::SrvHost], probe: &P) -> Option<Arc<RwLock<Target>>>
+async fn select_target<P>(
+    hosts: &[crate::srv::SrvHost],
+    probe: &P,
+    probe_timeout: Duration,
+) -> Option<Arc<RwLock<Target>>>
 where
     P: crate::serve::probe::PrimaryProbe + ?Sized,
 {
-    let primary = crate::serve::probe::select_primary(hosts, probe).await?;
+    let primary = crate::serve::probe::select_primary(hosts, probe, probe_timeout).await?;
     Some(Arc::new(RwLock::new(Target {
         host: primary.host,
         port: primary.port,
@@ -472,11 +517,12 @@ where
 async fn reselect_seed_list<P>(
     hosts: &[crate::srv::SrvHost],
     probe: &P,
+    probe_timeout: Duration,
 ) -> Option<crate::srv::SrvHost>
 where
     P: crate::serve::probe::PrimaryProbe + ?Sized,
 {
-    let picked = crate::serve::probe::select_primary(hosts, probe).await;
+    let picked = crate::serve::probe::select_primary(hosts, probe, probe_timeout).await;
     if picked.is_none() {
         warn!(
             hosts = hosts.len(),
@@ -492,13 +538,17 @@ where
 ///
 /// Used as the per-tick body of the background failover loop. Failures
 /// are non-fatal: the caller keeps the current target on `None`.
-async fn resolve_and_select<P>(hostname: &str, probe: &P) -> Option<crate::srv::SrvHost>
+async fn resolve_and_select<P>(
+    hostname: &str,
+    probe: &P,
+    probe_timeout: Duration,
+) -> Option<crate::srv::SrvHost>
 where
     P: crate::serve::probe::PrimaryProbe + ?Sized,
 {
     match crate::srv::resolve(hostname).await {
         Ok(hosts) => {
-            let picked = crate::serve::probe::select_primary(&hosts, probe).await;
+            let picked = crate::serve::probe::select_primary(&hosts, probe, probe_timeout).await;
             if picked.is_none() {
                 warn!(
                     hostname,
@@ -1272,7 +1322,7 @@ mod tests {
     // primary" wiring is verified without real sockets — the same gap
     // `from_uri` would otherwise only exercise against a live cluster.
 
-    use crate::serve::probe::MockPrimaryProbe;
+    use crate::serve::probe::{DEFAULT_PROBE_TIMEOUT, MockPrimaryProbe};
 
     #[tokio::test]
     async fn select_target_builds_cell_for_the_probed_primary() {
@@ -1288,7 +1338,7 @@ mod tests {
             .expect_is_primary()
             .returning(|host, _port| Ok(host == "primary.example.com"));
 
-        let cell = select_target(&hosts, &probe)
+        let cell = select_target(&hosts, &probe, DEFAULT_PROBE_TIMEOUT)
             .await
             .expect("a primary must be selected");
         assert_eq!(
@@ -1307,7 +1357,9 @@ mod tests {
         probe.expect_is_primary().returning(|_, _| Ok(false));
 
         assert!(
-            select_target(&hosts, &probe).await.is_none(),
+            select_target(&hosts, &probe, DEFAULT_PROBE_TIMEOUT)
+                .await
+                .is_none(),
             "no primary among the seed list must yield None"
         );
     }
@@ -1325,10 +1377,95 @@ mod tests {
             .expect_is_primary()
             .returning(|host, _port| Ok(host == "b.example.com"));
 
-        let picked = reselect_seed_list(&hosts, &probe)
+        let picked = reselect_seed_list(&hosts, &probe, DEFAULT_PROBE_TIMEOUT)
             .await
             .expect("re-probe finds the new primary");
         assert_eq!(picked, srv_host("b.example.com", 27017));
+    }
+
+    // ---------- configurable per-host probe timeout (#27) ----------
+    //
+    // `select_target` (shared by `from_srv` and the multi-host `from_uri`
+    // arm) must thread the configured budget into `select_primary`, so a
+    // cold-starting cluster is reached under a widened timeout instead of
+    // failing startup with a spurious `NoPrimary`. A hand-rolled probe
+    // that sleeps before answering lets `start_paused` virtual time prove
+    // the budget is honoured without wall-clock flakiness.
+
+    /// Primary that only answers its first `hello` after `delay` —
+    /// stands in for an Atlas free-tier node cold-starting.
+    struct ColdPrimaryProbe {
+        delay: Duration,
+    }
+
+    impl crate::serve::probe::PrimaryProbe for ColdPrimaryProbe {
+        async fn is_primary(
+            &self,
+            _host: String,
+            _port: u16,
+        ) -> Result<bool, crate::serve::probe::ProbeError> {
+            tokio::time::sleep(self.delay).await;
+            Ok(true)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn select_target_misses_a_cold_primary_under_the_default_timeout() {
+        let hosts = vec![srv_host("cold.example.com", 27017)];
+        let probe = ColdPrimaryProbe {
+            delay: Duration::from_secs(8),
+        };
+        assert!(
+            select_target(&hosts, &probe, DEFAULT_PROBE_TIMEOUT)
+                .await
+                .is_none(),
+            "the 5s default must time out before the cold primary answers",
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn select_target_reaches_a_cold_primary_under_a_widened_timeout() {
+        let hosts = vec![srv_host("cold.example.com", 27017)];
+        let probe = ColdPrimaryProbe {
+            delay: Duration::from_secs(8),
+        };
+        let cell = select_target(&hosts, &probe, Duration::from_secs(15))
+            .await
+            .expect("a widened budget must reach the cold-starting primary");
+        assert_eq!(read_target(&cell), ("cold.example.com".to_owned(), 27017));
+    }
+
+    // ---------- FailoverConfig probe-timeout knob ----------
+
+    #[test]
+    fn failover_config_default_uses_the_standard_probe_timeout() {
+        assert_eq!(
+            FailoverConfig::default().probe_timeout,
+            DEFAULT_PROBE_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn failover_config_every_keeps_the_default_probe_timeout() {
+        let cfg = FailoverConfig::every(Duration::from_secs(30));
+        assert_eq!(cfg.reprobe_interval, Some(Duration::from_secs(30)));
+        assert_eq!(cfg.probe_timeout, DEFAULT_PROBE_TIMEOUT);
+    }
+
+    #[test]
+    fn failover_config_disabled_keeps_a_probe_timeout_for_startup_selection() {
+        // Turning the re-probe loop off must not disable the per-host
+        // budget the one-shot startup selection still relies on.
+        let cfg = FailoverConfig::disabled();
+        assert_eq!(cfg.reprobe_interval, None);
+        assert_eq!(cfg.probe_timeout, DEFAULT_PROBE_TIMEOUT);
+    }
+
+    #[test]
+    fn failover_config_with_probe_timeout_overrides_only_the_timeout() {
+        let cfg = FailoverConfig::default().with_probe_timeout(Duration::from_secs(20));
+        assert_eq!(cfg.probe_timeout, Duration::from_secs(20));
+        assert_eq!(cfg.reprobe_interval, Some(DEFAULT_REPROBE_INTERVAL));
     }
 
     // ---------- from_uri routing: route() ----------

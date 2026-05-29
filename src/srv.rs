@@ -379,10 +379,10 @@ fn weighted_shuffle_into<R: WeightedRng>(
 ///
 /// Queries `_mongodb._tcp.<srv_hostname>` and returns every advertised
 /// `(host, port)` pair. Records are ordered per RFC 2782 — ascending
-/// `priority`, weight-randomised within each priority group (see
-/// [`order_by_priority_weight`]) — so the first record callers use is the
-/// most-preferred reachable target. The proxy is single-upstream, so only
-/// the chosen primary among these is ultimately forwarded to.
+/// `priority`, weight-randomised within each priority group — so the
+/// first record callers use is the most-preferred reachable target. The
+/// proxy is single-upstream, so only the chosen primary among these is
+/// ultimately forwarded to.
 ///
 /// The original hostname must have at least two labels (e.g.
 /// `cluster.example.com`). Each returned target must share the original

@@ -40,7 +40,7 @@ pub(crate) enum Scheme {
     MongodbSrv,
 }
 
-/// Failure modes for [`parse`] / [`Proxy::from_uri`](crate::Proxy::from_uri).
+/// Failure modes for [`Proxy::from_uri`](crate::Proxy::from_uri).
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ConnectionUriError {
     /// URI does not contain `://`.

@@ -50,7 +50,7 @@ pub(crate) struct RawSrvRecord {
     pub port: u16,
 }
 
-/// Opaque DNS lookup failure surfaced by [`SrvLookup`] implementations.
+/// Opaque DNS lookup failure surfaced by the SRV-lookup backend.
 ///
 /// Held by [`SrvResolveError::Lookup`] so callers can inspect the chain
 /// via [`std::error::Error::source`] without [`srv`](self) leaking

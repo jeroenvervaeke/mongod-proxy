@@ -266,12 +266,11 @@ impl Proxy<Identity> {
         let tls_connector = use_tls.then(default_tls_connector);
         let probe = crate::serve::probe::HelloProbe::new(tls_connector.clone());
         let probe_timeout = failover.probe_timeout;
-        let attempted = hosts.len();
         let target = select_target(&hosts, &probe, probe_timeout)
             .await
-            .ok_or_else(|| crate::srv::SrvResolveError::NoPrimary {
+            .map_err(|attempts| crate::srv::SrvResolveError::NoPrimary {
                 hostname: srv_hostname.to_owned(),
-                attempted,
+                attempts,
             })?;
 
         if let Some(interval) = failover.reprobe_interval {
@@ -383,12 +382,9 @@ impl Proxy<Identity> {
         let tls_connector = use_tls.then(default_tls_connector);
         let probe = crate::serve::probe::HelloProbe::new(tls_connector.clone());
         let probe_timeout = failover.probe_timeout;
-        let target =
-            select_target(&hosts, &probe, probe_timeout)
-                .await
-                .ok_or(FromUriError::NoPrimary {
-                    attempted: hosts.len(),
-                })?;
+        let target = select_target(&hosts, &probe, probe_timeout)
+            .await
+            .map_err(|attempts| FromUriError::NoPrimary { attempts })?;
 
         if let Some(interval) = failover.reprobe_interval {
             let tls = tls_connector.clone();
@@ -504,15 +500,20 @@ async fn select_target<P>(
     hosts: &[crate::srv::SrvHost],
     probe: &P,
     probe_timeout: Duration,
-) -> Option<Arc<RwLock<Target>>>
+) -> Result<Arc<RwLock<Target>>, Vec<(crate::srv::SrvHost, crate::serve::probe::ProbeOutcome)>>
 where
     P: crate::serve::probe::PrimaryProbe + ?Sized,
 {
-    let primary = crate::serve::probe::select_primary(hosts, probe, probe_timeout).await?;
-    Some(Arc::new(RwLock::new(Target {
-        host: primary.host,
-        port: primary.port,
-    })))
+    match crate::serve::probe::select_primary(hosts, probe, probe_timeout).await {
+        crate::serve::probe::Selection::Primary(primary) => Ok(Arc::new(RwLock::new(Target {
+            host: primary.host,
+            port: primary.port,
+        }))),
+        // No host is currently the primary: hand the per-host rejection
+        // reasons back so the constructor can build a diagnostic
+        // `NoPrimary` rather than collapsing them into a bare count.
+        crate::serve::probe::Selection::NoPrimary(attempts) => Err(attempts),
+    }
 }
 
 /// Re-probe a static seed list for the current primary, returning the
@@ -528,7 +529,9 @@ async fn reselect_seed_list<P>(
 where
     P: crate::serve::probe::PrimaryProbe + ?Sized,
 {
-    let picked = crate::serve::probe::select_primary(hosts, probe, probe_timeout).await;
+    let picked = crate::serve::probe::select_primary(hosts, probe, probe_timeout)
+        .await
+        .into_primary();
     if picked.is_none() {
         warn!(
             hosts = hosts.len(),
@@ -554,7 +557,9 @@ where
 {
     match crate::srv::resolve(hostname).await {
         Ok(hosts) => {
-            let picked = crate::serve::probe::select_primary(&hosts, probe, probe_timeout).await;
+            let picked = crate::serve::probe::select_primary(&hosts, probe, probe_timeout)
+                .await
+                .into_primary();
             if picked.is_none() {
                 warn!(
                     hostname,
@@ -732,10 +737,20 @@ pub enum FromUriError {
     /// [`RewriteHelloLayer`] deliberately hides). Analogous to
     /// [`SrvResolveError::NoPrimary`](crate::SrvResolveError::NoPrimary)
     /// for the non-SRV case.
-    #[error("no primary found among {attempted} seed-list hosts")]
+    ///
+    /// `attempts` pairs every probed seed-list host with the reason it was
+    /// rejected (a [`ProbeOutcome`](crate::ProbeOutcome)), so the operator
+    /// can tell a refused connection from a healthy secondary from a probe
+    /// timeout instead of seeing only a count.
+    #[error(
+        "no primary found among {} seed-list hosts ({})",
+        attempts.len(),
+        crate::srv::summarise_attempts(attempts)
+    )]
     NoPrimary {
-        /// How many seed-list hosts the probe loop tried before giving up.
-        attempted: usize,
+        /// Every probed seed-list host paired with why it was rejected, in
+        /// probe-completion order. `attempts.len()` is the number tried.
+        attempts: Vec<(crate::srv::SrvHost, crate::serve::probe::ProbeOutcome)>,
     },
 }
 
@@ -1354,7 +1369,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn select_target_returns_none_when_no_host_is_primary() {
+    async fn select_target_errors_with_per_host_outcomes_when_no_host_is_primary() {
         let hosts = vec![
             srv_host("a.example.com", 27017),
             srv_host("b.example.com", 27017),
@@ -1362,11 +1377,18 @@ mod tests {
         let mut probe = MockPrimaryProbe::new();
         probe.expect_is_primary().returning(|_, _| Ok(false));
 
+        // No primary must surface the per-host reasons (here: both are
+        // healthy secondaries) so the constructor can build a diagnostic
+        // `NoPrimary` rather than a bare count.
+        let attempts = select_target(&hosts, &probe, DEFAULT_PROBE_TIMEOUT)
+            .await
+            .expect_err("no primary among the seed list must be an Err carrying outcomes");
+        assert_eq!(attempts.len(), 2);
         assert!(
-            select_target(&hosts, &probe, DEFAULT_PROBE_TIMEOUT)
-                .await
-                .is_none(),
-            "no primary among the seed list must yield None"
+            attempts
+                .iter()
+                .all(|(_, o)| matches!(o, crate::serve::probe::ProbeOutcome::NotPrimary)),
+            "both secondaries must be reported as NotPrimary, got {attempts:?}",
         );
     }
 
@@ -1421,11 +1443,15 @@ mod tests {
         let probe = ColdPrimaryProbe {
             delay: Duration::from_secs(8),
         };
+        let attempts = select_target(&hosts, &probe, DEFAULT_PROBE_TIMEOUT)
+            .await
+            .expect_err("the 5s default must time out before the cold primary answers");
         assert!(
-            select_target(&hosts, &probe, DEFAULT_PROBE_TIMEOUT)
-                .await
-                .is_none(),
-            "the 5s default must time out before the cold primary answers",
+            matches!(
+                attempts.as_slice(),
+                [(_, crate::serve::probe::ProbeOutcome::TimedOut)]
+            ),
+            "the cold primary must be reported as a timeout, got {attempts:?}",
         );
     }
 
@@ -1604,7 +1630,8 @@ mod tests {
         // Bind two loopback listeners to grab free ports, then drop them
         // so connections are refused immediately. Every probe fails to
         // connect, so selection finds no primary and `from_seed_list`
-        // surfaces `NoPrimary` carrying the attempted count.
+        // surfaces `NoPrimary` carrying the per-host failure reasons —
+        // each a `Failed` connect, not just an opaque count.
         let (listener_a, port_a) = bound_listener().await;
         let (listener_b, port_b) = bound_listener().await;
         drop(listener_a);
@@ -1612,7 +1639,22 @@ mod tests {
 
         let hosts = vec![srv_host("127.0.0.1", port_a), srv_host("127.0.0.1", port_b)];
         match Proxy::from_seed_list(hosts, false, FailoverConfig::disabled()).await {
-            Err(FromUriError::NoPrimary { attempted }) => assert_eq!(attempted, 2),
+            Err(FromUriError::NoPrimary { attempts }) => {
+                assert_eq!(attempts.len(), 2, "both seed-list hosts must be reported");
+                assert!(
+                    attempts
+                        .iter()
+                        .all(|(_, o)| matches!(o, crate::serve::probe::ProbeOutcome::Failed(_))),
+                    "a refused TCP connect must be carried as Failed, got {attempts:?}",
+                );
+                // The refused-connect io::Error must remain reachable
+                // through the error chain for operator diagnostics.
+                let err = FromUriError::NoPrimary { attempts };
+                assert!(
+                    err.to_string().contains("127.0.0.1"),
+                    "the Display summary must name the failed hosts: {err}",
+                );
+            }
             Err(other) => panic!("expected NoPrimary, got {other:?}"),
             Ok(_) => panic!("expected NoPrimary, got a proxy"),
         }

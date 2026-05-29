@@ -25,15 +25,17 @@
 //!   is [`HelloProbe`], which reuses the proxy's own wire-protocol
 //!   [`ProxyClient`](crate::serve::service::ProxyClient) to dial, send
 //!   `hello`, and read the reply.
-//! - [`select_primary`] — iterates SRV hosts in DNS order, awaiting
-//!   each probe under a fixed per-host timeout, and returns the first
-//!   primary it finds.
+//! - [`select_primary`] — probes every SRV host concurrently under a
+//!   fixed per-host timeout and returns as soon as one reports itself
+//!   primary, so selection converges in single-host latency rather than
+//!   the sum of per-host timeouts.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use bson::doc;
 use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use tokio_rustls::TlsConnector;
 use tower_service::Service;
 
@@ -122,13 +124,21 @@ impl PrimaryProbe for HelloProbe {
     }
 }
 
-/// Iterate `hosts` in order, returning the first one whose probe
+/// Probe every host in `hosts` concurrently, returning as soon as one
 /// reports `isWritablePrimary == true`.
 ///
-/// Each probe runs under [`PROBE_TIMEOUT`]; secondaries, probe errors,
-/// and timeouts all fall through to the next host so a single
-/// unreachable replica-set member can't block startup. Returns `None`
-/// only when *every* host has been exhausted without finding a primary.
+/// Each probe runs under its own [`PROBE_TIMEOUT`], and they all race in
+/// parallel: the first confirmed primary wins and the remaining probes
+/// are cancelled (dropped), so selection converges in single-host
+/// latency rather than the sum of per-host timeouts. A slow or
+/// unreachable replica-set member therefore can't delay startup behind
+/// the host that actually answers.
+///
+/// Secondaries (`Ok(Ok(false))`), probe errors (`Ok(Err(_))`), and
+/// timeouts (`Err(_)`) are all ignored. Because we keep draining until a
+/// primary appears, a primary that merely responds slowly is still found
+/// rather than being missed by an early `None`; we return `None` only
+/// once *every* probe has settled without one.
 pub(crate) async fn select_primary<P>(
     hosts: &[crate::srv::SrvHost],
     probe: &P,
@@ -136,15 +146,19 @@ pub(crate) async fn select_primary<P>(
 where
     P: PrimaryProbe + ?Sized,
 {
-    for host in hosts {
-        let outcome = tokio::time::timeout(
-            PROBE_TIMEOUT,
-            probe.is_primary(host.host.clone(), host.port),
-        )
-        .await;
-        // Secondaries (`Ok(Ok(false))`), probe errors (`Ok(Err(_))`),
-        // and timeouts (`Err(_)`) all advance to the next host. Only a
-        // confirmed primary short-circuits the loop.
+    let mut probes: FuturesUnordered<_> = hosts
+        .iter()
+        .map(|host| async move {
+            let outcome = tokio::time::timeout(
+                PROBE_TIMEOUT,
+                probe.is_primary(host.host.clone(), host.port),
+            )
+            .await;
+            (host, outcome)
+        })
+        .collect();
+
+    while let Some((host, outcome)) = probes.next().await {
         if let Ok(Ok(true)) = outcome {
             return Some(host.clone());
         }
@@ -334,5 +348,85 @@ mod tests {
     async fn select_primary_returns_none_for_empty_host_list() {
         let probe = MockPrimaryProbe::new();
         assert!(select_primary(&[], &probe).await.is_none());
+    }
+
+    // ---------- select_primary parallelism ----------
+    //
+    // These use a hand-rolled probe (rather than `MockPrimaryProbe`)
+    // because mockall's `returning` closure can't `.await` a delay, and
+    // run under `start_paused` so virtual time advances deterministically
+    // when every task is idle — no wall-clock flakiness.
+
+    /// Probe whose per-host behaviour is keyed off the host name:
+    /// - `"primary"` answers `Ok(true)` immediately,
+    /// - `"slow-primary"` answers `Ok(true)` only after a long sleep,
+    /// - `"hang"` sleeps far past [`PROBE_TIMEOUT`] before answering,
+    /// - anything else is an immediate secondary (`Ok(false)`).
+    struct ScriptedProbe;
+
+    impl PrimaryProbe for ScriptedProbe {
+        async fn is_primary(&self, host: String, _port: u16) -> Result<bool, ProbeError> {
+            match host.as_str() {
+                "primary" => Ok(true),
+                "slow-primary" => {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    Ok(true)
+                }
+                "hang" => {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                    Ok(false)
+                }
+                _ => Ok(false),
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn select_primary_probes_concurrently_not_serially() {
+        // The primary sits behind a host whose probe would block for an
+        // hour. Serial probing would wait `PROBE_TIMEOUT` on `hang`
+        // before ever reaching the primary; parallel probing returns the
+        // primary immediately, so no virtual time elapses.
+        let hosts = vec![host("hang", 27017), host("primary", 27017)];
+        let start = tokio::time::Instant::now();
+
+        let picked = select_primary(&hosts, &ScriptedProbe)
+            .await
+            .expect("primary");
+
+        assert_eq!(picked.host, "primary");
+        assert!(
+            start.elapsed() < PROBE_TIMEOUT,
+            "selection must not wait out the blocked host before returning the primary",
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn select_primary_waits_for_a_slow_primary() {
+        // Two fast secondaries settle immediately; the only primary
+        // responds slowly. We must keep draining instead of returning
+        // `None` after the quick `Ok(false)`s.
+        let hosts = vec![
+            host("s1", 27017),
+            host("s2", 27017),
+            host("slow-primary", 27017),
+        ];
+
+        let picked = select_primary(&hosts, &ScriptedProbe)
+            .await
+            .expect("primary");
+        assert_eq!(picked.host, "slow-primary");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn select_primary_returns_none_when_every_probe_times_out() {
+        // Every host hangs well past PROBE_TIMEOUT. Each probe's timeout
+        // must elapse (`Err(Elapsed)`), be treated as non-primary, and
+        // the call must still terminate with `None` rather than awaiting
+        // the hour-long sleeps. The paused clock auto-advances to the
+        // timeout instant once all tasks are idle.
+        let hosts = vec![host("hang", 27017), host("hang", 27018)];
+
+        assert!(select_primary(&hosts, &ScriptedProbe).await.is_none());
     }
 }

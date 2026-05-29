@@ -176,10 +176,7 @@ impl Proxy<Identity> {
     /// shared `Arc<TlsConnector>`. [`Proxy::from_srv`] hands in a cell it
     /// also wired a background failover loop to; [`Proxy::new`] hands in a
     /// cell that never changes.
-    fn with_target(
-        target: Arc<RwLock<Target>>,
-        tls_connector: Option<Arc<TlsConnector>>,
-    ) -> Self {
+    fn with_target(target: Arc<RwLock<Target>>, tls_connector: Option<Arc<TlsConnector>>) -> Self {
         Self {
             target,
             tls_connector,
@@ -379,7 +376,7 @@ pub struct FailoverConfig {
 }
 
 impl Default for FailoverConfig {
-    /// Re-probe every [`DEFAULT_REPROBE_INTERVAL`] (60s).
+    /// Re-probe every 60 seconds.
     fn default() -> Self {
         Self {
             reprobe_interval: Some(DEFAULT_REPROBE_INTERVAL),

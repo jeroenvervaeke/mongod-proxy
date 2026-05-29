@@ -515,4 +515,43 @@ mod tests {
             "a 3s budget must elapse before the 8s cold primary answers",
         );
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn select_primary_needs_the_budget_to_reach_a_cold_primary_behind_fast_secondaries() {
+        // The realistic Atlas-order worst case: the secondaries answer
+        // `Ok(false)` instantly, but the actual primary is the cold-starting
+        // node that only replies after 8s. The default budget settles every
+        // host as non-primary before it answers (→ `None`); only a widened
+        // budget reaches it. This proves the budget — not the parallel race
+        // — is what lets the cold primary through.
+        let hosts = vec![
+            host("s1", 27017),
+            host("s2", 27017),
+            host("cold-primary", 27017),
+        ];
+        assert!(
+            select_primary(&hosts, &ScriptedProbe, DEFAULT_PROBE_TIMEOUT)
+                .await
+                .is_none(),
+            "5s default must time out the cold primary even though secondaries answered",
+        );
+        let picked = select_primary(&hosts, &ScriptedProbe, Duration::from_secs(15))
+            .await
+            .expect("widened budget reaches the cold primary behind the secondaries");
+        assert_eq!(picked.host, "cold-primary");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn select_primary_with_a_zero_budget_misses_a_slow_primary() {
+        // The fail-fast extreme: a zero per-host budget elapses before any
+        // host that isn't ready on the first poll, so a cold primary is
+        // missed and the call returns immediately rather than hanging.
+        let hosts = vec![host("cold-primary", 27017)];
+        assert!(
+            select_primary(&hosts, &ScriptedProbe, Duration::ZERO)
+                .await
+                .is_none(),
+            "a zero budget must not wait for the cold primary",
+        );
+    }
 }

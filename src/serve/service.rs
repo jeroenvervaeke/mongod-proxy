@@ -422,7 +422,13 @@ impl Proxy<Identity> {
 /// cold-starts slowly (Atlas free-tier) or sits behind a high-latency
 /// link can widen the budget instead of failing startup with a spurious
 /// [`SrvResolveError::NoPrimary`](crate::srv::SrvResolveError::NoPrimary).
+///
+/// Construct it via [`default`](Self::default), [`every`](Self::every), or
+/// [`disabled`](Self::disabled) and tune with the builder methods
+/// (e.g. [`with_probe_timeout`](Self::with_probe_timeout)); the struct is
+/// `#[non_exhaustive]` so new knobs can be added without breaking callers.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FailoverConfig {
     /// How often to re-resolve SRV and re-select the primary. `None`
     /// disables the background loop entirely: the startup-selected
@@ -1433,6 +1439,29 @@ mod tests {
             .await
             .expect("a widened budget must reach the cold-starting primary");
         assert_eq!(read_target(&cell), ("cold.example.com".to_owned(), 27017));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reselect_seed_list_honours_the_supplied_probe_timeout() {
+        // The seed-list re-probe is the per-tick body of the background
+        // failover loop, which captures `failover.probe_timeout`. A cold
+        // primary mid-failover must still be reachable under a widened
+        // budget — and missed under the default — so the re-probe path is
+        // proven to thread the budget, not just the startup selection.
+        let hosts = vec![srv_host("cold.example.com", 27017)];
+        let probe = ColdPrimaryProbe {
+            delay: Duration::from_secs(8),
+        };
+        assert!(
+            reselect_seed_list(&hosts, &probe, DEFAULT_PROBE_TIMEOUT)
+                .await
+                .is_none(),
+            "default budget must time out the cold primary on re-probe",
+        );
+        let picked = reselect_seed_list(&hosts, &probe, Duration::from_secs(15))
+            .await
+            .expect("widened budget must reach the cold primary on re-probe");
+        assert_eq!(picked, srv_host("cold.example.com", 27017));
     }
 
     // ---------- FailoverConfig probe-timeout knob ----------

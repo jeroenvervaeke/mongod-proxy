@@ -52,6 +52,21 @@ fn install_default_crypto_provider() {
     });
 }
 
+/// Builds the standard rustls client config used by every TLS upstream:
+/// `webpki-roots` trust anchors, no client cert, SNI on. Shared between
+/// [`Proxy::new`] and the SRV primary-selection probes in
+/// [`Proxy::from_srv`].
+pub(crate) fn default_tls_connector() -> Arc<TlsConnector> {
+    install_default_crypto_provider();
+    let mut root_cert_store = RootCertStore::empty();
+    root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let mut config = ClientConfig::builder()
+        .with_root_certificates(root_cert_store)
+        .with_no_client_auth();
+    config.enable_sni = true;
+    Arc::new(TlsConnector::from(Arc::new(config)))
+}
+
 type BoxedAsyncRead = Pin<Box<dyn AsyncRead + Send + Sync + 'static>>;
 type BoxedAsyncWrite = Pin<Box<dyn AsyncWrite + Send + Sync + 'static>>;
 type ServerReader = FramedRead<BoxedAsyncRead, WireDecoder>;
@@ -113,22 +128,19 @@ impl Proxy<Identity> {
     /// only when you specifically need the upstream's topology visible to
     /// drivers.
     pub fn new(destination_name: impl Into<String>, destination_port: u16, use_tls: bool) -> Self {
-        let tls_connector = if use_tls {
-            install_default_crypto_provider();
-            let mut root_cert_store = RootCertStore::empty();
-            root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            let mut config = ClientConfig::builder()
-                .with_root_certificates(root_cert_store)
-                .with_no_client_auth();
-            config.enable_sni = true;
+        let tls_connector = use_tls.then(default_tls_connector);
+        Self::with_tls_connector(destination_name.into(), destination_port, tls_connector)
+    }
 
-            Some(Arc::new(TlsConnector::from(Arc::new(config))))
-        } else {
-            None
-        };
-
+    /// Inner constructor sharing the live `Arc<TlsConnector>` across calls,
+    /// so an `from_srv` probe loop pays the rustls config cost once.
+    fn with_tls_connector(
+        destination_name: String,
+        destination_port: u16,
+        tls_connector: Option<Arc<TlsConnector>>,
+    ) -> Self {
         Self {
-            destination_name: destination_name.into(),
+            destination_name,
             destination_port,
             tls_connector,
             rewrite_hello: true,
@@ -137,35 +149,44 @@ impl Proxy<Identity> {
         }
     }
 
-    /// Creates a new proxy whose upstream is the first host returned by
-    /// an SRV lookup for `srv_hostname` — i.e. the `mongodb+srv://`
-    /// connection-string convention.
+    /// Creates a new proxy whose upstream is the replica-set primary
+    /// among the hosts returned by an SRV lookup for `srv_hostname` —
+    /// i.e. the `mongodb+srv://` connection-string convention.
     ///
-    /// Queries `_mongodb._tcp.<srv_hostname>` (see [`crate::srv`]) and
-    /// uses the first record as the upstream `host:port`. Per the SRV
-    /// spec, TLS to the upstream defaults to enabled; pass `use_tls =
-    /// false` only when forwarding to a test deployment that does not
-    /// terminate TLS itself.
+    /// Queries `_mongodb._tcp.<srv_hostname>` (see [`crate::srv`]),
+    /// then sends a `hello` probe to each candidate in DNS order and
+    /// uses the first node whose reply reports
+    /// `isWritablePrimary == true`. Picking the primary (rather than
+    /// the first SRV record blindly) is what makes the proxy work
+    /// against multi-node Atlas clusters: a secondary would otherwise
+    /// reject every operation with `NotPrimaryNoSecondaryOk` because
+    /// the driver, looking at a [`RewriteHelloLayer`]-stripped hello
+    /// reply, has no signal that it should set the wire-level
+    /// `secondaryOk` flag.
     ///
-    /// The proxy is single-upstream, so subsequent SRV records are
-    /// ignored. The default `hello` / `isMaster` rewrite (see
-    /// [`Proxy::new`]) keeps the driver pinned to this socket instead of
-    /// trying to dial the other replica-set members.
+    /// Per the SRV spec, TLS to the upstream defaults to enabled; pass
+    /// `use_tls = false` only when forwarding to a test deployment that
+    /// does not terminate TLS itself.
     ///
-    /// SRV resolution happens once, here. If the underlying records
-    /// change while the proxy is running, restart the process to
-    /// re-resolve.
+    /// Primary identity is captured *once*, here. If Atlas fails over
+    /// during the proxy's lifetime, the captured node stops being
+    /// primary and forwarded writes will start failing — restart the
+    /// proxy to re-probe (consistent with the existing "restart to
+    /// re-resolve SRV records" lifecycle).
     ///
     /// # Errors
     ///
-    /// See [`crate::srv::SrvResolveError`].
+    /// See [`crate::srv::SrvResolveError`]. New here:
+    /// [`SrvResolveError::NoPrimary`](crate::srv::SrvResolveError::NoPrimary)
+    /// fires when every SRV-resolved host responds (or fails to
+    /// respond) without identifying itself as the primary.
     ///
     /// # Examples
     ///
     /// ```no_run
     /// use mongod_proxy::Proxy;
     /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    /// // `mongodb+srv://cluster0.foo.mongodb.net/` → SRV lookup, first host wins.
+    /// // SRV lookup → probe each candidate → use the primary.
     /// let proxy = Proxy::from_srv("cluster0.foo.mongodb.net", true).await?;
     /// # let _ = proxy;
     /// # Ok(()) }
@@ -175,17 +196,20 @@ impl Proxy<Identity> {
         use_tls: bool,
     ) -> Result<Self, crate::srv::SrvResolveError> {
         let hosts = crate::srv::resolve(srv_hostname).await?;
-        // `resolve` guarantees a non-empty vec on Ok, but re-check the
-        // invariant defensively so a future contract change can't turn
-        // this into a panic — return NoRecords instead.
-        let first =
-            hosts
-                .into_iter()
-                .next()
-                .ok_or_else(|| crate::srv::SrvResolveError::NoRecords {
-                    hostname: srv_hostname.to_owned(),
-                })?;
-        Ok(Self::new(first.host, first.port, use_tls))
+        let tls_connector = use_tls.then(default_tls_connector);
+        let probe = crate::serve::probe::HelloProbe::new(tls_connector.clone());
+        let attempted = hosts.len();
+        let primary = crate::serve::probe::select_primary(&hosts, &probe)
+            .await
+            .ok_or_else(|| crate::srv::SrvResolveError::NoPrimary {
+                hostname: srv_hostname.to_owned(),
+                attempted,
+            })?;
+        Ok(Self::with_tls_connector(
+            primary.host,
+            primary.port,
+            tls_connector,
+        ))
     }
 
     /// Constructs a proxy from any MongoDB connection string — both

@@ -125,6 +125,21 @@ pub enum SrvResolveError {
         /// The offending SRV target.
         target: String,
     },
+    /// SRV records all resolved, but none of the returned hosts
+    /// responded as the replica-set primary within the per-host probe
+    /// timeout. The proxy is single-upstream — without a primary it
+    /// can't safely forward writes (a secondary would reject anything
+    /// without an explicit `secondaryOk` flag the driver only sets when
+    /// it knows it's talking to a replica set, which the
+    /// [`RewriteHelloLayer`](crate::RewriteHelloLayer) deliberately
+    /// hides).
+    #[error("no primary found among {attempted} SRV-resolved hosts for `{hostname}`")]
+    NoPrimary {
+        /// The original hostname passed to [`resolve`].
+        hostname: String,
+        /// How many SRV records the probe loop tried before giving up.
+        attempted: usize,
+    },
 }
 
 /// Performs the underlying DNS SRV query.

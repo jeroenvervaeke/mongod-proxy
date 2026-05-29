@@ -26,9 +26,10 @@
 //!   [`ProxyClient`](crate::serve::service::ProxyClient) to dial, send
 //!   `hello`, and read the reply.
 //! - [`select_primary`] — probes every SRV host concurrently under a
-//!   fixed per-host timeout and returns as soon as one reports itself
-//!   primary, so selection converges in single-host latency rather than
-//!   the sum of per-host timeouts.
+//!   caller-supplied per-host timeout (default [`DEFAULT_PROBE_TIMEOUT`])
+//!   and returns as soon as one reports itself primary, so selection
+//!   converges in single-host latency rather than the sum of per-host
+//!   timeouts.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,10 +48,18 @@ use crate::operation::{
 };
 use crate::serve::service::{ProxyClient, ProxyClientForwardError, ProxyClientRequestError};
 
-/// Per-host budget for the dial + `hello` round-trip during primary
-/// selection. Hosts that don't reply in time are skipped rather than
-/// stalling the proxy startup.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Default per-host budget for the dial + `hello` round-trip during
+/// primary selection. Hosts that don't reply in time are skipped rather
+/// than stalling the proxy startup.
+///
+/// 5s suits the steady-state Atlas case, but a cold-starting free-tier
+/// cluster can take 10-20s to answer its first `hello` and a
+/// high-latency international link can exceed 5s on the TLS handshake
+/// alone. Callers that talk to such deployments widen the budget via
+/// [`FailoverConfig::with_probe_timeout`](crate::FailoverConfig::with_probe_timeout);
+/// local-network tests can shorten it to fail fast. The value is plumbed
+/// into [`select_primary`] rather than read from this constant directly.
+pub(crate) const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Failure modes for a single primary probe.
 #[derive(Debug, thiserror::Error)]
@@ -127,12 +136,19 @@ impl PrimaryProbe for HelloProbe {
 /// Probe every host in `hosts` concurrently, returning as soon as one
 /// reports `isWritablePrimary == true`.
 ///
-/// Each probe runs under its own [`PROBE_TIMEOUT`], and they all race in
-/// parallel: the first confirmed primary wins and the remaining probes
-/// are cancelled (dropped), so selection converges in single-host
-/// latency rather than the sum of per-host timeouts. A slow or
-/// unreachable replica-set member therefore can't delay startup behind
-/// the host that actually answers.
+/// Each probe runs under its own `timeout` budget (see
+/// [`DEFAULT_PROBE_TIMEOUT`] for the default and the rationale for tuning
+/// it), and they all race in parallel: the first confirmed primary wins
+/// and the remaining probes are cancelled (dropped), so selection
+/// converges in single-host latency rather than the sum of per-host
+/// timeouts. A slow or unreachable replica-set member therefore can't
+/// delay startup behind the host that actually answers.
+///
+/// The budget is per host, not for the whole call: a cold-starting
+/// cluster where *every* host is slow at once would still time out at
+/// `timeout` per probe (parallelism can't help when nothing answers
+/// sooner), so a deployment known to cold-start slowly must widen
+/// `timeout` rather than rely on the parallel race.
 ///
 /// Secondaries (`Ok(Ok(false))`), probe errors (`Ok(Err(_))`), and
 /// timeouts (`Err(_)`) are all ignored. Because we keep draining until a
@@ -142,6 +158,7 @@ impl PrimaryProbe for HelloProbe {
 pub(crate) async fn select_primary<P>(
     hosts: &[crate::srv::SrvHost],
     probe: &P,
+    timeout: Duration,
 ) -> Option<crate::srv::SrvHost>
 where
     P: PrimaryProbe + ?Sized,
@@ -149,11 +166,8 @@ where
     let mut probes: FuturesUnordered<_> = hosts
         .iter()
         .map(|host| async move {
-            let outcome = tokio::time::timeout(
-                PROBE_TIMEOUT,
-                probe.is_primary(host.host.clone(), host.port),
-            )
-            .await;
+            let outcome =
+                tokio::time::timeout(timeout, probe.is_primary(host.host.clone(), host.port)).await;
             (host, outcome)
         })
         .collect();
@@ -288,7 +302,9 @@ mod tests {
             .expect_is_primary()
             .returning(|name, _port| Ok(name == "a"));
 
-        let picked = select_primary(&hosts, &probe).await.expect("primary");
+        let picked = select_primary(&hosts, &probe, DEFAULT_PROBE_TIMEOUT)
+            .await
+            .expect("primary");
         assert_eq!(picked.host, "a");
     }
 
@@ -302,7 +318,9 @@ mod tests {
             .expect_is_primary()
             .returning(|name, _port| Ok(name == "c"));
 
-        let picked = select_primary(&hosts, &probe).await.expect("primary");
+        let picked = select_primary(&hosts, &probe, DEFAULT_PROBE_TIMEOUT)
+            .await
+            .expect("primary");
         assert_eq!(picked.host, "c");
     }
 
@@ -320,7 +338,9 @@ mod tests {
             }
         });
 
-        let picked = select_primary(&hosts, &probe).await.expect("primary");
+        let picked = select_primary(&hosts, &probe, DEFAULT_PROBE_TIMEOUT)
+            .await
+            .expect("primary");
         assert_eq!(picked.host, "b");
     }
 
@@ -330,7 +350,11 @@ mod tests {
         let mut probe = MockPrimaryProbe::new();
         probe.expect_is_primary().returning(|_, _| Ok(false));
 
-        assert!(select_primary(&hosts, &probe).await.is_none());
+        assert!(
+            select_primary(&hosts, &probe, DEFAULT_PROBE_TIMEOUT)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -341,13 +365,21 @@ mod tests {
             .expect_is_primary()
             .returning(|_, _| Err(ProbeError::NoReply));
 
-        assert!(select_primary(&hosts, &probe).await.is_none());
+        assert!(
+            select_primary(&hosts, &probe, DEFAULT_PROBE_TIMEOUT)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
     async fn select_primary_returns_none_for_empty_host_list() {
         let probe = MockPrimaryProbe::new();
-        assert!(select_primary(&[], &probe).await.is_none());
+        assert!(
+            select_primary(&[], &probe, DEFAULT_PROBE_TIMEOUT)
+                .await
+                .is_none()
+        );
     }
 
     // ---------- select_primary parallelism ----------
@@ -360,7 +392,7 @@ mod tests {
     /// Probe whose per-host behaviour is keyed off the host name:
     /// - `"primary"` answers `Ok(true)` immediately,
     /// - `"slow-primary"` answers `Ok(true)` only after a long sleep,
-    /// - `"hang"` sleeps far past [`PROBE_TIMEOUT`] before answering,
+    /// - `"hang"` sleeps far past [`DEFAULT_PROBE_TIMEOUT`] before answering,
     /// - anything else is an immediate secondary (`Ok(false)`).
     struct ScriptedProbe;
 
@@ -370,6 +402,13 @@ mod tests {
                 "primary" => Ok(true),
                 "slow-primary" => {
                     tokio::time::sleep(Duration::from_secs(2)).await;
+                    Ok(true)
+                }
+                // An Atlas free-tier cluster cold-starting: the host is
+                // healthy and is the primary, but doesn't answer its first
+                // `hello` until ~8s in — past the 5s default budget.
+                "cold-primary" => {
+                    tokio::time::sleep(Duration::from_secs(8)).await;
                     Ok(true)
                 }
                 "hang" => {
@@ -384,19 +423,19 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn select_primary_probes_concurrently_not_serially() {
         // The primary sits behind a host whose probe would block for an
-        // hour. Serial probing would wait `PROBE_TIMEOUT` on `hang`
+        // hour. Serial probing would wait `DEFAULT_PROBE_TIMEOUT` on `hang`
         // before ever reaching the primary; parallel probing returns the
         // primary immediately, so no virtual time elapses.
         let hosts = vec![host("hang", 27017), host("primary", 27017)];
         let start = tokio::time::Instant::now();
 
-        let picked = select_primary(&hosts, &ScriptedProbe)
+        let picked = select_primary(&hosts, &ScriptedProbe, DEFAULT_PROBE_TIMEOUT)
             .await
             .expect("primary");
 
         assert_eq!(picked.host, "primary");
         assert!(
-            start.elapsed() < PROBE_TIMEOUT,
+            start.elapsed() < DEFAULT_PROBE_TIMEOUT,
             "selection must not wait out the blocked host before returning the primary",
         );
     }
@@ -412,7 +451,7 @@ mod tests {
             host("slow-primary", 27017),
         ];
 
-        let picked = select_primary(&hosts, &ScriptedProbe)
+        let picked = select_primary(&hosts, &ScriptedProbe, DEFAULT_PROBE_TIMEOUT)
             .await
             .expect("primary");
         assert_eq!(picked.host, "slow-primary");
@@ -420,13 +459,99 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn select_primary_returns_none_when_every_probe_times_out() {
-        // Every host hangs well past PROBE_TIMEOUT. Each probe's timeout
+        // Every host hangs well past DEFAULT_PROBE_TIMEOUT. Each probe's timeout
         // must elapse (`Err(Elapsed)`), be treated as non-primary, and
         // the call must still terminate with `None` rather than awaiting
         // the hour-long sleeps. The paused clock auto-advances to the
         // timeout instant once all tasks are idle.
         let hosts = vec![host("hang", 27017), host("hang", 27018)];
 
-        assert!(select_primary(&hosts, &ScriptedProbe).await.is_none());
+        assert!(
+            select_primary(&hosts, &ScriptedProbe, DEFAULT_PROBE_TIMEOUT)
+                .await
+                .is_none()
+        );
+    }
+
+    // ---------- select_primary configurable per-host timeout (#27) ----------
+
+    #[tokio::test(start_paused = true)]
+    async fn select_primary_misses_a_cold_primary_under_the_default_timeout() {
+        // Regression for #27: an Atlas free-tier cluster can take 10-20s to
+        // answer its first `hello` while it cold-starts, and *every* host is
+        // slow at once — so parallel probing (#17) doesn't help. Under the
+        // 5s default budget every probe times out and selection falsely
+        // reports no primary for a perfectly healthy cluster.
+        let hosts = vec![host("cold-primary", 27017)];
+        assert!(
+            select_primary(&hosts, &ScriptedProbe, DEFAULT_PROBE_TIMEOUT)
+                .await
+                .is_none(),
+            "the 5s default is too short to reach a cold-starting primary",
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn select_primary_finds_a_cold_primary_under_a_longer_timeout() {
+        // The fix: widening the per-host probe budget lets the same
+        // cold-starting primary be selected instead of failing startup.
+        let hosts = vec![host("cold-primary", 27017)];
+        let picked = select_primary(&hosts, &ScriptedProbe, Duration::from_secs(15))
+            .await
+            .expect("a generous timeout must reach the cold-starting primary");
+        assert_eq!(picked.host, "cold-primary");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn select_primary_honours_a_tight_per_host_timeout() {
+        // The supplied timeout is the per-host budget: a primary answering
+        // after it elapses is missed, and the call still terminates promptly
+        // rather than waiting out the full 8s probe.
+        let hosts = vec![host("cold-primary", 27017)];
+        assert!(
+            select_primary(&hosts, &ScriptedProbe, Duration::from_secs(3))
+                .await
+                .is_none(),
+            "a 3s budget must elapse before the 8s cold primary answers",
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn select_primary_needs_the_budget_to_reach_a_cold_primary_behind_fast_secondaries() {
+        // The realistic Atlas-order worst case: the secondaries answer
+        // `Ok(false)` instantly, but the actual primary is the cold-starting
+        // node that only replies after 8s. The default budget settles every
+        // host as non-primary before it answers (→ `None`); only a widened
+        // budget reaches it. This proves the budget — not the parallel race
+        // — is what lets the cold primary through.
+        let hosts = vec![
+            host("s1", 27017),
+            host("s2", 27017),
+            host("cold-primary", 27017),
+        ];
+        assert!(
+            select_primary(&hosts, &ScriptedProbe, DEFAULT_PROBE_TIMEOUT)
+                .await
+                .is_none(),
+            "5s default must time out the cold primary even though secondaries answered",
+        );
+        let picked = select_primary(&hosts, &ScriptedProbe, Duration::from_secs(15))
+            .await
+            .expect("widened budget reaches the cold primary behind the secondaries");
+        assert_eq!(picked.host, "cold-primary");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn select_primary_with_a_zero_budget_misses_a_slow_primary() {
+        // The fail-fast extreme: a zero per-host budget elapses before any
+        // host that isn't ready on the first poll, so a cold primary is
+        // missed and the call returns immediately rather than hanging.
+        let hosts = vec![host("cold-primary", 27017)];
+        assert!(
+            select_primary(&hosts, &ScriptedProbe, Duration::ZERO)
+                .await
+                .is_none(),
+            "a zero budget must not wait for the cold primary",
+        );
     }
 }

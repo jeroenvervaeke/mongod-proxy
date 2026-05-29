@@ -113,6 +113,14 @@ target if the replica set fails over, so the proxy recovers without a
 restart. Use `Proxy::from_srv_with(hostname, use_tls, FailoverConfig::…)`
 to tune the interval or opt out of the background loop for SRV URIs.
 
+Primary selection probes each candidate with a 5s per-host budget by
+default. A cluster that cold-starts slowly (Atlas free-tier, which can
+take 10–20s to answer its first `hello`) or one behind a high-latency
+link can exceed that and fail startup with a spurious "no primary"; widen
+the budget with
+`FailoverConfig::default().with_probe_timeout(Duration::from_secs(20))`
+(or shorten it to fail fast on a local network).
+
 Everything else in the URI — user/password, database name, every option
 beyond `tls` / `ssl` — is intentionally *dropped*. The proxy is
 wire-level; the client driver forwards those options to the upstream

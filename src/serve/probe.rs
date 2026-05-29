@@ -83,6 +83,69 @@ pub enum ProbeError {
     MalformedReply,
 }
 
+/// Why a single SRV candidate was *not* chosen as the primary.
+///
+/// `select_primary` records one of these per host whenever no host
+/// reports itself primary, so the
+/// [`NoPrimary`](crate::SrvResolveError::NoPrimary) error returned to the
+/// operator can explain *why* each candidate was rejected. The bare
+/// attempted-count the proxy used to surface collapsed four very
+/// different failures — a refused TCP connect, a TLS handshake error, a
+/// healthy secondary, and a probe that never answered — into a single
+/// opaque number; an operator could not tell a network-policy problem
+/// from an in-progress election from a cert mismatch.
+#[derive(Debug, thiserror::Error)]
+pub enum ProbeOutcome {
+    /// The host answered `hello` but reported `isWritablePrimary: false`
+    /// (a secondary, arbiter, or other non-primary member) — the replica
+    /// set is reachable but this node isn't currently the primary.
+    #[error("responded as a non-primary member")]
+    NotPrimary,
+    /// The probe could not complete: the TCP/TLS connect was refused, the
+    /// socket closed before a reply arrived, or the `hello` reply was
+    /// malformed. The underlying [`ProbeError`] is kept as the error
+    /// `source`, so the full `ProbeError` → `ProxyClientForwardError` →
+    /// `io::Error` / TLS chain stays inspectable via
+    /// [`std::error::Error::source`].
+    #[error("probe failed: {0}")]
+    Failed(#[from] ProbeError),
+    /// The probe did not finish within the per-host timeout budget (see
+    /// `DEFAULT_PROBE_TIMEOUT`). The host may simply be cold-starting and
+    /// slow to answer its first `hello`.
+    #[error("timed out")]
+    TimedOut,
+}
+
+/// Outcome of probing every SRV candidate in [`select_primary`].
+///
+/// Either one host won the race by reporting itself primary, or every
+/// host settled without one — in which case the per-host
+/// [`ProbeOutcome`]s are carried out so the caller can build a
+/// diagnostic [`NoPrimary`](crate::SrvResolveError::NoPrimary).
+pub(crate) enum Selection {
+    /// A candidate reported `isWritablePrimary == true`; it becomes the
+    /// upstream.
+    Primary(crate::srv::SrvHost),
+    /// No candidate did. Carries each probed host paired with the reason
+    /// it was rejected, in probe-completion order.
+    NoPrimary(Vec<(crate::srv::SrvHost, ProbeOutcome)>),
+}
+
+impl Selection {
+    /// The selected primary, or `None` when no host qualified.
+    ///
+    /// Used by the background failover loop, which only needs the winner
+    /// and logs its own "kept current target" message on `None` — the
+    /// per-host rejection reasons matter only for the *startup* error the
+    /// caller surfaces, not for a steady-state re-probe tick.
+    pub(crate) fn into_primary(self) -> Option<crate::srv::SrvHost> {
+        match self {
+            Selection::Primary(host) => Some(host),
+            Selection::NoPrimary(_) => None,
+        }
+    }
+}
+
 /// Single-host probe used by [`select_primary`].
 ///
 /// Behind a trait so [`select_primary`]'s iteration / timeout / error
@@ -150,16 +213,21 @@ impl PrimaryProbe for HelloProbe {
 /// sooner), so a deployment known to cold-start slowly must widen
 /// `timeout` rather than rely on the parallel race.
 ///
-/// Secondaries (`Ok(Ok(false))`), probe errors (`Ok(Err(_))`), and
-/// timeouts (`Err(_)`) are all ignored. Because we keep draining until a
-/// primary appears, a primary that merely responds slowly is still found
-/// rather than being missed by an early `None`; we return `None` only
+/// Because we keep draining until a primary appears, a primary that
+/// merely responds slowly is still found rather than being missed by an
+/// early [`NoPrimary`](Selection::NoPrimary); we report no primary only
 /// once *every* probe has settled without one.
+///
+/// On that no-primary path each host is paired with the reason it was
+/// rejected — a secondary reply ([`ProbeOutcome::NotPrimary`]), a probe
+/// failure ([`ProbeOutcome::Failed`]), or a timeout
+/// ([`ProbeOutcome::TimedOut`]) — so the caller can surface *why* startup
+/// found no primary rather than just *how many* hosts it tried.
 pub(crate) async fn select_primary<P>(
     hosts: &[crate::srv::SrvHost],
     probe: &P,
     timeout: Duration,
-) -> Option<crate::srv::SrvHost>
+) -> Selection
 where
     P: PrimaryProbe + ?Sized,
 {
@@ -172,12 +240,20 @@ where
         })
         .collect();
 
+    let mut rejected = Vec::new();
     while let Some((host, outcome)) = probes.next().await {
-        if let Ok(Ok(true)) = outcome {
-            return Some(host.clone());
-        }
+        let reason = match outcome {
+            // The first confirmed primary wins; remaining probes are
+            // dropped, so their (now irrelevant) outcomes are never
+            // gathered.
+            Ok(Ok(true)) => return Selection::Primary(host.clone()),
+            Ok(Ok(false)) => ProbeOutcome::NotPrimary,
+            Ok(Err(e)) => ProbeOutcome::Failed(e),
+            Err(_elapsed) => ProbeOutcome::TimedOut,
+        };
+        rejected.push((host.clone(), reason));
     }
-    None
+    Selection::NoPrimary(rejected)
 }
 
 fn build_hello_request() -> Message {
@@ -304,6 +380,7 @@ mod tests {
 
         let picked = select_primary(&hosts, &probe, DEFAULT_PROBE_TIMEOUT)
             .await
+            .into_primary()
             .expect("primary");
         assert_eq!(picked.host, "a");
     }
@@ -320,6 +397,7 @@ mod tests {
 
         let picked = select_primary(&hosts, &probe, DEFAULT_PROBE_TIMEOUT)
             .await
+            .into_primary()
             .expect("primary");
         assert_eq!(picked.host, "c");
     }
@@ -340,6 +418,7 @@ mod tests {
 
         let picked = select_primary(&hosts, &probe, DEFAULT_PROBE_TIMEOUT)
             .await
+            .into_primary()
             .expect("primary");
         assert_eq!(picked.host, "b");
     }
@@ -353,6 +432,7 @@ mod tests {
         assert!(
             select_primary(&hosts, &probe, DEFAULT_PROBE_TIMEOUT)
                 .await
+                .into_primary()
                 .is_none()
         );
     }
@@ -368,6 +448,7 @@ mod tests {
         assert!(
             select_primary(&hosts, &probe, DEFAULT_PROBE_TIMEOUT)
                 .await
+                .into_primary()
                 .is_none()
         );
     }
@@ -378,6 +459,7 @@ mod tests {
         assert!(
             select_primary(&[], &probe, DEFAULT_PROBE_TIMEOUT)
                 .await
+                .into_primary()
                 .is_none()
         );
     }
@@ -431,6 +513,7 @@ mod tests {
 
         let picked = select_primary(&hosts, &ScriptedProbe, DEFAULT_PROBE_TIMEOUT)
             .await
+            .into_primary()
             .expect("primary");
 
         assert_eq!(picked.host, "primary");
@@ -453,6 +536,7 @@ mod tests {
 
         let picked = select_primary(&hosts, &ScriptedProbe, DEFAULT_PROBE_TIMEOUT)
             .await
+            .into_primary()
             .expect("primary");
         assert_eq!(picked.host, "slow-primary");
     }
@@ -469,6 +553,7 @@ mod tests {
         assert!(
             select_primary(&hosts, &ScriptedProbe, DEFAULT_PROBE_TIMEOUT)
                 .await
+                .into_primary()
                 .is_none()
         );
     }
@@ -486,6 +571,7 @@ mod tests {
         assert!(
             select_primary(&hosts, &ScriptedProbe, DEFAULT_PROBE_TIMEOUT)
                 .await
+                .into_primary()
                 .is_none(),
             "the 5s default is too short to reach a cold-starting primary",
         );
@@ -498,6 +584,7 @@ mod tests {
         let hosts = vec![host("cold-primary", 27017)];
         let picked = select_primary(&hosts, &ScriptedProbe, Duration::from_secs(15))
             .await
+            .into_primary()
             .expect("a generous timeout must reach the cold-starting primary");
         assert_eq!(picked.host, "cold-primary");
     }
@@ -511,6 +598,7 @@ mod tests {
         assert!(
             select_primary(&hosts, &ScriptedProbe, Duration::from_secs(3))
                 .await
+                .into_primary()
                 .is_none(),
             "a 3s budget must elapse before the 8s cold primary answers",
         );
@@ -532,11 +620,13 @@ mod tests {
         assert!(
             select_primary(&hosts, &ScriptedProbe, DEFAULT_PROBE_TIMEOUT)
                 .await
+                .into_primary()
                 .is_none(),
             "5s default must time out the cold primary even though secondaries answered",
         );
         let picked = select_primary(&hosts, &ScriptedProbe, Duration::from_secs(15))
             .await
+            .into_primary()
             .expect("widened budget reaches the cold primary behind the secondaries");
         assert_eq!(picked.host, "cold-primary");
     }
@@ -550,8 +640,150 @@ mod tests {
         assert!(
             select_primary(&hosts, &ScriptedProbe, Duration::ZERO)
                 .await
+                .into_primary()
                 .is_none(),
             "a zero budget must not wait for the cold primary",
         );
+    }
+
+    // ---------- select_primary per-host outcomes (#20) ----------
+    //
+    // When no host is the primary, the rejected hosts must be carried out
+    // of the race paired with *why* — a secondary reply, a probe failure,
+    // or a timeout — so the caller can turn the bare attempted-count into
+    // an actionable diagnosis (network policy vs in-progress election vs
+    // cert mismatch all looked identical before).
+
+    /// Probe that produces a different rejection reason per host so a
+    /// single race exercises all three [`ProbeOutcome`] variants:
+    /// `"secondary"` answers `Ok(false)`, `"dead"` fails the probe, and
+    /// `"hang"` never answers (→ timeout under a finite budget).
+    struct MixedProbe;
+
+    impl PrimaryProbe for MixedProbe {
+        async fn is_primary(&self, host: String, _port: u16) -> Result<bool, ProbeError> {
+            match host.as_str() {
+                "secondary" => Ok(false),
+                "dead" => Err(ProbeError::NoReply),
+                "hang" => {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                    Ok(false)
+                }
+                other => panic!("unexpected host {other}"),
+            }
+        }
+    }
+
+    fn no_primary(selection: Selection) -> Vec<(SrvHost, ProbeOutcome)> {
+        match selection {
+            Selection::NoPrimary(attempts) => attempts,
+            Selection::Primary(host) => panic!("expected NoPrimary, got primary {host:?}"),
+        }
+    }
+
+    fn outcome_for<'a>(attempts: &'a [(SrvHost, ProbeOutcome)], name: &str) -> &'a ProbeOutcome {
+        &attempts
+            .iter()
+            .find(|(h, _)| h.host == name)
+            .unwrap_or_else(|| panic!("no attempt recorded for host {name}"))
+            .1
+    }
+
+    #[tokio::test]
+    async fn select_primary_records_not_primary_for_every_secondary() {
+        let hosts = vec![host("a", 27017), host("b", 27017)];
+        let mut probe = MockPrimaryProbe::new();
+        probe.expect_is_primary().returning(|_, _| Ok(false));
+
+        let attempts = no_primary(select_primary(&hosts, &probe, DEFAULT_PROBE_TIMEOUT).await);
+        assert_eq!(attempts.len(), 2, "every probed host must be reported");
+        assert!(
+            attempts
+                .iter()
+                .all(|(_, o)| matches!(o, ProbeOutcome::NotPrimary)),
+            "a host answering isWritablePrimary:false is NotPrimary, got {attempts:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn select_primary_records_failed_and_preserves_the_probe_error_source() {
+        let hosts = vec![host("a", 27017)];
+        let mut probe = MockPrimaryProbe::new();
+        probe
+            .expect_is_primary()
+            .returning(|_, _| Err(ProbeError::NoReply));
+
+        let attempts = no_primary(select_primary(&hosts, &probe, DEFAULT_PROBE_TIMEOUT).await);
+        assert_eq!(attempts.len(), 1);
+        assert!(
+            matches!(&attempts[0].1, ProbeOutcome::Failed(ProbeError::NoReply)),
+            "a probe error must be carried as Failed, got {:?}",
+            attempts[0].1,
+        );
+        // The original ProbeError (and its io/TLS chain) must stay reachable
+        // via the standard error `source`, per the issue's "Care for" note.
+        assert!(
+            std::error::Error::source(&attempts[0].1).is_some(),
+            "Failed must expose the ProbeError as its source",
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn select_primary_records_timed_out_for_a_host_past_the_budget() {
+        // `hang` sleeps an hour; under a finite budget its probe elapses
+        // and must be reported as TimedOut, distinct from a probe failure.
+        let hosts = vec![host("hang", 27017)];
+        let attempts =
+            no_primary(select_primary(&hosts, &MixedProbe, Duration::from_secs(5)).await);
+        assert_eq!(attempts.len(), 1);
+        assert!(
+            matches!(attempts[0].1, ProbeOutcome::TimedOut),
+            "a probe exceeding the budget is TimedOut, got {:?}",
+            attempts[0].1,
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn select_primary_keys_each_distinct_outcome_to_the_right_host() {
+        // The realistic failed-startup picture: one secondary, one
+        // unreachable host, one that never answers. All three reasons must
+        // survive, keyed to the host they came from.
+        let hosts = vec![
+            host("secondary", 27017),
+            host("dead", 27017),
+            host("hang", 27017),
+        ];
+        let attempts =
+            no_primary(select_primary(&hosts, &MixedProbe, Duration::from_secs(5)).await);
+
+        assert_eq!(attempts.len(), 3);
+        assert!(matches!(
+            outcome_for(&attempts, "secondary"),
+            ProbeOutcome::NotPrimary
+        ));
+        assert!(matches!(
+            outcome_for(&attempts, "dead"),
+            ProbeOutcome::Failed(_)
+        ));
+        assert!(matches!(
+            outcome_for(&attempts, "hang"),
+            ProbeOutcome::TimedOut
+        ));
+    }
+
+    #[tokio::test]
+    async fn select_primary_returns_primary_variant_without_collecting_outcomes() {
+        // The happy path stays a clean `Primary`: finding the primary
+        // short-circuits the race, so no rejection reasons are gathered.
+        let hosts = vec![host("primary", 27017), host("secondary", 27017)];
+        let mut probe = MockPrimaryProbe::new();
+        probe
+            .expect_is_primary()
+            .returning(|name, _| Ok(name == "primary"));
+
+        match select_primary(&hosts, &probe, DEFAULT_PROBE_TIMEOUT).await {
+            Selection::Primary(host) => assert_eq!(host.host, "primary"),
+            Selection::NoPrimary(attempts) => panic!("expected Primary, got {attempts:?}"),
+        }
     }
 }

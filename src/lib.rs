@@ -82,6 +82,7 @@ pub use serve::explain::{
 };
 pub use serve::{
     log::LogLayer,
+    probe::{ProbeError, ProbeOutcome},
     rewrite_hello::{RewriteHelloLayer, RewriteHelloService, RewriteHelloStream},
     serve,
     service::{FailoverConfig, FromUriError, Proxy},

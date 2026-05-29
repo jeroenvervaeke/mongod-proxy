@@ -133,13 +133,48 @@ pub enum SrvResolveError {
     /// it knows it's talking to a replica set, which the
     /// [`RewriteHelloLayer`](crate::RewriteHelloLayer) deliberately
     /// hides).
-    #[error("no primary found among {attempted} SRV-resolved hosts for `{hostname}`")]
+    ///
+    /// `attempts` pairs every probed host with the reason it was rejected
+    /// (a [`ProbeOutcome`](crate::ProbeOutcome)) so an operator can tell apart "every host
+    /// refused the TCP connect" (network policy), "the TLS handshake
+    /// failed everywhere" (cert / SNI), and "every host answered but none
+    /// is primary" (an election in progress). The
+    /// [`Failed`](crate::ProbeOutcome::Failed) variant keeps the
+    /// underlying [`ProbeError`](crate::ProbeError) chain — and through it
+    /// the `io::Error` / TLS error — reachable via
+    /// [`std::error::Error::source`].
+    #[error(
+        "no primary found among {} SRV-resolved hosts for `{hostname}` ({})",
+        attempts.len(),
+        summarise_attempts(attempts)
+    )]
     NoPrimary {
         /// The original hostname passed to [`resolve`].
         hostname: String,
-        /// How many SRV records the probe loop tried before giving up.
-        attempted: usize,
+        /// Every probed host paired with why it was rejected, in
+        /// probe-completion order. `attempts.len()` is the number of
+        /// hosts tried.
+        attempts: Vec<(SrvHost, crate::serve::probe::ProbeOutcome)>,
     },
+}
+
+/// Renders the per-host probe outcomes into a compact, single-line
+/// summary for [`SrvResolveError::NoPrimary`]'s `Display`, e.g.
+/// `a:27017 timed out; b:27017 responded as a non-primary member`. The
+/// structured `attempts` field stays available for callers that want to
+/// inspect each [`ProbeOutcome`](crate::serve::probe::ProbeOutcome)
+/// programmatically.
+pub(crate) fn summarise_attempts(
+    attempts: &[(SrvHost, crate::serve::probe::ProbeOutcome)],
+) -> String {
+    if attempts.is_empty() {
+        return "no hosts probed".to_owned();
+    }
+    attempts
+        .iter()
+        .map(|(host, outcome)| format!("{}:{} {outcome}", host.host, host.port))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Performs the underlying DNS SRV query.

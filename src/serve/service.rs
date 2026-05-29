@@ -266,16 +266,12 @@ impl Proxy<Identity> {
         let tls_connector = use_tls.then(default_tls_connector);
         let probe = crate::serve::probe::HelloProbe::new(tls_connector.clone());
         let attempted = hosts.len();
-        let primary = crate::serve::probe::select_primary(&hosts, &probe)
-            .await
-            .ok_or_else(|| crate::srv::SrvResolveError::NoPrimary {
+        let target = select_target(&hosts, &probe).await.ok_or_else(|| {
+            crate::srv::SrvResolveError::NoPrimary {
                 hostname: srv_hostname.to_owned(),
                 attempted,
-            })?;
-        let target = Arc::new(RwLock::new(Target {
-            host: primary.host,
-            port: primary.port,
-        }));
+            }
+        })?;
 
         if let Some(interval) = failover.reprobe_interval {
             let hostname = srv_hostname.to_owned();
@@ -298,12 +294,26 @@ impl Proxy<Identity> {
     /// `mongodb://host[:port][,host[:port]…]/…` and
     /// `mongodb+srv://hostname/…` are accepted.
     ///
-    /// Callers don't have to inspect the scheme themselves: this routes
-    /// to [`Proxy::new`] for plain URIs and to [`Proxy::from_srv`] for
-    /// SRV URIs. For multi-host plain URIs the first host wins (the
-    /// proxy is single-upstream); the default
-    /// [`hello` rewrite](crate::RewriteHelloLayer) keeps the client
-    /// driver pinned to the proxy socket regardless.
+    /// Callers don't have to inspect the scheme themselves; this routes
+    /// by scheme and host count:
+    ///
+    /// - **Single-host `mongodb://host[:port]/`** → [`Proxy::new`], no
+    ///   probe. The caller named exactly one host, so it's used verbatim.
+    /// - **Multi-host `mongodb://h1,h2,h3/`** → the same probe-and-select
+    ///   path as the SRV branch: each host is sent a `hello` and the one
+    ///   reporting `isWritablePrimary == true` becomes the upstream. A
+    ///   replica-set seed list lists every member, so forwarding to the
+    ///   first one blindly would land on a secondary and break every
+    ///   operation with `NotPrimaryNoSecondaryOk` (the
+    ///   [`hello` rewrite](crate::RewriteHelloLayer) deliberately hides
+    ///   the topology signal a driver would otherwise use to set
+    ///   `secondaryOk`). The selected primary is also kept current by the
+    ///   same background failover loop as [`from_srv`](Self::from_srv),
+    ///   re-probing the seed list on the default interval.
+    /// - **`mongodb+srv://hostname/`** → [`Proxy::from_srv`].
+    ///
+    /// The default [`hello` rewrite](crate::RewriteHelloLayer) keeps the
+    /// client driver pinned to the proxy socket in every case.
     ///
     /// TLS follows the URI:
     ///
@@ -320,8 +330,10 @@ impl Proxy<Identity> {
     /// # Errors
     ///
     /// Returns [`FromUriError::Parse`] for any URI shape rejected by
-    /// [`crate::uri::ConnectionUriError`], or [`FromUriError::Srv`] if
-    /// the SRV lookup fails on a `mongodb+srv://` URI.
+    /// [`crate::uri::ConnectionUriError`], [`FromUriError::Srv`] if the
+    /// SRV lookup fails on a `mongodb+srv://` URI, or
+    /// [`FromUriError::NoPrimary`] if a multi-host seed list resolves but
+    /// none of its hosts responds as the primary.
     ///
     /// # Examples
     ///
@@ -338,21 +350,55 @@ impl Proxy<Identity> {
     /// ```
     pub async fn from_uri(uri: &str) -> Result<Self, FromUriError> {
         let parsed = crate::uri::parse(uri).map_err(FromUriError::Parse)?;
-        match parsed.scheme {
-            crate::uri::Scheme::Mongodb => {
-                // Spec default for non-SRV URIs: TLS off, port 27017.
-                let port = parsed.port.unwrap_or(27017);
-                let use_tls = parsed.tls.unwrap_or(false);
-                Ok(Self::new(parsed.host, port, use_tls))
+        match route(parsed)? {
+            UriRoute::Single {
+                host,
+                port,
+                use_tls,
+            } => Ok(Self::new(host, port, use_tls)),
+            UriRoute::SeedList { hosts, use_tls } => {
+                Self::from_seed_list(hosts, use_tls, FailoverConfig::default()).await
             }
-            crate::uri::Scheme::MongodbSrv => {
-                // Spec default for SRV URIs: TLS on.
-                let use_tls = parsed.tls.unwrap_or(true);
-                Self::from_srv(&parsed.host, use_tls)
-                    .await
-                    .map_err(FromUriError::Srv)
-            }
+            UriRoute::Srv { hostname, use_tls } => Self::from_srv(&hostname, use_tls)
+                .await
+                .map_err(FromUriError::Srv),
         }
+    }
+
+    /// Builds a proxy from an explicit replica-set seed list by probing
+    /// each host for the primary, then (unless disabled) keeping it
+    /// current with the same background failover loop as
+    /// [`from_srv`](Self::from_srv) — except there's no DNS to re-resolve,
+    /// so each tick re-probes the same static `hosts`.
+    ///
+    /// This is the multi-host `mongodb://h1,h2,h3/` arm of
+    /// [`from_uri`](Self::from_uri). Single-host URIs don't come through
+    /// here: with one named host there's nothing to select.
+    async fn from_seed_list(
+        hosts: Vec<crate::srv::SrvHost>,
+        use_tls: bool,
+        failover: FailoverConfig,
+    ) -> Result<Self, FromUriError> {
+        let tls_connector = use_tls.then(default_tls_connector);
+        let probe = crate::serve::probe::HelloProbe::new(tls_connector.clone());
+        let target = select_target(&hosts, &probe)
+            .await
+            .ok_or(FromUriError::NoPrimary {
+                attempted: hosts.len(),
+            })?;
+
+        if let Some(interval) = failover.reprobe_interval {
+            let tls = tls_connector.clone();
+            // The seed list is static — no DNS to re-resolve — so each
+            // tick simply re-probes the same hosts for the current primary.
+            spawn_reprobe_loop(interval, &target, move || {
+                let probe = crate::serve::probe::HelloProbe::new(tls.clone());
+                let hosts = hosts.clone();
+                async move { reselect_seed_list(&hosts, &probe).await }
+            });
+        }
+
+        Ok(Self::with_target(target, tls_connector))
     }
 }
 
@@ -399,6 +445,45 @@ impl FailoverConfig {
             reprobe_interval: None,
         }
     }
+}
+
+/// Probe `hosts` for the replica-set primary and, when one is found,
+/// wrap it in the swappable [`Target`] cell every constructor shares.
+///
+/// Returns `None` when no host responds as the primary. Generic over the
+/// probe so the multi-host selection wiring can be unit-tested with a
+/// mock instead of real sockets.
+async fn select_target<P>(hosts: &[crate::srv::SrvHost], probe: &P) -> Option<Arc<RwLock<Target>>>
+where
+    P: crate::serve::probe::PrimaryProbe + ?Sized,
+{
+    let primary = crate::serve::probe::select_primary(hosts, probe).await?;
+    Some(Arc::new(RwLock::new(Target {
+        host: primary.host,
+        port: primary.port,
+    })))
+}
+
+/// Re-probe a static seed list for the current primary, returning the
+/// chosen host or `None` (logging the reason) when none responds as
+/// primary. The seed-list counterpart of [`resolve_and_select`]; used as
+/// the per-tick body of the background failover loop for multi-host
+/// `mongodb://` URIs, which have no DNS to re-resolve.
+async fn reselect_seed_list<P>(
+    hosts: &[crate::srv::SrvHost],
+    probe: &P,
+) -> Option<crate::srv::SrvHost>
+where
+    P: crate::serve::probe::PrimaryProbe + ?Sized,
+{
+    let picked = crate::serve::probe::select_primary(hosts, probe).await;
+    if picked.is_none() {
+        warn!(
+            hosts = hosts.len(),
+            "failover re-probe found no primary among seed-list hosts; keeping current upstream target"
+        );
+    }
+    picked
 }
 
 /// Re-resolve SRV for `hostname` and re-select the replica-set primary,
@@ -490,6 +575,86 @@ where
     })
 }
 
+/// Which [`Proxy`] constructor a parsed connection string routes to.
+///
+/// Separated from [`Proxy::from_uri`] so the scheme/host-count dispatch —
+/// the crux of *which* URIs get primary-probed (#26) — is unit-testable
+/// without opening sockets or hitting DNS. The async constructors that
+/// actually probe live behind this pure decision.
+#[derive(Debug, PartialEq, Eq)]
+enum UriRoute {
+    /// One named host: forwarded to verbatim, no probe (the caller chose
+    /// exactly one host, so there's nothing to select).
+    Single {
+        host: String,
+        port: u16,
+        use_tls: bool,
+    },
+    /// A `mongodb://h1,h2,h3/` seed list: probe every host and forward to
+    /// the replica-set primary.
+    SeedList {
+        hosts: Vec<crate::srv::SrvHost>,
+        use_tls: bool,
+    },
+    /// A `mongodb+srv://hostname/` URI: resolve SRV, then probe.
+    Srv { hostname: String, use_tls: bool },
+}
+
+/// Classifies a parsed URI into the constructor path it should take,
+/// applying the per-scheme TLS default and the per-host default port.
+///
+/// The only error is a defensive [`FromUriError::Parse`] for an empty
+/// host list — [`crate::uri::parse`] already rejects that, so it's
+/// unreachable in practice, but routing without an `unwrap`/`expect`
+/// keeps the no-panic policy intact.
+fn route(parsed: crate::uri::ParsedConnectionUri) -> Result<UriRoute, FromUriError> {
+    let crate::uri::ParsedConnectionUri { scheme, hosts, tls } = parsed;
+    match scheme {
+        crate::uri::Scheme::Mongodb => {
+            // Spec default for non-SRV URIs: TLS off.
+            let use_tls = tls.unwrap_or(false);
+            if hosts.len() > 1 {
+                // Replica-set seed list: probe every host and forward to
+                // the primary (default port 27017 per host).
+                let hosts = hosts
+                    .into_iter()
+                    .map(|h| crate::srv::SrvHost {
+                        host: h.host,
+                        port: h.port.unwrap_or(27017),
+                    })
+                    .collect();
+                Ok(UriRoute::SeedList { hosts, use_tls })
+            } else {
+                // Exactly one host (the parser rejects an empty host list).
+                match hosts.into_iter().next() {
+                    Some(h) => Ok(UriRoute::Single {
+                        host: h.host,
+                        port: h.port.unwrap_or(27017),
+                        use_tls,
+                    }),
+                    None => Err(FromUriError::Parse(
+                        crate::uri::ConnectionUriError::MissingHost,
+                    )),
+                }
+            }
+        }
+        crate::uri::Scheme::MongodbSrv => {
+            // Spec default for SRV URIs: TLS on. The parser guarantees
+            // exactly one host for the SRV scheme.
+            let use_tls = tls.unwrap_or(true);
+            match hosts.into_iter().next() {
+                Some(h) => Ok(UriRoute::Srv {
+                    hostname: h.host,
+                    use_tls,
+                }),
+                None => Err(FromUriError::Parse(
+                    crate::uri::ConnectionUriError::MissingHost,
+                )),
+            }
+        }
+    }
+}
+
 /// Failure modes for [`Proxy::from_uri`].
 #[derive(Debug, thiserror::Error)]
 pub enum FromUriError {
@@ -503,6 +668,19 @@ pub enum FromUriError {
     /// [`SrvResolveError`](crate::SrvResolveError) for the full list.
     #[error("SRV resolution failed: {0}")]
     Srv(#[from] crate::srv::SrvResolveError),
+    /// A multi-host `mongodb://h1,h2,h3/` seed list parsed, but none of
+    /// the listed hosts responded as the replica-set primary within the
+    /// per-host probe timeout. The proxy is single-upstream — without a
+    /// primary it can't safely forward writes (a secondary rejects
+    /// anything lacking the `secondaryOk` flag the
+    /// [`RewriteHelloLayer`] deliberately hides). Analogous to
+    /// [`SrvResolveError::NoPrimary`](crate::SrvResolveError::NoPrimary)
+    /// for the non-SRV case.
+    #[error("no primary found among {attempted} seed-list hosts")]
+    NoPrimary {
+        /// How many seed-list hosts the probe loop tried before giving up.
+        attempted: usize,
+    },
 }
 
 impl<L> Proxy<L> {
@@ -1084,6 +1262,194 @@ mod tests {
         let swapped = apply_primary(&cell, srv_host("host.example.com", 27017));
         assert!(!swapped, "identical host:port must not swap");
         assert_eq!(read_target(&cell), ("host.example.com".to_owned(), 27017));
+    }
+
+    // ---------- multi-host seed-list selection: select_target ----------
+    //
+    // `from_uri`'s multi-host arm and `from_srv` both build their
+    // swappable target via `select_target`. These drive that selection
+    // with a `MockPrimaryProbe` so the "probe the seed list, pick the
+    // primary" wiring is verified without real sockets — the same gap
+    // `from_uri` would otherwise only exercise against a live cluster.
+
+    use crate::serve::probe::MockPrimaryProbe;
+
+    #[tokio::test]
+    async fn select_target_builds_cell_for_the_probed_primary() {
+        // Seed list with the primary last (the Atlas-order worst case):
+        // the first two hosts are secondaries, the third is primary.
+        let hosts = vec![
+            srv_host("secondary-a.example.com", 27017),
+            srv_host("secondary-b.example.com", 27017),
+            srv_host("primary.example.com", 27017),
+        ];
+        let mut probe = MockPrimaryProbe::new();
+        probe
+            .expect_is_primary()
+            .returning(|host, _port| Ok(host == "primary.example.com"));
+
+        let cell = select_target(&hosts, &probe)
+            .await
+            .expect("a primary must be selected");
+        assert_eq!(
+            read_target(&cell),
+            ("primary.example.com".to_owned(), 27017)
+        );
+    }
+
+    #[tokio::test]
+    async fn select_target_returns_none_when_no_host_is_primary() {
+        let hosts = vec![
+            srv_host("a.example.com", 27017),
+            srv_host("b.example.com", 27017),
+        ];
+        let mut probe = MockPrimaryProbe::new();
+        probe.expect_is_primary().returning(|_, _| Ok(false));
+
+        assert!(
+            select_target(&hosts, &probe).await.is_none(),
+            "no primary among the seed list must yield None"
+        );
+    }
+
+    #[tokio::test]
+    async fn reselect_seed_list_picks_the_current_primary_on_reprobe() {
+        // The failover loop's per-tick body for a static seed list must
+        // re-pick the primary after it moves to a different host.
+        let hosts = vec![
+            srv_host("a.example.com", 27017),
+            srv_host("b.example.com", 27017),
+        ];
+        let mut probe = MockPrimaryProbe::new();
+        probe
+            .expect_is_primary()
+            .returning(|host, _port| Ok(host == "b.example.com"));
+
+        let picked = reselect_seed_list(&hosts, &probe)
+            .await
+            .expect("re-probe finds the new primary");
+        assert_eq!(picked, srv_host("b.example.com", 27017));
+    }
+
+    // ---------- from_uri routing: route() ----------
+    //
+    // `from_uri`'s scheme/host-count dispatch is the crux of #26: a
+    // single named host must be used verbatim, but a multi-host seed list
+    // must be probed for the primary. `route` is the pure decision behind
+    // the async constructors, so these assert that decision (and the
+    // per-scheme TLS / per-host port defaults) without sockets or DNS.
+
+    fn route_uri(uri: &str) -> UriRoute {
+        route(crate::uri::parse(uri).expect("uri parses")).expect("uri routes")
+    }
+
+    #[test]
+    fn route_single_host_plain_uri_is_used_verbatim_without_probing() {
+        assert_eq!(
+            route_uri("mongodb://only.example.com:27017/"),
+            UriRoute::Single {
+                host: "only.example.com".to_owned(),
+                port: 27017,
+                use_tls: false,
+            }
+        );
+    }
+
+    #[test]
+    fn route_single_host_plain_uri_defaults_port_and_tls() {
+        // No port -> 27017; no `tls=` -> off for the `mongodb://` scheme.
+        assert_eq!(
+            route_uri("mongodb://only.example.com/"),
+            UriRoute::Single {
+                host: "only.example.com".to_owned(),
+                port: 27017,
+                use_tls: false,
+            }
+        );
+    }
+
+    #[test]
+    fn route_single_host_plain_uri_honours_tls_query() {
+        assert_eq!(
+            route_uri("mongodb://only.example.com/?tls=true"),
+            UriRoute::Single {
+                host: "only.example.com".to_owned(),
+                port: 27017,
+                use_tls: true,
+            }
+        );
+    }
+
+    #[test]
+    fn route_multi_host_plain_uri_becomes_a_probed_seed_list() {
+        // The #26 regression guard: more than one host must route to the
+        // probe-and-select path, *not* be silently truncated to host #1.
+        assert_eq!(
+            route_uri("mongodb://a.example.com:27017,b.example.com:27018,c.example.com/"),
+            UriRoute::SeedList {
+                hosts: vec![
+                    srv_host("a.example.com", 27017),
+                    srv_host("b.example.com", 27018),
+                    // No explicit port -> default 27017.
+                    srv_host("c.example.com", 27017),
+                ],
+                use_tls: false,
+            }
+        );
+    }
+
+    #[test]
+    fn route_multi_host_plain_uri_honours_tls_query() {
+        match route_uri("mongodb://a.example.com,b.example.com/?tls=true") {
+            UriRoute::SeedList { use_tls, hosts } => {
+                assert!(use_tls, "explicit tls=true must propagate to the seed list");
+                assert_eq!(hosts.len(), 2);
+            }
+            other => panic!("expected SeedList, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_srv_uri_defaults_tls_on() {
+        assert_eq!(
+            route_uri("mongodb+srv://cluster0.foo.mongodb.net/"),
+            UriRoute::Srv {
+                hostname: "cluster0.foo.mongodb.net".to_owned(),
+                use_tls: true,
+            }
+        );
+    }
+
+    #[test]
+    fn route_srv_uri_honours_tls_false_query() {
+        assert_eq!(
+            route_uri("mongodb+srv://cluster0.foo.mongodb.net/?tls=false"),
+            UriRoute::Srv {
+                hostname: "cluster0.foo.mongodb.net".to_owned(),
+                use_tls: false,
+            }
+        );
+    }
+
+    // ---------- from_seed_list: NoPrimary error path ----------
+
+    #[tokio::test]
+    async fn from_seed_list_errors_no_primary_when_every_host_is_unreachable() {
+        // Bind two loopback listeners to grab free ports, then drop them
+        // so connections are refused immediately. Every probe fails to
+        // connect, so selection finds no primary and `from_seed_list`
+        // surfaces `NoPrimary` carrying the attempted count.
+        let (listener_a, port_a) = bound_listener().await;
+        let (listener_b, port_b) = bound_listener().await;
+        drop(listener_a);
+        drop(listener_b);
+
+        let hosts = vec![srv_host("127.0.0.1", port_a), srv_host("127.0.0.1", port_b)];
+        match Proxy::from_seed_list(hosts, false, FailoverConfig::disabled()).await {
+            Err(FromUriError::NoPrimary { attempted }) => assert_eq!(attempted, 2),
+            Err(other) => panic!("expected NoPrimary, got {other:?}"),
+            Ok(_) => panic!("expected NoPrimary, got a proxy"),
+        }
     }
 
     // ---------- failover: spawn_reprobe_loop ----------

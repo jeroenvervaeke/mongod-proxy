@@ -2,7 +2,7 @@
 //!
 //! Covers just enough of the [connection-string spec] to route a URI to
 //! the right [`Proxy`](crate::Proxy) constructor: which scheme, which
-//! upstream host (and optional port), and whether to enable TLS. The
+//! upstream host(s) (and optional port), and whether to enable TLS. The
 //! proxy is wire-level, so user/password and database-name segments are
 //! stripped without being inspected, and every other option is ignored.
 //!
@@ -12,23 +12,38 @@
 //!
 //! [connection-string spec]: https://www.mongodb.com/docs/manual/reference/connection-string/
 
-/// Parsed shape of a MongoDB connection string. The proxy is
-/// single-upstream, so only the first host is kept; if more hosts are
-/// listed, the rest are dropped silently.
+/// Parsed shape of a MongoDB connection string.
+///
+/// All hosts in the URI's host list are kept, in order. A plain
+/// `mongodb://host1,host2,host3/` seed list yields every host so
+/// [`Proxy::from_uri`](crate::Proxy::from_uri) can probe them for the
+/// replica-set primary rather than blindly forwarding to the first one;
+/// a `mongodb+srv://` URI always carries exactly one host (the parser
+/// rejects anything else with [`ConnectionUriError::InvalidSrvHost`]).
 ///
 /// Internal — consumers reach this via [`Proxy::from_uri`](crate::Proxy::from_uri).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ParsedConnectionUri {
     pub scheme: Scheme,
-    /// First host in the URI's host list.
-    pub host: String,
-    /// Explicit port, if the URI carried one. Always `None` for
-    /// `mongodb+srv://` URIs (the SRV record supplies the port).
-    pub port: Option<u16>,
+    /// Every host in the URI's host list, in URI order. Guaranteed
+    /// non-empty (an empty host list is rejected with
+    /// [`ConnectionUriError::MissingHost`]); exactly one entry for
+    /// `mongodb+srv://`.
+    pub hosts: Vec<HostSpec>,
     /// `?tls=true|false` / `?ssl=true|false` if present in the query
     /// string. `None` when neither was set — callers apply the
     /// scheme-specific default themselves.
     pub tls: Option<bool>,
+}
+
+/// One `host[:port]` entry from a connection string's host list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostSpec {
+    /// The hostname (no port, no trailing `/`).
+    pub host: String,
+    /// Explicit port, if this entry carried one. Always `None` for
+    /// `mongodb+srv://` URIs (the SRV record supplies the port).
+    pub port: Option<u16>,
 }
 
 /// Connection-string scheme.
@@ -83,7 +98,7 @@ pub enum ConnectionUriError {
 /// Parses a MongoDB connection string into the minimal shape the proxy
 /// needs.
 ///
-/// Only the scheme, the first host (with optional port), and the
+/// Only the scheme, the host list (each with an optional port), and the
 /// `tls`/`ssl` query option are extracted. Everything else
 /// (user:password, database name, every other query option) is dropped
 /// without being inspected. See [`ParsedConnectionUri`].
@@ -131,20 +146,21 @@ pub(crate) fn parse(uri: &str) -> Result<ParsedConnectionUri, ConnectionUriError
         return Err(ConnectionUriError::InvalidSrvHost);
     }
 
-    let (host, port) = parse_host_port(host_specs[0])?;
-
-    if scheme == Scheme::MongodbSrv && port.is_some() {
-        return Err(ConnectionUriError::InvalidSrvHost);
+    let mut hosts = Vec::with_capacity(host_specs.len());
+    for spec in host_specs {
+        let (host, port) = parse_host_port(spec)?;
+        // SRV records supply the port themselves, so an explicit one on a
+        // `mongodb+srv://` host is a contradiction (the host list is
+        // length 1 here, so this checks the only entry).
+        if scheme == Scheme::MongodbSrv && port.is_some() {
+            return Err(ConnectionUriError::InvalidSrvHost);
+        }
+        hosts.push(HostSpec { host, port });
     }
 
     let tls = parse_tls_option(query)?;
 
-    Ok(ParsedConnectionUri {
-        scheme,
-        host,
-        port,
-        tls,
-    })
+    Ok(ParsedConnectionUri { scheme, hosts, tls })
 }
 
 fn parse_host_port(s: &str) -> Result<(String, Option<u16>), ConnectionUriError> {
@@ -219,9 +235,18 @@ mod tests {
     ) -> ParsedConnectionUri {
         ParsedConnectionUri {
             scheme,
+            hosts: vec![HostSpec {
+                host: host.to_owned(),
+                port,
+            }],
+            tls,
+        }
+    }
+
+    fn host_spec(host: &str, port: Option<u16>) -> HostSpec {
+        HostSpec {
             host: host.to_owned(),
             port,
-            tls,
         }
     }
 
@@ -353,10 +378,42 @@ mod tests {
     // ---------- multi-host handling ----------
 
     #[test]
-    fn multi_host_mongodb_uses_first_host_only() {
+    fn multi_host_mongodb_keeps_every_host_in_order() {
         assert_eq!(
             parse("mongodb://host1:27017,host2:27018,host3:27019/").unwrap(),
-            parsed(Scheme::Mongodb, "host1", Some(27017), None)
+            ParsedConnectionUri {
+                scheme: Scheme::Mongodb,
+                hosts: vec![
+                    host_spec("host1", Some(27017)),
+                    host_spec("host2", Some(27018)),
+                    host_spec("host3", Some(27019)),
+                ],
+                tls: None,
+            }
+        );
+    }
+
+    #[test]
+    fn multi_host_mongodb_allows_per_host_default_port() {
+        // A seed list may mix explicit and implicit ports; each entry
+        // keeps its own `port` so the caller can default per host.
+        assert_eq!(
+            parse("mongodb://host1,host2:27018/").unwrap(),
+            ParsedConnectionUri {
+                scheme: Scheme::Mongodb,
+                hosts: vec![host_spec("host1", None), host_spec("host2", Some(27018))],
+                tls: None,
+            }
+        );
+    }
+
+    #[test]
+    fn multi_host_mongodb_rejects_a_bad_host_anywhere_in_the_list() {
+        // The second host has an unparseable port — the whole URI fails
+        // rather than silently dropping the offending entry.
+        assert_eq!(
+            parse("mongodb://host1:27017,host2:bogus/"),
+            Err(ConnectionUriError::InvalidPort("bogus".to_owned()))
         );
     }
 

@@ -52,6 +52,21 @@ fn install_default_crypto_provider() {
     });
 }
 
+/// Builds the standard rustls client config used by every TLS upstream:
+/// `webpki-roots` trust anchors, no client cert, SNI on. Shared between
+/// [`Proxy::new`] and the SRV primary-selection probes in
+/// [`Proxy::from_srv`].
+pub(crate) fn default_tls_connector() -> Arc<TlsConnector> {
+    install_default_crypto_provider();
+    let mut root_cert_store = RootCertStore::empty();
+    root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let mut config = ClientConfig::builder()
+        .with_root_certificates(root_cert_store)
+        .with_no_client_auth();
+    config.enable_sni = true;
+    Arc::new(TlsConnector::from(Arc::new(config)))
+}
+
 type BoxedAsyncRead = Pin<Box<dyn AsyncRead + Send + Sync + 'static>>;
 type BoxedAsyncWrite = Pin<Box<dyn AsyncWrite + Send + Sync + 'static>>;
 type ServerReader = FramedRead<BoxedAsyncRead, WireDecoder>;
@@ -113,22 +128,19 @@ impl Proxy<Identity> {
     /// only when you specifically need the upstream's topology visible to
     /// drivers.
     pub fn new(destination_name: impl Into<String>, destination_port: u16, use_tls: bool) -> Self {
-        let tls_connector = if use_tls {
-            install_default_crypto_provider();
-            let mut root_cert_store = RootCertStore::empty();
-            root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            let mut config = ClientConfig::builder()
-                .with_root_certificates(root_cert_store)
-                .with_no_client_auth();
-            config.enable_sni = true;
+        let tls_connector = use_tls.then(default_tls_connector);
+        Self::with_tls_connector(destination_name.into(), destination_port, tls_connector)
+    }
 
-            Some(Arc::new(TlsConnector::from(Arc::new(config))))
-        } else {
-            None
-        };
-
+    /// Inner constructor sharing the live `Arc<TlsConnector>` across calls,
+    /// so an `from_srv` probe loop pays the rustls config cost once.
+    fn with_tls_connector(
+        destination_name: String,
+        destination_port: u16,
+        tls_connector: Option<Arc<TlsConnector>>,
+    ) -> Self {
         Self {
-            destination_name: destination_name.into(),
+            destination_name,
             destination_port,
             tls_connector,
             rewrite_hello: true,
@@ -136,6 +148,145 @@ impl Proxy<Identity> {
             proxy_layer: Identity::new(),
         }
     }
+
+    /// Creates a new proxy whose upstream is the replica-set primary
+    /// among the hosts returned by an SRV lookup for `srv_hostname` —
+    /// i.e. the `mongodb+srv://` connection-string convention.
+    ///
+    /// Queries `_mongodb._tcp.<srv_hostname>` (see [`crate::srv`]),
+    /// then sends a `hello` probe to each candidate in DNS order and
+    /// uses the first node whose reply reports
+    /// `isWritablePrimary == true`. Picking the primary (rather than
+    /// the first SRV record blindly) is what makes the proxy work
+    /// against multi-node Atlas clusters: a secondary would otherwise
+    /// reject every operation with `NotPrimaryNoSecondaryOk` because
+    /// the driver, looking at a [`RewriteHelloLayer`]-stripped hello
+    /// reply, has no signal that it should set the wire-level
+    /// `secondaryOk` flag.
+    ///
+    /// Per the SRV spec, TLS to the upstream defaults to enabled; pass
+    /// `use_tls = false` only when forwarding to a test deployment that
+    /// does not terminate TLS itself.
+    ///
+    /// Primary identity is captured *once*, here. If Atlas fails over
+    /// during the proxy's lifetime, the captured node stops being
+    /// primary and forwarded writes will start failing — restart the
+    /// proxy to re-probe (consistent with the existing "restart to
+    /// re-resolve SRV records" lifecycle).
+    ///
+    /// # Errors
+    ///
+    /// See [`crate::srv::SrvResolveError`]. New here:
+    /// [`SrvResolveError::NoPrimary`](crate::srv::SrvResolveError::NoPrimary)
+    /// fires when every SRV-resolved host responds (or fails to
+    /// respond) without identifying itself as the primary.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use mongod_proxy::Proxy;
+    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    /// // SRV lookup → probe each candidate → use the primary.
+    /// let proxy = Proxy::from_srv("cluster0.foo.mongodb.net", true).await?;
+    /// # let _ = proxy;
+    /// # Ok(()) }
+    /// ```
+    pub async fn from_srv(
+        srv_hostname: &str,
+        use_tls: bool,
+    ) -> Result<Self, crate::srv::SrvResolveError> {
+        let hosts = crate::srv::resolve(srv_hostname).await?;
+        let tls_connector = use_tls.then(default_tls_connector);
+        let probe = crate::serve::probe::HelloProbe::new(tls_connector.clone());
+        let attempted = hosts.len();
+        let primary = crate::serve::probe::select_primary(&hosts, &probe)
+            .await
+            .ok_or_else(|| crate::srv::SrvResolveError::NoPrimary {
+                hostname: srv_hostname.to_owned(),
+                attempted,
+            })?;
+        Ok(Self::with_tls_connector(
+            primary.host,
+            primary.port,
+            tls_connector,
+        ))
+    }
+
+    /// Constructs a proxy from any MongoDB connection string — both
+    /// `mongodb://host[:port][,host[:port]…]/…` and
+    /// `mongodb+srv://hostname/…` are accepted.
+    ///
+    /// Callers don't have to inspect the scheme themselves: this routes
+    /// to [`Proxy::new`] for plain URIs and to [`Proxy::from_srv`] for
+    /// SRV URIs. For multi-host plain URIs the first host wins (the
+    /// proxy is single-upstream); the default
+    /// [`hello` rewrite](crate::RewriteHelloLayer) keeps the client
+    /// driver pinned to the proxy socket regardless.
+    ///
+    /// TLS follows the URI:
+    ///
+    /// - `mongodb://` defaults to **off** unless the URI carries
+    ///   `?tls=true` or `?ssl=true`.
+    /// - `mongodb+srv://` defaults to **on** (per the SRV spec) unless
+    ///   the URI carries `?tls=false` / `?ssl=false`.
+    ///
+    /// Everything else in the URI — user/password, database name, every
+    /// other query option — is intentionally ignored. The proxy is
+    /// wire-level; the client driver forwards those options to the
+    /// upstream itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FromUriError::Parse`] for any URI shape rejected by
+    /// [`crate::uri::ConnectionUriError`], or [`FromUriError::Srv`] if
+    /// the SRV lookup fails on a `mongodb+srv://` URI.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use mongod_proxy::Proxy;
+    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    /// // Plain URI: TLS defaults to off, port defaults to 27017.
+    /// let proxy = Proxy::from_uri("mongodb://127.0.0.1:27017/").await?;
+    /// # let _ = proxy;
+    /// // SRV URI: TLS defaults to on; the SRV record supplies the port.
+    /// let proxy = Proxy::from_uri("mongodb+srv://cluster0.foo.mongodb.net/").await?;
+    /// # let _ = proxy;
+    /// # Ok(()) }
+    /// ```
+    pub async fn from_uri(uri: &str) -> Result<Self, FromUriError> {
+        let parsed = crate::uri::parse(uri).map_err(FromUriError::Parse)?;
+        match parsed.scheme {
+            crate::uri::Scheme::Mongodb => {
+                // Spec default for non-SRV URIs: TLS off, port 27017.
+                let port = parsed.port.unwrap_or(27017);
+                let use_tls = parsed.tls.unwrap_or(false);
+                Ok(Self::new(parsed.host, port, use_tls))
+            }
+            crate::uri::Scheme::MongodbSrv => {
+                // Spec default for SRV URIs: TLS on.
+                let use_tls = parsed.tls.unwrap_or(true);
+                Self::from_srv(&parsed.host, use_tls)
+                    .await
+                    .map_err(FromUriError::Srv)
+            }
+        }
+    }
+}
+
+/// Failure modes for [`Proxy::from_uri`].
+#[derive(Debug, thiserror::Error)]
+pub enum FromUriError {
+    /// The URI did not parse: bad scheme, missing host, invalid port,
+    /// invalid `tls=` value, etc. See
+    /// [`ConnectionUriError`](crate::ConnectionUriError) for the full
+    /// list.
+    #[error("invalid connection string: {0}")]
+    Parse(#[from] crate::uri::ConnectionUriError),
+    /// The SRV lookup for a `mongodb+srv://` URI failed. See
+    /// [`SrvResolveError`](crate::SrvResolveError) for the full list.
+    #[error("SRV resolution failed: {0}")]
+    Srv(#[from] crate::srv::SrvResolveError),
 }
 
 impl<L> Proxy<L> {

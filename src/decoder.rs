@@ -96,20 +96,25 @@ impl Decoder for WireDecoder {
             }
         }
 
-        // If we don't have a header or don't have enough data yet, wait for more data
-        let Some(next_header) = &self.next_header else {
-            return Ok(None);
+        // If we don't have a header or don't have enough data yet, wait
+        // for more data. Peek the length without consuming so we can
+        // return `Ok(None)` before taking ownership.
+        let frame_len = match &self.next_header {
+            Some(h) => h.message_length.into_inner() as usize,
+            None => return Ok(None),
         };
-        let frame_len = next_header.message_length.into_inner() as usize;
         if buf.len() < frame_len {
             return Ok(None);
         }
 
-        // Header + body present: take ownership of the header and split the frame off.
-        let header = self
-            .next_header
-            .take()
-            .expect("checked above via let-else borrow");
+        // Header + body present: take ownership of the header and split
+        // the frame off. The earlier match proves `next_header.is_some()`,
+        // but use `let-else` rather than `.expect()` so this stays
+        // panic-free even under refactor: an unexpected `None` falls
+        // through to "wait for more data".
+        let Some(header) = self.next_header.take() else {
+            return Ok(None);
+        };
         let message_bytes = buf.split_to(frame_len);
 
         // Parse message based on header and bytes

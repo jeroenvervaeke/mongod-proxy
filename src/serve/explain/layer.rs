@@ -172,9 +172,12 @@ fn alloc_request_id(c: &AtomicI32) -> Result<ExplainRequestId, RequestIdExhauste
         let next = cur - 1;
         match c.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => {
-                // Infallible: guard above ensures `next < 0`.
-                return Ok(ExplainRequestId::try_new(next)
-                    .expect("alloc_request_id guard ensures next < 0"));
+                // The guard above proves `next < 0`, so `try_new` cannot
+                // fail in practice. Map the would-be validation error to
+                // `RequestIdExhausted` rather than `.expect()` so the
+                // function stays panic-free even if the newtype's
+                // predicate is tightened later.
+                return ExplainRequestId::try_new(next).map_err(|_| RequestIdExhausted);
             }
             Err(observed) => cur = observed,
         }

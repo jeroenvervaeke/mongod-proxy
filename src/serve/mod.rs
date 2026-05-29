@@ -29,6 +29,7 @@ use crate::{
 
 pub mod explain;
 pub mod log;
+pub(crate) mod probe;
 pub mod rewrite_hello;
 pub mod service;
 

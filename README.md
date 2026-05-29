@@ -68,6 +68,55 @@ async fn main() -> std::io::Result<()> {
 Point any MongoDB driver at `mongodb://127.0.0.1:27018/` and traffic flows
 through the proxy unchanged, with every frame parsed and logged.
 
+## Connection strings (`mongodb://` and `mongodb+srv://`)
+
+When you already have a MongoDB connection string in hand, hand the whole
+thing to `Proxy::from_uri` — both schemes are accepted, no scheme-sniffing
+on your side:
+
+```rust
+use mongod_proxy::{Proxy, serve};
+use tokio::net::TcpListener;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:27018").await?;
+
+    // `mongodb://` and `mongodb+srv://` both work. For SRV URIs the
+    // `_mongodb._tcp.<hostname>` record is resolved at startup and the
+    // first advertised host is used as the upstream. TLS defaults match
+    // the URI scheme — off for `mongodb://`, on for `mongodb+srv://` —
+    // and can be overridden via `?tls=true|false` in the URI itself.
+    let proxy = Proxy::from_uri("mongodb+srv://cluster0.foo.mongodb.net/")
+        .await?
+        .enable_logging();
+
+    serve(listener, proxy).await?;
+    Ok(())
+}
+```
+
+For SRV URIs the proxy is still single-upstream, so subsequent records
+are ignored; the default [`hello`
+rewrite](#hello--ismaster-rewrite-on-by-default) keeps the client driver
+pinned to the proxy socket rather than dialling the other replica-set
+members it would otherwise discover. SRV resolution runs once at
+construction — restart the process to pick up changes to the records.
+
+Everything else in the URI — user/password, database name, every option
+beyond `tls` / `ssl` — is intentionally *dropped*. The proxy is
+wire-level; the client driver forwards those options to the upstream
+itself in the handshake. The MongoDB `TXT` record (which carries
+driver-side `authSource` / `replicaSet` / `loadBalanced` options) is
+similarly not fetched.
+
+For callers that don't have a connection string —
+`Proxy::new(host, port, use_tls)` and `Proxy::from_srv(hostname, use_tls)`
+remain available with explicit arguments.
+
+The `logger` binary picks the URI up via the `MONGOD_PROXY_UPSTREAM_URI`
+env var (defaults to `mongodb://localhost:27017/`).
+
 ## `hello` / `isMaster` rewrite (on by default)
 
 Without help, an SDAM-enabled MongoDB driver

@@ -33,6 +33,14 @@
 //! # Ok(()) }
 //! ```
 //!
+//! If you already have a connection string in hand, use
+//! [`Proxy::from_uri`] instead of `Proxy::new`: it handles both
+//! `mongodb://host[:port][,host…]/…` and `mongodb+srv://hostname/…`
+//! (resolving the SRV record at startup), and picks scheme-appropriate
+//! TLS defaults that the URI itself can override via `?tls=true|false`.
+//! [`Proxy::from_srv`] remains available for SRV with explicit
+//! arguments; the [`srv`] module exposes the lookup itself.
+//!
 //! # Architecture
 //!
 //! ```text
@@ -55,6 +63,8 @@ pub mod message;
 pub mod op_code;
 pub mod operation;
 pub mod serve;
+pub mod srv;
+mod uri;
 
 #[cfg(test)]
 mod fixtures;
@@ -74,5 +84,7 @@ pub use serve::{
     log::LogLayer,
     rewrite_hello::{RewriteHelloLayer, RewriteHelloService, RewriteHelloStream},
     serve,
-    service::Proxy,
+    service::{FromUriError, Proxy},
 };
+pub use srv::{LookupFailure, SrvHost, SrvResolveError};
+pub use uri::ConnectionUriError;

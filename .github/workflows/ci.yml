@@ -57,9 +57,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: stable
-      # E2E tests under `tests/` self-skip when Docker is unreachable, so
+      # E2E tests under `tests/` self-skip when their dependencies are
+      # unreachable (Docker for `e2e_intercept`/`e2e_explain`, the
+      # `MONGOD_PROXY_E2E_ATLAS_URI` secret for `e2e_from_uri`), so
       # running --all-targets here is safe on a stock GitHub runner.
+      # The Atlas secret is only available on `push` to master and on
+      # PRs from the same repo; forked PRs skip cleanly with no setup.
       - run: cargo test --workspace --all-targets --all-features
+        env:
+          MONGOD_PROXY_E2E_ATLAS_URI: ${{ secrets.MONGOD_PROXY_E2E_ATLAS_URI }}
 
   # Builds the rustdoc with -D warnings so broken intra-doc links, missing
   # items referenced from docs, and similar regressions fail CI instead of

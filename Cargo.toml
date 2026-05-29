@@ -28,6 +28,7 @@ hickory-resolver = "0.26.1"
 anyhow = "1.0.98"
 atlas-local = "0.6.1"
 bollard = "=0.20.1"
+mockall = "0.14"
 mongodb = { version = "3.1" }
 pretty_assertions = "1.4.1"
 rstest = "0.25.0"
@@ -57,3 +58,25 @@ tower-layer = "0.3.3"
 tower-service = "0.3.3"
 tokio-stream = "0.1.17"
 tracing = { version = "0.1.41", features = ["attributes"] }
+
+# No-panic policy. Library code in `src/` (and the binary in `logger/src/`)
+# must never panic at runtime — fallible operations return `Result`, and
+# infallible-by-invariant sites use defensive fallbacks rather than
+# `.expect()`. `assert!` and friends are deliberately not banned: assertions
+# are how Rust's test harness signals failure, and panic-style assertions
+# remain available in `#[cfg(test)]` modules via the `allow-*-in-tests`
+# escape hatches configured in `clippy.toml`.
+#
+# CI runs `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
+# so any new `.unwrap()` / `.expect()` / `panic!()` / `unreachable!()` /
+# `todo!()` / `unimplemented!()` in non-test code fails the build.
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+unreachable = "warn"
+todo = "warn"
+unimplemented = "warn"
+
+[lints]
+workspace = true

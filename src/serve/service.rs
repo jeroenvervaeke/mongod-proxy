@@ -1153,4 +1153,80 @@ mod tests {
             "select must not run again once the proxy is dropped"
         );
     }
+
+    // ---------- failover: end-to-end through Service::call ----------
+    //
+    // The unit tests above prove the *decision* (apply_primary) and the
+    // *loop* (spawn_reprobe_loop) in isolation. These two tie that
+    // decision to an actually-forwarded connection: a swap must be
+    // observed by the next `Service<SocketAddr>::call`, including after
+    // the proxy has been wrapped in a layer stack. We use paired local
+    // `TcpListener`s (rather than the `duplex` helper) because
+    // `ProxyClient::forward_to` dials a real socket, and which listener
+    // accepts is the observable signal of which target was used.
+
+    async fn bound_listener() -> (tokio::net::TcpListener, u16) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        (listener, port)
+    }
+
+    #[tokio::test]
+    async fn service_call_follows_a_target_swap_on_the_next_connection() {
+        let (listener_a, port_a) = bound_listener().await;
+        let (listener_b, port_b) = bound_listener().await;
+
+        let cell = target_cell("127.0.0.1", port_a);
+        let mut proxy = Proxy::with_target(cell.clone(), None);
+
+        let dummy: SocketAddr = "127.0.0.1:1".parse().expect("parse client addr");
+
+        // First connection lands on A (the current target).
+        let call_fut = proxy.call(dummy);
+        let (accept_a, client_a) = tokio::join!(listener_a.accept(), call_fut);
+        accept_a.expect("listener A accepts the first connection");
+        client_a.expect("proxy connects to A");
+
+        // Swap the target out from under the live proxy.
+        assert!(apply_primary(&cell, srv_host("127.0.0.1", port_b)));
+
+        // The next connection must land on B, not A. If `Service::call`
+        // had cached the original host instead of reading the cell fresh,
+        // this accept on B would hang (and the test would time out).
+        let call_fut = proxy.call(dummy);
+        let (accept_b, client_b) = tokio::join!(listener_b.accept(), call_fut);
+        accept_b.expect("listener B accepts after the swap");
+        client_b.expect("proxy connects to B");
+    }
+
+    #[tokio::test]
+    async fn layered_proxy_still_follows_target_swaps() {
+        // `layer()` moves `self.target` into the new `Proxy`. This guards
+        // the documented `from_srv(...).enable_logging()` promise: the
+        // shared cell the background loop swaps must remain the same one
+        // the *layered, served* proxy reads.
+        let (listener_a, port_a) = bound_listener().await;
+        let (listener_b, port_b) = bound_listener().await;
+
+        let cell = target_cell("127.0.0.1", port_a);
+        // Build, then wrap in a layer stack, keeping our own `cell` clone
+        // to stand in for the background loop's handle.
+        let mut proxy = Proxy::with_target(cell.clone(), None).enable_logging();
+
+        let dummy: SocketAddr = "127.0.0.1:1".parse().expect("parse client addr");
+
+        let call_fut = proxy.call(dummy);
+        let (accept_a, built_a) = tokio::join!(listener_a.accept(), call_fut);
+        accept_a.expect("layered proxy connects to A first");
+        built_a.expect("layered service builds against A");
+
+        assert!(apply_primary(&cell, srv_host("127.0.0.1", port_b)));
+
+        let call_fut = proxy.call(dummy);
+        let (accept_b, built_b) = tokio::join!(listener_b.accept(), call_fut);
+        accept_b.expect("layered proxy follows the swap to B");
+        built_b.expect("layered service builds against B");
+    }
 }

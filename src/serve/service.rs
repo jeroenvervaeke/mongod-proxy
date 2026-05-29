@@ -673,8 +673,7 @@ pub enum FromUriError {
     /// per-host probe timeout. The proxy is single-upstream — without a
     /// primary it can't safely forward writes (a secondary rejects
     /// anything lacking the `secondaryOk` flag the
-    /// [`RewriteHelloLayer`](crate::RewriteHelloLayer) deliberately
-    /// hides). Analogous to
+    /// [`RewriteHelloLayer`] deliberately hides). Analogous to
     /// [`SrvResolveError::NoPrimary`](crate::SrvResolveError::NoPrimary)
     /// for the non-SRV case.
     #[error("no primary found among {attempted} seed-list hosts")]

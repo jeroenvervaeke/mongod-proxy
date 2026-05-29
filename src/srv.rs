@@ -48,6 +48,12 @@ pub(crate) struct RawSrvRecord {
     pub target: String,
     /// SRV port.
     pub port: u16,
+    /// SRV priority. Lower values are preferred; records are probed in
+    /// ascending priority order per RFC 2782.
+    pub priority: u16,
+    /// SRV weight. Used to proportionally randomise the order of records
+    /// that share the same priority per RFC 2782.
+    pub weight: u16,
 }
 
 /// Opaque DNS lookup failure surfaced by the SRV-lookup backend.
@@ -231,19 +237,152 @@ impl SrvLookup for HickorySrvLookup {
                 Some(RawSrvRecord {
                     target: srv.target.to_utf8(),
                     port: srv.port,
+                    priority: srv.priority,
+                    weight: srv.weight,
                 })
             })
             .collect())
     }
 }
 
+/// Uniform randomness source for the RFC 2782 weighted SRV ordering.
+///
+/// Abstracted behind a trait so [`order_by_priority_weight`] can be
+/// exercised deterministically in unit tests with a scripted RNG, while
+/// production uses the entropy-seeded [`SplitMix64`].
+pub(crate) trait WeightedRng {
+    /// Returns a uniformly distributed value in `[0, max]` (inclusive).
+    fn gen_range_inclusive(&mut self, max: u32) -> u32;
+}
+
+/// Tiny, dependency-free [`SplitMix64`] PRNG seeded from process entropy.
+///
+/// SRV weighted-shuffling needs only a cheap per-process random source —
+/// not a cryptographic one — so rather than take a `rand` dependency we
+/// seed [`SplitMix64`] from [`RandomState`], whose hasher keys are
+/// randomised per process by the standard library.
+pub(crate) struct SplitMix64 {
+    state: u64,
+}
+
+impl SplitMix64 {
+    /// Seeds from [`RandomState`]: hashing the empty input yields a value
+    /// derived purely from the process-random hasher keys.
+    fn from_entropy() -> Self {
+        use std::hash::{BuildHasher, Hasher, RandomState};
+        Self {
+            state: RandomState::new().build_hasher().finish(),
+        }
+    }
+
+    /// Deterministic seed for unit tests that assert the PRNG sequence.
+    #[cfg(test)]
+    fn seeded(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+}
+
+impl WeightedRng for SplitMix64 {
+    fn gen_range_inclusive(&mut self, max: u32) -> u32 {
+        if max == 0 {
+            return 0;
+        }
+        // `% (max + 1)` lands in `[0, max]`; the result is < 2^32 so the
+        // truncating cast is lossless. A small modulo bias is acceptable
+        // for weighted load distribution.
+        (self.next_u64() % (u64::from(max) + 1)) as u32
+    }
+}
+
+/// Orders SRV records per RFC 2782 / the [Initial DNS Seedlist Discovery
+/// spec]: ascending `priority` first, then a weight-proportional shuffle
+/// within each equal-priority group.
+///
+/// The proxy is single-upstream and uses the *first* surviving record,
+/// so this ordering decides which host gets probed for the primary first.
+/// A custom SRV deployment can therefore steer the proxy toward a
+/// preferred region (lower priority) with a fall-back region behind it.
+///
+/// Against Atlas — where every record is `priority=0 weight=0` — the
+/// weighted selection collapses to "keep input order" (every running sum
+/// is `0 >= 0`), so the resolver's order is preserved unchanged.
+///
+/// [Initial DNS Seedlist Discovery spec]: https://github.com/mongodb/specifications/blob/master/source/initial-dns-seedlist-discovery/initial-dns-seedlist-discovery.md
+pub(crate) fn order_by_priority_weight<R: WeightedRng>(
+    mut records: Vec<RawSrvRecord>,
+    rng: &mut R,
+) -> Vec<RawSrvRecord> {
+    // Stable sort keeps equal-priority records in resolver order before
+    // the weighted shuffle reorders them.
+    records.sort_by_key(|r| r.priority);
+
+    let mut ordered = Vec::with_capacity(records.len());
+    let mut rest = records.into_iter().peekable();
+    while let Some(&RawSrvRecord { priority, .. }) = rest.peek() {
+        let mut group = Vec::new();
+        while rest.peek().is_some_and(|r| r.priority == priority) {
+            if let Some(record) = rest.next() {
+                group.push(record);
+            }
+        }
+        weighted_shuffle_into(group, rng, &mut ordered);
+    }
+    ordered
+}
+
+/// Applies RFC 2782's weighted-selection algorithm to one equal-priority
+/// `group`, appending the result to `out`.
+///
+/// Repeatedly: place `weight==0` records first, compute the running sum
+/// of weights, draw a uniform number in `[0, total]`, and select the
+/// first record whose running sum reaches it. When every weight is `0`
+/// the draw is always `0` and the first remaining record wins each round,
+/// preserving input order.
+fn weighted_shuffle_into<R: WeightedRng>(
+    mut group: Vec<RawSrvRecord>,
+    rng: &mut R,
+    out: &mut Vec<RawSrvRecord>,
+) {
+    while !group.is_empty() {
+        // RFC 2782: weight-0 records sort to the front. `false < true`,
+        // so this is stable and leaves equal-weight records in order.
+        group.sort_by_key(|r| r.weight != 0);
+
+        let total: u32 = group.iter().map(|r| u32::from(r.weight)).sum();
+        let pick = rng.gen_range_inclusive(total);
+
+        // `pick <= total`, so the running sum reaches `pick` by the last
+        // record at the latest; index 0 is a safe default for the
+        // all-zero-weight case where the first record always wins.
+        let mut running = 0u32;
+        let mut chosen = 0usize;
+        for (idx, record) in group.iter().enumerate() {
+            running += u32::from(record.weight);
+            if running >= pick {
+                chosen = idx;
+                break;
+            }
+        }
+        out.push(group.remove(chosen));
+    }
+}
+
 /// Resolves `srv_hostname` via the MongoDB SRV convention.
 ///
 /// Queries `_mongodb._tcp.<srv_hostname>` and returns every advertised
-/// `(host, port)` pair, in the order the resolver delivered them. SRV
-/// priority/weight selection is *not* applied: drivers normally connect
-/// to every returned host in parallel, but the proxy is single-upstream
-/// so the first record is what callers will use.
+/// `(host, port)` pair. Records are ordered per RFC 2782 — ascending
+/// `priority`, weight-randomised within each priority group (see
+/// [`order_by_priority_weight`]) — so the first record callers use is the
+/// most-preferred reachable target. The proxy is single-upstream, so only
+/// the chosen primary among these is ultimately forwarded to.
 ///
 /// The original hostname must have at least two labels (e.g.
 /// `cluster.example.com`). Each returned target must share the original
@@ -274,6 +413,8 @@ pub(crate) async fn resolve_with<L: SrvLookup + ?Sized>(
             hostname: srv_hostname.to_owned(),
             source,
         })?;
+
+    let raw = order_by_priority_weight(raw, &mut SplitMix64::from_entropy());
 
     let parent = parent_domain(srv_hostname);
 
@@ -342,9 +483,38 @@ mod tests {
     use super::*;
 
     fn raw(target: &str, port: u16) -> RawSrvRecord {
+        raw_pw(target, port, 0, 0)
+    }
+
+    fn raw_pw(target: &str, port: u16, priority: u16, weight: u16) -> RawSrvRecord {
         RawSrvRecord {
             target: target.to_owned(),
             port,
+            priority,
+            weight,
+        }
+    }
+
+    /// Deterministic [`WeightedRng`] that replays a scripted sequence of
+    /// values (each clamped into the requested `[0, max]` range) so the
+    /// weighted-shuffle ordering can be asserted exactly. Once the script
+    /// is exhausted it yields `0`, which selects the first remaining
+    /// record.
+    struct ScriptedRng {
+        values: std::collections::VecDeque<u32>,
+    }
+
+    impl ScriptedRng {
+        fn new(values: impl IntoIterator<Item = u32>) -> Self {
+            Self {
+                values: values.into_iter().collect(),
+            }
+        }
+    }
+
+    impl WeightedRng for ScriptedRng {
+        fn gen_range_inclusive(&mut self, max: u32) -> u32 {
+            self.values.pop_front().unwrap_or(0).min(max)
         }
     }
 
@@ -585,5 +755,199 @@ mod tests {
             }
             other => panic!("expected DomainMismatch, got {other:?}"),
         }
+    }
+
+    // ---------- order_by_priority_weight: priority ----------
+
+    fn ports(records: &[RawSrvRecord]) -> Vec<u16> {
+        records.iter().map(|r| r.port).collect()
+    }
+
+    #[test]
+    fn order_sorts_by_priority_ascending() {
+        // Records arrive out of priority order; lower priority must win.
+        let mut rng = ScriptedRng::new([]);
+        let ordered = order_by_priority_weight(
+            vec![
+                raw_pw("c.example.com", 3, 2, 0),
+                raw_pw("a.example.com", 1, 0, 0),
+                raw_pw("b.example.com", 2, 1, 0),
+            ],
+            &mut rng,
+        );
+        assert_eq!(ports(&ordered), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn order_preserves_input_order_for_equal_priority_zero_weight() {
+        // Atlas case: every record is priority 0 / weight 0, so the
+        // weighted shuffle must collapse to "keep resolver order".
+        let mut rng = ScriptedRng::new([]);
+        let ordered = order_by_priority_weight(
+            vec![
+                raw_pw("a.example.com", 1, 0, 0),
+                raw_pw("b.example.com", 2, 0, 0),
+                raw_pw("c.example.com", 3, 0, 0),
+            ],
+            &mut rng,
+        );
+        assert_eq!(ports(&ordered), vec![1, 2, 3]);
+    }
+
+    // ---------- order_by_priority_weight: weighted shuffle ----------
+
+    #[test]
+    fn order_weight_shuffle_selects_first_record_when_draw_is_low() {
+        // Two equal-priority weight-1 records, total weight 2. A draw of
+        // 1 reaches the first record's running sum, so it is selected.
+        let mut rng = ScriptedRng::new([1]);
+        let ordered = order_by_priority_weight(
+            vec![
+                raw_pw("a.example.com", 1, 0, 1),
+                raw_pw("b.example.com", 2, 0, 1),
+            ],
+            &mut rng,
+        );
+        assert_eq!(ports(&ordered), vec![1, 2]);
+    }
+
+    #[test]
+    fn order_weight_shuffle_selects_later_record_when_draw_is_high() {
+        // A draw of 2 only reaches the second record's running sum, so
+        // it is selected first and the order is reversed.
+        let mut rng = ScriptedRng::new([2]);
+        let ordered = order_by_priority_weight(
+            vec![
+                raw_pw("a.example.com", 1, 0, 1),
+                raw_pw("b.example.com", 2, 0, 1),
+            ],
+            &mut rng,
+        );
+        assert_eq!(ports(&ordered), vec![2, 1]);
+    }
+
+    #[test]
+    fn order_weight_shuffle_gives_zero_weight_record_the_lowest_running_sum() {
+        // RFC 2782 places weight-0 records first; with a draw of 0 the
+        // weight-0 record (`b`) is selected ahead of the weighted `a`,
+        // even though `a` appeared first in the input.
+        let mut rng = ScriptedRng::new([0]);
+        let ordered = order_by_priority_weight(
+            vec![
+                raw_pw("a.example.com", 1, 0, 5),
+                raw_pw("b.example.com", 2, 0, 0),
+            ],
+            &mut rng,
+        );
+        assert_eq!(ordered.first().map(|r| r.port), Some(2));
+    }
+
+    #[test]
+    fn order_weight_shuffle_is_scoped_within_priority_group() {
+        // The weighted reshuffle of the priority-0 pair must not pull the
+        // priority-1 record forward: it always trails the lower priority.
+        let mut rng = ScriptedRng::new([2]);
+        let ordered = order_by_priority_weight(
+            vec![
+                raw_pw("a.example.com", 1, 0, 1),
+                raw_pw("b.example.com", 2, 0, 1),
+                raw_pw("c.example.com", 3, 1, 0),
+            ],
+            &mut rng,
+        );
+        assert_eq!(ports(&ordered), vec![2, 1, 3]);
+    }
+
+    #[test]
+    fn order_weight_shuffle_favours_high_weight_records_with_real_rng() {
+        // Statistical check over the production entropy RNG: a 9:1 weight
+        // ratio should put the heavy record first the large majority of
+        // the time. The 70% threshold is well below the ~82% expectation
+        // (heavy wins unless the draw is 0 or 1 of 0..=10) to stay
+        // non-flaky.
+        let trials = 2000;
+        let mut heavy_first = 0;
+        for _ in 0..trials {
+            let ordered = order_by_priority_weight(
+                vec![
+                    raw_pw("light.example.com", 1, 0, 1),
+                    raw_pw("heavy.example.com", 2, 0, 9),
+                ],
+                &mut SplitMix64::from_entropy(),
+            );
+            if ordered.first().map(|r| r.port) == Some(2) {
+                heavy_first += 1;
+            }
+        }
+        assert!(
+            heavy_first > trials * 7 / 10,
+            "heavy record won first only {heavy_first}/{trials} times"
+        );
+    }
+
+    // ---------- SplitMix64 ----------
+
+    #[test]
+    fn splitmix_gen_range_respects_bounds() {
+        let mut rng = SplitMix64::from_entropy();
+        assert_eq!(rng.gen_range_inclusive(0), 0);
+        for _ in 0..1000 {
+            assert!(rng.gen_range_inclusive(7) <= 7);
+        }
+    }
+
+    #[test]
+    fn splitmix_produces_varied_output() {
+        // A fixed seed must still spread across the range rather than
+        // getting stuck on a single value.
+        let mut rng = SplitMix64::seeded(0x1234_5678_9ABC_DEF0);
+        let mut seen_zero = false;
+        let mut seen_one = false;
+        for _ in 0..200 {
+            match rng.gen_range_inclusive(1) {
+                0 => seen_zero = true,
+                1 => seen_one = true,
+                other => panic!("value {other} out of [0, 1]"),
+            }
+        }
+        assert!(seen_zero && seen_one);
+    }
+
+    #[test]
+    fn splitmix_is_deterministic_for_a_fixed_seed() {
+        let mut a = SplitMix64::seeded(42);
+        let mut b = SplitMix64::seeded(42);
+        for _ in 0..50 {
+            assert_eq!(a.gen_range_inclusive(1_000), b.gen_range_inclusive(1_000));
+        }
+    }
+
+    // ---------- resolve_with: ordering integration ----------
+
+    #[tokio::test]
+    async fn resolve_orders_records_by_srv_priority() {
+        // End-to-end through resolve_with: the resolver hands back records
+        // in priority order 2, 0, 1 and the proxy must reorder them so the
+        // lowest-priority (most-preferred) host is probed first. Distinct
+        // priorities make this independent of the weighted-shuffle RNG.
+        let lookup = lookup_returning(vec![
+            raw_pw("c.foo.mongodb.net.", 27019, 2, 0),
+            raw_pw("a.foo.mongodb.net.", 27017, 0, 0),
+            raw_pw("b.foo.mongodb.net.", 27018, 1, 0),
+        ]);
+
+        let hosts = resolve_with("cluster0.foo.mongodb.net", &lookup)
+            .await
+            .expect("ok");
+
+        let resolved: Vec<(&str, u16)> = hosts.iter().map(|h| (h.host.as_str(), h.port)).collect();
+        assert_eq!(
+            resolved,
+            vec![
+                ("a.foo.mongodb.net", 27017),
+                ("b.foo.mongodb.net", 27018),
+                ("c.foo.mongodb.net", 27019),
+            ]
+        );
     }
 }

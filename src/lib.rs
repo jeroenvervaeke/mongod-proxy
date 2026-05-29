@@ -84,7 +84,7 @@ pub use serve::{
     log::LogLayer,
     rewrite_hello::{RewriteHelloLayer, RewriteHelloService, RewriteHelloStream},
     serve,
-    service::{FromUriError, Proxy},
+    service::{FailoverConfig, FromUriError, Proxy},
 };
 pub use srv::{LookupFailure, SrvHost, SrvResolveError};
 pub use uri::ConnectionUriError;

@@ -413,4 +413,16 @@ mod tests {
         let picked = select_primary(&hosts, &ScriptedProbe).await.expect("primary");
         assert_eq!(picked.host, "slow-primary");
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn select_primary_returns_none_when_every_probe_times_out() {
+        // Every host hangs well past PROBE_TIMEOUT. Each probe's timeout
+        // must elapse (`Err(Elapsed)`), be treated as non-primary, and
+        // the call must still terminate with `None` rather than awaiting
+        // the hour-long sleeps. The paused clock auto-advances to the
+        // timeout instant once all tasks are idle.
+        let hosts = vec![host("hang", 27017), host("hang", 27018)];
+
+        assert!(select_primary(&hosts, &ScriptedProbe).await.is_none());
+    }
 }

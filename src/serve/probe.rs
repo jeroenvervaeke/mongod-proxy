@@ -85,7 +85,7 @@ pub enum ProbeError {
 
 /// Why a single SRV candidate was *not* chosen as the primary.
 ///
-/// [`select_primary`] records one of these per host whenever no host
+/// `select_primary` records one of these per host whenever no host
 /// reports itself primary, so the
 /// [`NoPrimary`](crate::SrvResolveError::NoPrimary) error returned to the
 /// operator can explain *why* each candidate was rejected. The bare
@@ -110,7 +110,7 @@ pub enum ProbeOutcome {
     #[error("probe failed: {0}")]
     Failed(#[from] ProbeError),
     /// The probe did not finish within the per-host timeout budget (see
-    /// [`DEFAULT_PROBE_TIMEOUT`]). The host may simply be cold-starting and
+    /// `DEFAULT_PROBE_TIMEOUT`). The host may simply be cold-starting and
     /// slow to answer its first `hello`.
     #[error("timed out")]
     TimedOut,

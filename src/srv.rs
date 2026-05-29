@@ -135,7 +135,7 @@ pub enum SrvResolveError {
     /// hides).
     ///
     /// `attempts` pairs every probed host with the reason it was rejected
-    /// (a [`ProbeOutcome`]) so an operator can tell apart "every host
+    /// (a [`ProbeOutcome`](crate::ProbeOutcome)) so an operator can tell apart "every host
     /// refused the TCP connect" (network policy), "the TLS handshake
     /// failed everywhere" (cert / SNI), and "every host answered but none
     /// is primary" (an election in progress). The

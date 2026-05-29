@@ -13,11 +13,11 @@
 //! The fix here is what every full driver does internally: issue a
 //! `hello` probe to each SRV candidate, find the one whose reply
 //! reports `isWritablePrimary == true`, and use that node as the
-//! upstream. Primary identity is captured *once* at startup — matching
-//! the existing "restart the proxy to re-resolve SRV" lifecycle in
-//! [`Proxy::from_srv`]. If Atlas fails over during the proxy's
-//! lifetime, the old primary starts rejecting writes and the operator
-//! must restart.
+//! upstream. The primary is selected at startup and then kept current
+//! by a background loop in [`Proxy::from_srv`] that re-runs this
+//! selection periodically (see
+//! [`FailoverConfig`](crate::FailoverConfig)), so an Atlas failover
+//! swaps the upstream target in place rather than requiring a restart.
 //!
 //! ## What lives here
 //!
@@ -95,6 +95,7 @@ pub(crate) trait PrimaryProbe: Send + Sync {
 /// [`ProxyClient`] to perform the dial + `hello` round-trip, so the
 /// probe socket goes through exactly the same TCP/TLS stack the
 /// forwarding path will use after selection.
+#[derive(Clone)]
 pub(crate) struct HelloProbe {
     tls_connector: Option<Arc<TlsConnector>>,
 }

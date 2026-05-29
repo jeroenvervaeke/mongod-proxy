@@ -25,6 +25,10 @@ webpki-roots = "1.0.0"
 hickory-resolver = "0.26.1"
 
 [dev-dependencies]
+# Adds `test-util` on top of the `full` feature set the main dependency
+# already enables, for `tokio::time::pause`/`advance` in the
+# failover-loop unit tests.
+tokio = { workspace = true, features = ["test-util"] }
 anyhow = "1.0.98"
 atlas-local = "0.6.1"
 bollard = "=0.20.1"

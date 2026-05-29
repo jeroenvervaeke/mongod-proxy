@@ -37,6 +37,11 @@
 //! cargo test --test e2e_intercept -- --nocapture
 //! ```
 
+// Library code in `src/` is held to a no-panic policy (see workspace lints
+// in the root `Cargo.toml`); integration tests are exempt because Rust
+// assertions and `Mutex`-poison handling are panic-based by design.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use std::{
     pin::Pin,
     sync::{Arc, Mutex},

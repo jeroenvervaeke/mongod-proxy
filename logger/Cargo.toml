@@ -6,6 +6,9 @@ rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 publish = false
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow = "1.0.98"
 futures = { workspace = true }

@@ -31,7 +31,7 @@
 //!     cargo test --test e2e_from_uri -- --nocapture
 //! ```
 
-use std::{env, time::Duration};
+use std::{env, error::Error, time::Duration};
 
 use futures::TryStreamExt;
 use mongod_proxy::{Proxy, serve};
@@ -44,15 +44,22 @@ use tokio::net::TcpListener;
 
 const ENV_URI: &str = "MONGOD_PROXY_E2E_ATLAS_URI";
 
+/// Returning `Result` (rather than panicking via `.expect()`) lets the
+/// test stay panic-free for every fallible setup step: any error
+/// short-circuits through `?` and is reported by the test harness
+/// without dumping a synthetic panic message that could otherwise echo
+/// driver-side error text into the CI log. Genuine *assertion* failures
+/// are still expressed via `assert!` — those are the test's intended
+/// failure mode and panic semantics are how the harness reports them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn proxy_forwards_traffic_when_built_from_uri_secret() {
+async fn proxy_forwards_traffic_when_built_from_uri_secret() -> Result<(), Box<dyn Error>> {
     // Self-skip when the secret isn't wired. Forked PRs and local
     // `cargo test` runs hit this path.
     let atlas_uri = match env::var(ENV_URI) {
         Ok(v) if !v.trim().is_empty() => v,
         _ => {
             eprintln!("skipping: {ENV_URI} not set");
-            return;
+            return Ok(());
         }
     };
 
@@ -62,13 +69,11 @@ async fn proxy_forwards_traffic_when_built_from_uri_secret() {
     // URIs `from_uri` issues the `_mongodb._tcp.<hostname>` lookup,
     // picks the first record, and configures the upstream socket for
     // TLS (the SRV-spec default).
-    let proxy = Proxy::from_uri(atlas_uri.trim())
-        .await
-        .expect("Proxy::from_uri must accept the secret URI");
+    let proxy = Proxy::from_uri(atlas_uri.trim()).await?;
 
     // ----- 2. Bind a local proxy port and start serving -----
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind proxy");
-    let proxy_port = listener.local_addr().unwrap().port();
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let proxy_port = listener.local_addr()?.port();
     eprintln!("proxy listening on 127.0.0.1:{proxy_port}");
 
     let proxy_task = tokio::spawn(async move {
@@ -78,10 +83,9 @@ async fn proxy_forwards_traffic_when_built_from_uri_secret() {
     // ----- 3. Build driver options pointing at the proxy ---------------
     //
     // The driver URI we hand to `ClientOptions::parse` deliberately
-    // carries NO credentials: if parsing ever panicked (it shouldn't —
-    // the URI is statically valid), the panic message would otherwise
-    // echo the secret in plaintext, and GitHub Actions' secret masking
-    // only matches the exact stored value. Credentials are set on the
+    // carries NO credentials: any parse error here would otherwise echo
+    // the secret in plaintext, and GitHub Actions' secret masking only
+    // matches the exact stored value. Credentials are set on the
     // resulting `ClientOptions` directly — `Credential`'s `Debug` impl
     // is hardcoded to `REDACTED`, so even `{options:?}` is safe.
     //
@@ -90,8 +94,7 @@ async fn proxy_forwards_traffic_when_built_from_uri_secret() {
     let mut options = ClientOptions::parse(format!(
         "mongodb://127.0.0.1:{proxy_port}/?directConnection=true"
     ))
-    .await
-    .expect("static driver URI must parse");
+    .await?;
 
     if let Some((user, pass)) = extract_user_password(&atlas_uri) {
         // Atlas needs the real credentials to complete SASL upstream.
@@ -108,7 +111,7 @@ async fn proxy_forwards_traffic_when_built_from_uri_secret() {
     // burn a few hundred ms; give server selection some headroom over
     // the driver's 30s default to absorb a slow Atlas cold-start.
     options.server_selection_timeout = Some(Duration::from_secs(30));
-    let client = Client::with_options(options).expect("build mongodb client");
+    let client = Client::with_options(options)?;
 
     // ----- 4. Drive a few representative commands through the proxy --
     //
@@ -124,15 +127,9 @@ async fn proxy_forwards_traffic_when_built_from_uri_secret() {
     // SRV → TLS upstream → wire forwarding → hello rewrite — works.
     let admin = client.database("admin");
 
-    admin
-        .run_command(doc! { "ping": 1 })
-        .await
-        .expect("admin.ping must succeed through the proxy");
+    admin.run_command(doc! { "ping": 1 }).await?;
 
-    let hello = admin
-        .run_command(doc! { "hello": 1 })
-        .await
-        .expect("admin.hello must succeed through the proxy");
+    let hello = admin.run_command(doc! { "hello": 1 }).await?;
     // RewriteHelloLayer is on by default — these fields must not appear
     // in the reply, regardless of how the upstream is configured. If
     // they leak through, the driver would have re-SDAMed and broken
@@ -141,14 +138,11 @@ async fn proxy_forwards_traffic_when_built_from_uri_secret() {
     for stripped in ["setName", "hosts", "primary", "me"] {
         assert!(
             !hello.contains_key(stripped),
-            "hello reply still carried `{stripped}` after RewriteHelloLayer ran: {hello:?}",
+            "hello reply still carried `{stripped}` after RewriteHelloLayer ran",
         );
     }
 
-    let dbs = client
-        .list_database_names()
-        .await
-        .expect("listDatabases must succeed through the proxy");
+    let dbs = client.list_database_names().await?;
     eprintln!("listDatabases returned {} databases", dbs.len());
 
     // ----- 5. Round-trip a document so wire-level read+write paths run -
@@ -162,22 +156,19 @@ async fn proxy_forwards_traffic_when_built_from_uri_secret() {
     let coll = db.collection::<mongodb::bson::Document>("ping");
 
     coll.insert_one(doc! { "marker": "from_uri-e2e", "n": 1i32 })
-        .await
-        .expect("insert_one must succeed through the proxy");
+        .await?;
 
     let found: Vec<_> = coll
         .find(doc! { "marker": "from_uri-e2e" })
-        .await
-        .expect("find must succeed through the proxy")
+        .await?
         .try_collect()
-        .await
-        .expect("cursor drain must succeed through the proxy");
+        .await?;
     assert!(
         !found.is_empty(),
         "round-tripped insert should be visible via find"
     );
 
-    // Best-effort cleanup. We don't assert on this — if the test user
+    // Best-effort cleanup. We don't surface this — if the test user
     // lacks dropDatabase permission, the leftover db is named uniquely
     // per run and easy to clean up out of band.
     let _ = db.drop().await;
@@ -187,6 +178,7 @@ async fn proxy_forwards_traffic_when_built_from_uri_secret() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     proxy_task.abort();
     let _ = proxy_task.await;
+    Ok(())
 }
 
 /// Pulls `(user, Option<pass>)` out of `mongodb[+srv]://user:pass@host/...`.

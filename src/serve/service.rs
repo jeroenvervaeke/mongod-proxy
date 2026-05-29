@@ -175,11 +175,16 @@ impl Proxy<Identity> {
         use_tls: bool,
     ) -> Result<Self, crate::srv::SrvResolveError> {
         let hosts = crate::srv::resolve(srv_hostname).await?;
-        // `resolve` returns Err(NoRecords) on an empty vec, so first is always Some.
-        let first = hosts
-            .into_iter()
-            .next()
-            .expect("srv::resolve guarantees at least one record on Ok");
+        // `resolve` guarantees a non-empty vec on Ok, but re-check the
+        // invariant defensively so a future contract change can't turn
+        // this into a panic — return NoRecords instead.
+        let first =
+            hosts
+                .into_iter()
+                .next()
+                .ok_or_else(|| crate::srv::SrvResolveError::NoRecords {
+                    hostname: srv_hostname.to_owned(),
+                })?;
         Ok(Self::new(first.host, first.port, use_tls))
     }
 

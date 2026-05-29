@@ -1,0 +1,11 @@
+# clippy configuration. See https://doc.rust-lang.org/clippy/lint_configuration.html
+#
+# Lints (`unwrap_used`, `expect_used`, `panic`, ...) themselves live in the
+# workspace `Cargo.toml`'s `[workspace.lints.clippy]` table — this file only
+# tunes per-lint behaviour that has no `lints` syntax. The "no panics in
+# library code" rule is the project's intent; assertions are *fundamentally*
+# panics, so we exempt `#[cfg(test)]` modules so `assert!`, `.unwrap()`, and
+# `.expect()` remain available as test idioms.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true

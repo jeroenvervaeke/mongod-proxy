@@ -26,7 +26,7 @@ use bollard::{
     },
 };
 use futures::TryStreamExt;
-use mongodb::{Client, bson::doc, options::ClientOptions};
+use mongodb::{Client, bson::Bson, bson::Document, bson::doc, options::ClientOptions};
 
 /// Plain `mongod` image used for the standalone case. `mongo:latest`
 /// follows the same convention as `atlas-local`'s default
@@ -310,4 +310,327 @@ async fn start_standalone(
             container_id: container.id,
         },
     })
+}
+
+// ===========================================================================
+// Multi-node replica set
+//
+// `atlas-local` 0.6.1 can only create a single-node replica set (its
+// `CreateDeploymentOptions` has no member-count knob), and a single-node set
+// always reports its one host as primary. That can't exercise the multi-host
+// `select_primary` / `HelloProbe` path the proxy uses when an earlier seed /
+// SRV record is a *secondary*. So we hand-roll a real 3-member replica set
+// from plain `mongo:latest` containers and `rs.initiate` it via the driver.
+//
+// Networking: every node runs with Docker host networking and binds a
+// distinct loopback port (27117/27118/27119). Host networking makes the
+// members reach one another at the *same* `127.0.0.1:<port>` the host (and
+// thus the in-process proxy) uses, so the replica-set config addresses are
+// valid from both sides. This is Linux-only, which matches the CI `test`
+// job (ubuntu-latest) where this actually runs; on a machine without a
+// reachable daemon the caller self-skips before getting here.
+// ===========================================================================
+
+/// Replica-set name used for the hand-rolled multi-node deployment.
+const REPLICA_SET_NAME: &str = "rs0";
+
+/// Loopback ports the three members bind, in member order. Picked high to
+/// avoid colliding with a developer's local `mongod` on 27017.
+const REPLICA_SET_PORTS: [u16; 3] = [27117, 27118, 27119];
+
+/// A hand-rolled multi-node replica set: three `mongo:latest` containers
+/// wired into one `rs.initiate`d set, exposed on loopback ports.
+///
+/// Construct via [`start_replica_set`]; tear every container down via
+/// [`shutdown`](Self::shutdown) on the happy path or a
+/// [`ReplicaSetCleanup`] captured in a `scopeguard` for panic-safe cleanup.
+pub struct ReplicaSet {
+    docker: Docker,
+    /// Container ids in member order (parallel to [`REPLICA_SET_PORTS`]).
+    container_ids: Vec<String>,
+    /// Loopback ports each member binds, in member order.
+    ports: Vec<u16>,
+}
+
+/// Cleanup-only view of a [`ReplicaSet`]; force-removes every member
+/// container. Cheap to construct and `Send` so it can ride in a `scopeguard`.
+pub struct ReplicaSetCleanup {
+    docker: Docker,
+    container_ids: Vec<String>,
+}
+
+impl ReplicaSet {
+    /// Loopback ports of every member, in member order.
+    pub fn ports(&self) -> &[u16] {
+        &self.ports
+    }
+
+    /// Build a `mongodb://h1,h2,h3/` seed list pointing at every member,
+    /// with `directConnection` left off so the driver / proxy treats it as
+    /// a seed list to probe.
+    pub fn seed_uri(&self, ports: &[u16]) -> String {
+        let hosts = ports
+            .iter()
+            .map(|p| format!("127.0.0.1:{p}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("mongodb://{hosts}/")
+    }
+
+    /// Discover the current primary's loopback port by issuing `hello` to
+    /// each member directly until one reports `isWritablePrimary`.
+    ///
+    /// Retries with backoff: immediately after `rs.initiate` (or a
+    /// step-down) an election is in flight and there is briefly no primary.
+    pub async fn current_primary_port(
+        &self,
+    ) -> Result<u16, Box<dyn std::error::Error + Send + Sync>> {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut last: Option<String> = None;
+        while Instant::now() < deadline {
+            for &port in &self.ports {
+                match member_is_primary(port).await {
+                    Ok(true) => return Ok(port),
+                    Ok(false) => {}
+                    Err(e) => last = Some(e.to_string()),
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        Err(format!("no member reported itself primary in time; last error = {last:?}").into())
+    }
+
+    /// Order the member ports so the current primary comes *last*. Feeding
+    /// this to [`seed_uri`](Self::seed_uri) yields a seed list whose earlier
+    /// entries are all secondaries, forcing the proxy's `select_primary`
+    /// path to skip them and probe its way to the primary.
+    pub async fn ports_primary_last(
+        &self,
+    ) -> Result<Vec<u16>, Box<dyn std::error::Error + Send + Sync>> {
+        let primary = self.current_primary_port().await?;
+        let mut ordered: Vec<u16> = self
+            .ports
+            .iter()
+            .copied()
+            .filter(|&p| p != primary)
+            .collect();
+        ordered.push(primary);
+        Ok(ordered)
+    }
+
+    /// Step the current primary down for `seconds`, forcing a new election.
+    ///
+    /// `replSetStepDown` closes the command connection by design, so the
+    /// driver surfaces an error even on success; we treat that as expected
+    /// and let the caller re-discover the new primary.
+    pub async fn step_down_primary(
+        &self,
+        seconds: u32,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let primary = self.current_primary_port().await?;
+        let client = direct_client(primary).await?;
+        // The server drops the connection as part of stepping down, so an
+        // Err here is the normal outcome — only a clean Ok or a dropped
+        // connection both mean "stepped down".
+        let _ = client
+            .database("admin")
+            .run_command(doc! { "replSetStepDown": i32::try_from(seconds).unwrap_or(i32::MAX) })
+            .await;
+        Ok(())
+    }
+
+    /// Cheap-to-clone cleanup-only view for panic-safe `scopeguard` teardown.
+    pub fn cleanup_handle(&self) -> ReplicaSetCleanup {
+        ReplicaSetCleanup {
+            docker: self.docker.clone(),
+            container_ids: self.container_ids.clone(),
+        }
+    }
+
+    /// Happy-path teardown: force-remove every member container.
+    pub async fn shutdown(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        remove_containers(&self.docker, &self.container_ids).await
+    }
+}
+
+impl ReplicaSetCleanup {
+    pub async fn shutdown(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        remove_containers(&self.docker, &self.container_ids).await
+    }
+}
+
+async fn remove_containers(
+    docker: &Docker,
+    container_ids: &[String],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    for id in container_ids {
+        // Best-effort: keep removing the rest even if one is already gone.
+        let _ = docker
+            .remove_container(
+                id,
+                Some(RemoveContainerOptionsBuilder::default().force(true).build()),
+            )
+            .await;
+    }
+    Ok(())
+}
+
+/// Direct (`directConnection=true`) client to a single member on `port`.
+/// Bypasses SDAM so the driver talks to exactly that mongod, even when it's
+/// a secondary, which is what the `hello`/step-down probes need.
+async fn direct_client(port: u16) -> Result<Client, Box<dyn std::error::Error + Send + Sync>> {
+    let uri = format!("mongodb://127.0.0.1:{port}/?directConnection=true");
+    let mut options = ClientOptions::parse(&uri).await?;
+    options.server_selection_timeout = Some(Duration::from_secs(5));
+    Ok(Client::with_options(options)?)
+}
+
+/// `true` iff the member on `port` answers `hello` with
+/// `isWritablePrimary: true` (the modern field; falls back to the legacy
+/// `ismaster`).
+async fn member_is_primary(port: u16) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let client = direct_client(port).await?;
+    let reply = client
+        .database("admin")
+        .run_command(doc! { "hello": 1 })
+        .await?;
+    // `get(..).and_then(Bson::as_bool)` reads the same way across bson
+    // major versions (unlike the typed `get_bool`, whose return shape and
+    // availability shifted between 2.x and 3.x). Modern servers send
+    // `isWritablePrimary`; the legacy `ismaster` is the fallback.
+    let primary = reply
+        .get("isWritablePrimary")
+        .or_else(|| reply.get("ismaster"))
+        .and_then(Bson::as_bool)
+        .unwrap_or(false);
+    Ok(primary)
+}
+
+/// Boot a 3-member replica set from plain `mongo:latest` containers and
+/// `rs.initiate` it, returning once a primary has been elected.
+///
+/// See the module-level comment on the multi-node section for the
+/// host-networking rationale.
+pub async fn start_replica_set(
+    docker: &Docker,
+) -> Result<ReplicaSet, Box<dyn std::error::Error + Send + Sync>> {
+    // Ensure the image is present (no-op when already cached).
+    let _: Vec<_> = docker
+        .create_image(
+            Some(
+                CreateImageOptionsBuilder::default()
+                    .from_image(STANDALONE_IMAGE)
+                    .build(),
+            ),
+            None,
+            None,
+        )
+        .try_collect()
+        .await?;
+
+    let ports: Vec<u16> = REPLICA_SET_PORTS.to_vec();
+    let mut container_ids = Vec::with_capacity(ports.len());
+
+    // Register a defensive cleanup: if any later step fails, the containers
+    // we already started must still be torn down. We collect ids as we go.
+    for &port in &ports {
+        let container = docker
+            .create_container(
+                Some(CreateContainerOptionsBuilder::default().build()),
+                ContainerCreateBody {
+                    image: Some(STANDALONE_IMAGE.to_string()),
+                    cmd: Some(vec![
+                        "mongod".to_string(),
+                        "--replSet".to_string(),
+                        REPLICA_SET_NAME.to_string(),
+                        "--port".to_string(),
+                        port.to_string(),
+                        // Bind all interfaces; with host networking the proxy
+                        // and the peer members all reach it via 127.0.0.1.
+                        "--bind_ip_all".to_string(),
+                    ]),
+                    host_config: Some(HostConfig {
+                        // Host networking so member<->member addresses
+                        // (127.0.0.1:<port>) are valid from inside the
+                        // containers *and* from the host-side proxy.
+                        network_mode: Some("host".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        let container = match container {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = remove_containers(docker, &container_ids).await;
+                return Err(e.into());
+            }
+        };
+
+        if let Err(e) = docker
+            .start_container(&container.id, None::<StartContainerOptions>)
+            .await
+        {
+            container_ids.push(container.id);
+            let _ = remove_containers(docker, &container_ids).await;
+            return Err(e.into());
+        }
+        container_ids.push(container.id);
+    }
+
+    // From here on, errors must tear down every started container.
+    let result = initiate_replica_set(&ports).await;
+    if let Err(e) = result {
+        let _ = remove_containers(docker, &container_ids).await;
+        return Err(e);
+    }
+
+    let rs = ReplicaSet {
+        docker: docker.clone(),
+        container_ids,
+        ports,
+    };
+
+    // Block until an actual primary exists (election completes) so the
+    // caller can immediately query topology.
+    if let Err(e) = rs.current_primary_port().await {
+        let _ = remove_containers(&rs.docker, &rs.container_ids).await;
+        return Err(e);
+    }
+
+    Ok(rs)
+}
+
+/// Wait for every member to accept pings, then `replSetInitiate` a config
+/// listing all three as `127.0.0.1:<port>` voting members.
+async fn initiate_replica_set(
+    ports: &[u16],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    for &port in ports {
+        let uri = format!("mongodb://127.0.0.1:{port}/?directConnection=true");
+        wait_ready(&uri).await?;
+    }
+
+    let members: Vec<Document> = ports
+        .iter()
+        .enumerate()
+        .map(|(i, p)| doc! { "_id": i as i32, "host": format!("127.0.0.1:{p}") })
+        .collect();
+
+    let config = doc! {
+        "_id": REPLICA_SET_NAME,
+        "members": members,
+    };
+
+    // Initiate against the first member. The set has no config yet, so a
+    // direct connection is required (SDAM would refuse an uninitialised set).
+    let client = direct_client(ports[0]).await?;
+    client
+        .database("admin")
+        .run_command(doc! { "replSetInitiate": config })
+        .await?;
+
+    Ok(())
 }

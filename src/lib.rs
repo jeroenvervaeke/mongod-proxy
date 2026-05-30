@@ -62,6 +62,7 @@ pub mod ids;
 pub mod message;
 pub mod op_code;
 pub mod operation;
+pub mod redact;
 pub mod serve;
 pub mod srv;
 mod uri;

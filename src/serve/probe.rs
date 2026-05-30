@@ -977,6 +977,17 @@ mod tests {
         let messages = layer.messages.clone();
         let subscriber = Registry::default().with(layer);
         let _guard = tracing::subscriber::set_default(subscriber);
+        // `tracing` caches each callsite's interest globally the first time it
+        // is evaluated. Because this capturing subscriber is installed only on
+        // the current thread (`set_default`, not `set_global_default`), a
+        // callsite first hit while the global default is `NoSubscriber` can
+        // cache its interest as "never" — after which the `info!`/`debug!`
+        // events in `select_primary` are skipped before this thread-local
+        // subscriber is ever consulted, and the assertions flake depending on
+        // cross-test scheduling. Rebuilding the cache re-evaluates every
+        // callsite against the now-installed subscriber, making capture
+        // deterministic.
+        tracing::callsite::rebuild_interest_cache();
         fut.await;
         let buf = messages.lock().expect("messages mutex poisoned");
         buf.clone()

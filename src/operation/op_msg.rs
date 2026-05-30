@@ -176,7 +176,7 @@ pub enum OperationMessageParseError {
     DocumentSequenceIdentifierNotUtf8(#[from] Utf8Error),
     /// BSON parsing of a section document failed.
     #[error("failed to parse bson: {0}")]
-    InvalidBson(#[from] bson::de::Error),
+    InvalidBson(#[from] bson::error::Error),
 }
 
 /// Failure modes for [`OperationMessage::write_bytes`].
@@ -184,7 +184,7 @@ pub enum OperationMessageParseError {
 pub enum OperationMessageWriteError {
     /// Serialising a section's BSON document failed.
     #[error("failed to serialize sections: {0}")]
-    SerializeError(#[from] bson::ser::Error),
+    SerializeError(#[from] bson::error::Error),
     /// A document-sequence section's identifier contained an interior NUL
     /// byte and so could not be written as a C string.
     #[error("document sequence identifier contains null byte: {0}")]
@@ -508,7 +508,7 @@ mod tests {
         // Use bit 2 (unknown required).
         body.extend_from_slice(&(1u32 << 2).to_le_bytes());
         body.push(0); // kind
-        let doc_bytes = bson::to_vec(&doc! { "hello": 1 }).unwrap();
+        let doc_bytes = bson::serialize_to_vec(&doc! { "hello": 1 }).unwrap();
         body.extend_from_slice(&doc_bytes);
 
         let err = OperationMessage::from_bytes(&body).unwrap_err();
@@ -524,7 +524,7 @@ mod tests {
         // Set bit 17 (unknown optional) — must be silently cleared per spec.
         body.extend_from_slice(&(1u32 << 17).to_le_bytes());
         body.push(0);
-        let doc_bytes = bson::to_vec(&doc! { "hello": 1 }).unwrap();
+        let doc_bytes = bson::serialize_to_vec(&doc! { "hello": 1 }).unwrap();
         body.extend_from_slice(&doc_bytes);
 
         let parsed = OperationMessage::from_bytes(&body).unwrap();

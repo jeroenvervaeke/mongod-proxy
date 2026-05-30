@@ -25,13 +25,13 @@ pub enum ExplainParseError {
     Deserialise {
         raw_preview: String,
         #[source]
-        source: bson::de::Error,
+        source: bson::error::Error,
     },
     #[error("explain reply with ok=0 had malformed error body (preview: {raw_preview}): {source}")]
     MalformedServerError {
         raw_preview: String,
         #[source]
-        source: bson::de::Error,
+        source: bson::error::Error,
     },
     #[error("plan node at depth {depth} had both inputStage and inputStages")]
     BothChildrenShapesPresent { depth: usize },

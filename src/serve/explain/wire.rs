@@ -1,5 +1,5 @@
 //! Raw wire types — `serde::Deserialize`d directly from the explain reply
-//! body via `bson::from_document`.
+//! body via `bson::deserialize_from_document`.
 //!
 //! These are `pub(crate)`: downstream code only ever sees the public typed
 //! model in [`super::model`]. The raw types are the boundary layer where

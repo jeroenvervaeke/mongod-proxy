@@ -69,7 +69,7 @@ pub(crate) fn parse_reply_doc(
         OkOutcome::Rejected => {
             // Compute the preview BEFORE consuming `doc` into from_document.
             let preview = super::util::truncate_doc_preview(&doc, 256);
-            match bson::from_document::<RawServerError>(doc) {
+            match bson::deserialize_from_document::<RawServerError>(doc) {
                 Ok(raw) => Ok(Err(ExplainServerError::Rejected {
                     message: raw.message,
                     code: raw.code,
@@ -84,7 +84,7 @@ pub(crate) fn parse_reply_doc(
         }
         OkOutcome::Success => {
             let preview = super::util::truncate_doc_preview(&doc, 256);
-            match bson::from_document::<RawExplainReply>(doc) {
+            match bson::deserialize_from_document::<RawExplainReply>(doc) {
                 Ok(reply) => Ok(Ok(reply)),
                 Err(source) => Err(ExplainParseError::Deserialise {
                     raw_preview: preview,

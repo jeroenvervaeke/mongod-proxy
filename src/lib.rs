@@ -85,7 +85,7 @@ pub use serve::{
     probe::{ProbeError, ProbeOutcome},
     rewrite_hello::{RewriteHelloLayer, RewriteHelloService, RewriteHelloStream},
     serve,
-    service::{FailoverConfig, FromUriError, Proxy},
+    service::{FailoverConfig, FromUriError, Proxy, TlsConfig},
 };
 pub use srv::{LookupFailure, SrvHost, SrvResolveError};
 pub use uri::ConnectionUriError;

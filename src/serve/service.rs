@@ -10,7 +10,7 @@
 use std::{
     net::SocketAddr,
     pin::Pin,
-    sync::{Arc, Once, PoisonError, RwLock, Weak},
+    sync::{Arc, Once},
     task::{Context, Poll},
     time::Duration,
 };
@@ -20,7 +20,7 @@ use rustls_pki_types::{InvalidDnsNameError, ServerName};
 use tokio::{
     io::{self, AsyncRead, AsyncWrite, split},
     net::TcpStream,
-    sync::{Mutex, OwnedMutexGuard},
+    sync::{Mutex, OwnedMutexGuard, watch},
 };
 #[cfg(feature = "dangerous-insecure-tls")]
 use tokio_rustls::rustls::{
@@ -241,25 +241,27 @@ impl ServerCertVerifier for InsecureServerVerifier {
 
 /// The upstream `host:port` the proxy currently forwards to.
 ///
-/// Held behind an [`Arc<RwLock<Target>>`] inside [`Proxy`] so the
+/// Held behind a [`tokio::sync::watch`] channel inside [`Proxy`] so the
 /// background failover loop spawned by [`Proxy::from_srv`] can swap it
 /// out atomically when the replica-set primary changes, without
 /// disturbing connections already in flight (each [`ProxyClient`] keeps
 /// the socket it dialled; only *new* connections read the swapped value).
+/// A watch channel gives lock-free reads (`tx.borrow().clone()`) with no
+/// poison handling, and lets the re-probe loop observe the channel
+/// closing when the [`Proxy`] (and thus the [`watch::Sender`]) drops.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Target {
     host: String,
     port: u16,
 }
 
-/// Reads the current upstream target, tolerating a poisoned lock.
+/// Reads the current upstream target from the watch channel.
 ///
-/// The only writer is the single-threaded failover loop and its critical
-/// section can't panic, so poisoning is effectively impossible — but the
-/// no-panic policy still forbids `unwrap()`, so we recover the guard via
-/// [`PoisonError::into_inner`] rather than risk a panic.
-fn read_target(target: &RwLock<Target>) -> (String, u16) {
-    let guard = target.read().unwrap_or_else(PoisonError::into_inner);
+/// The borrow is synchronous and short-lived — cloned out immediately and
+/// never held across an `.await` — so there is no lock to poison and no
+/// guard to leak. Returns an owned `(host, port)` pair for the caller.
+fn read_target(target: &watch::Sender<Target>) -> (String, u16) {
+    let guard = target.borrow();
     (guard.host.clone(), guard.port)
 }
 
@@ -296,13 +298,26 @@ type ServerWriter = FramedWrite<BoxedAsyncWrite, WireEncoder>;
 /// // `proxy` is now a `Service<SocketAddr>` ready to hand to `serve(...)`.
 /// # let _ = proxy;
 /// ```
+#[must_use = "a Proxy does nothing until passed to serve()"]
 pub struct Proxy<L> {
     /// Current upstream target, read fresh for every accepted connection.
     ///
     /// For [`Proxy::new`] this never changes. For [`Proxy::from_srv`] a
     /// background task swaps it on replica-set failover (see
     /// [`Proxy::from_srv_with`] and [`FailoverConfig`]).
-    target: Arc<RwLock<Target>>,
+    ///
+    /// Stored as the [`watch::Sender`] half: it both holds the latest
+    /// [`Target`] (read via `borrow()`) and keeps the channel open. Reads
+    /// are lock-free `borrow().clone()`s; failover swaps go through
+    /// [`watch::Sender::send_replace`].
+    target: watch::Sender<Target>,
+    /// Keepalive [`watch::Receiver`] held purely so the background re-probe
+    /// loop can detect this [`Proxy`] being dropped: the loop owns a cloned
+    /// [`watch::Sender`] (so it can swap the target) and waits on
+    /// [`watch::Sender::closed`], which resolves only once every receiver is
+    /// gone. Dropping the [`Proxy`] drops this receiver, closing the
+    /// channel and signalling the loop to stop near-immediately.
+    _target_keepalive: watch::Receiver<Target>,
     tls_connector: Option<Arc<TlsConnector>>,
     /// When true, every per-connection service has a [`RewriteHelloLayer`]
     /// inserted *between* the user-supplied layer stack and the inner
@@ -333,6 +348,9 @@ impl Proxy<Identity> {
     /// Opt out with [`disable_rewrite_hello`](Proxy::disable_rewrite_hello)
     /// only when you specifically need the upstream's topology visible to
     /// drivers.
+    // The `Proxy` struct is already `#[must_use]`, which covers this
+    // `-> Self` constructor; a second bare attribute would be redundant
+    // (`clippy::double_must_use`).
     pub fn new(destination_name: impl Into<String>, destination_port: u16, use_tls: bool) -> Self {
         let tls = if use_tls {
             TlsConfig::System
@@ -366,26 +384,32 @@ impl Proxy<Identity> {
     /// let proxy = Proxy::with_tls("127.0.0.1", 27017, TlsConfig::Disabled);
     /// # let _ = proxy;
     /// ```
+    // The `Proxy` struct is already `#[must_use]` (see `Proxy::new`).
     pub fn with_tls(
         destination_name: impl Into<String>,
         destination_port: u16,
         tls: TlsConfig,
     ) -> Self {
         let tls_connector = build_tls_connector(tls);
-        let target = Arc::new(RwLock::new(Target {
+        let target = watch::Sender::new(Target {
             host: destination_name.into(),
             port: destination_port,
-        }));
+        });
         Self::with_target(target, tls_connector)
     }
 
-    /// Inner constructor over a pre-built, swappable [`Target`] cell and a
-    /// shared `Arc<TlsConnector>`. [`Proxy::from_srv`] hands in a cell it
-    /// also wired a background failover loop to; [`Proxy::new`] hands in a
-    /// cell that never changes.
-    fn with_target(target: Arc<RwLock<Target>>, tls_connector: Option<Arc<TlsConnector>>) -> Self {
+    /// Inner constructor over a pre-built, swappable [`Target`] channel and
+    /// a shared `Arc<TlsConnector>`. [`Proxy::from_srv`] hands in a sender
+    /// it also wired a background failover loop to; [`Proxy::new`] hands in
+    /// a sender whose value never changes.
+    fn with_target(
+        target: watch::Sender<Target>,
+        tls_connector: Option<Arc<TlsConnector>>,
+    ) -> Self {
+        let _target_keepalive = target.subscribe();
         Self {
             target,
+            _target_keepalive,
             tls_connector,
             rewrite_hello: true,
 
@@ -441,8 +465,9 @@ impl Proxy<Identity> {
     /// # let _ = proxy;
     /// # Ok(()) }
     /// ```
+    #[must_use = "a Proxy does nothing until passed to serve()"]
     pub async fn from_srv(
-        srv_hostname: &str,
+        srv_hostname: impl Into<String>,
         use_tls: bool,
     ) -> Result<Self, crate::srv::SrvResolveError> {
         Self::from_srv_with(srv_hostname, use_tls, FailoverConfig::default()).await
@@ -464,15 +489,56 @@ impl Proxy<Identity> {
     /// fail here — once the proxy is built, later re-probe failures are
     /// logged via `tracing` and leave the current target in place rather
     /// than tearing the proxy down.
+    #[must_use = "a Proxy does nothing until passed to serve()"]
     pub async fn from_srv_with(
-        srv_hostname: &str,
+        srv_hostname: impl Into<String>,
         use_tls: bool,
         failover: FailoverConfig,
     ) -> Result<Self, crate::srv::SrvResolveError> {
+        let tls = if use_tls {
+            TlsConfig::System
+        } else {
+            TlsConfig::Disabled
+        };
+        Self::from_srv_with_tls(srv_hostname, tls, failover).await
+    }
+
+    /// Like [`from_srv_with`](Self::from_srv_with) but with full control
+    /// over the upstream TLS trust policy via [`TlsConfig`], closing the
+    /// gap where SRV-resolved upstreams could only ever use the default
+    /// `webpki-roots` connector.
+    ///
+    /// [`from_srv`](Self::from_srv) / [`from_srv_with`](Self::from_srv_with)
+    /// take only `use_tls: bool`, which hard-codes
+    /// [`TlsConfig::System`] (or [`TlsConfig::Disabled`]). That left
+    /// [`TlsConfig::WithRoots`] (forward to an internal-CA Atlas-like
+    /// cluster) and — under the `dangerous-insecure-tls` feature —
+    /// [`TlsConfig::Insecure`] unreachable for SRV deployments. This
+    /// constructor builds the upstream connector from the supplied
+    /// [`TlsConfig`] through the same internal `build_tls_connector` helper
+    /// [`Proxy::with_tls`] and [`Proxy::from_uri`] use, instead of the
+    /// default connector.
+    ///
+    /// Note: the same [`TlsConfig`] is also used for the `hello` probes
+    /// that select (and re-select) the primary, so a private-CA cluster is
+    /// probed under the policy it is forwarded under.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`from_srv_with`](Self::from_srv_with): see
+    /// [`crate::srv::SrvResolveError`]. Only the initial selection can
+    /// fail; later re-probe failures are logged and leave the current
+    /// target in place.
+    #[must_use = "a Proxy does nothing until passed to serve()"]
+    pub async fn from_srv_with_tls(
+        srv_hostname: impl Into<String>,
+        tls: TlsConfig,
+        failover: FailoverConfig,
+    ) -> Result<Self, crate::srv::SrvResolveError> {
         Self::from_srv_inner(
-            srv_hostname,
+            &srv_hostname.into(),
             crate::srv::DEFAULT_SRV_SERVICE_NAME,
-            use_tls,
+            tls,
             failover,
         )
         .await
@@ -489,11 +555,11 @@ impl Proxy<Identity> {
     async fn from_srv_inner(
         srv_hostname: &str,
         service_name: &str,
-        use_tls: bool,
+        tls: TlsConfig,
         failover: FailoverConfig,
     ) -> Result<Self, crate::srv::SrvResolveError> {
         let hosts = crate::srv::resolve_with_service_name(srv_hostname, service_name).await?;
-        let tls_connector = use_tls.then(default_tls_connector);
+        let tls_connector = build_tls_connector(tls);
         let probe = crate::serve::probe::HelloProbe::new(tls_connector.clone());
         let probe_timeout = failover.probe_timeout;
         let target = select_target(&hosts, &probe, probe_timeout)
@@ -503,15 +569,21 @@ impl Proxy<Identity> {
                 attempts,
             })?;
 
+        // Build the proxy first so its keepalive `watch::Receiver` exists
+        // before the loop is spawned: the loop's `closed()` shutdown signal
+        // keys off that receiver, so spawning after construction is
+        // race-free.
+        let proxy = Self::with_target(target, tls_connector.clone());
+
         if let Some(interval) = failover.reprobe_interval {
             let hostname = srv_hostname.to_owned();
             let service_name = service_name.to_owned();
             let tls = tls_connector.clone();
-            // The loop owns only a `Weak` handle to the target, so it
-            // self-terminates once the `Proxy` (and its serve loop) is
-            // dropped. Each tick builds a self-contained future that
+            // The loop owns only a cloned `watch::Sender`, so it
+            // self-terminates once the `Proxy` (and its keepalive receiver)
+            // is dropped. Each tick builds a self-contained future that
             // re-resolves SRV and re-selects the primary.
-            spawn_reprobe_loop(interval, &target, move || {
+            spawn_reprobe_loop(interval, &proxy.target, move || {
                 let hostname = hostname.clone();
                 let service_name = service_name.clone();
                 let probe = crate::serve::probe::HelloProbe::new(tls.clone());
@@ -519,7 +591,7 @@ impl Proxy<Identity> {
             });
         }
 
-        Ok(Self::with_target(target, tls_connector))
+        Ok(proxy)
     }
 
     /// Constructs a proxy from any MongoDB connection string — both
@@ -580,6 +652,7 @@ impl Proxy<Identity> {
     /// # let _ = proxy;
     /// # Ok(()) }
     /// ```
+    #[must_use = "a Proxy does nothing until passed to serve()"]
     pub async fn from_uri(uri: &str) -> Result<Self, FromUriError> {
         let parsed = crate::uri::parse(uri).map_err(FromUriError::Parse)?;
         match route(parsed)? {
@@ -599,7 +672,12 @@ impl Proxy<Identity> {
                 let service_name = service_name
                     .as_deref()
                     .unwrap_or(crate::srv::DEFAULT_SRV_SERVICE_NAME);
-                Self::from_srv_inner(&hostname, service_name, use_tls, FailoverConfig::default())
+                let tls = if use_tls {
+                    TlsConfig::System
+                } else {
+                    TlsConfig::Disabled
+                };
+                Self::from_srv_inner(&hostname, service_name, tls, FailoverConfig::default())
                     .await
                     .map_err(FromUriError::Srv)
             }
@@ -627,18 +705,22 @@ impl Proxy<Identity> {
             .await
             .map_err(|attempts| FromUriError::NoPrimary { attempts })?;
 
+        // Build the proxy first so its keepalive `watch::Receiver` exists
+        // before the loop is spawned (see `from_srv_inner`).
+        let proxy = Self::with_target(target, tls_connector.clone());
+
         if let Some(interval) = failover.reprobe_interval {
-            let tls = tls_connector.clone();
+            let tls = tls_connector;
             // The seed list is static — no DNS to re-resolve — so each
             // tick simply re-probes the same hosts for the current primary.
-            spawn_reprobe_loop(interval, &target, move || {
+            spawn_reprobe_loop(interval, &proxy.target, move || {
                 let probe = crate::serve::probe::HelloProbe::new(tls.clone());
                 let hosts = hosts.clone();
                 async move { reselect_seed_list(&hosts, &probe, probe_timeout).await }
             });
         }
 
-        Ok(Self::with_target(target, tls_connector))
+        Ok(proxy)
     }
 }
 
@@ -665,6 +747,7 @@ impl Proxy<Identity> {
 /// (e.g. [`with_probe_timeout`](Self::with_probe_timeout)); the struct is
 /// `#[non_exhaustive]` so new knobs can be added without breaking callers.
 #[derive(Debug, Clone)]
+#[must_use = "a FailoverConfig does nothing until passed to a from_srv* constructor"]
 #[non_exhaustive]
 pub struct FailoverConfig {
     /// How often to re-resolve SRV and re-select the primary. `None`
@@ -732,24 +815,25 @@ impl FailoverConfig {
 }
 
 /// Probe `hosts` for the replica-set primary and, when one is found,
-/// wrap it in the swappable [`Target`] cell every constructor shares.
+/// wrap it in the swappable [`Target`] watch channel every constructor
+/// shares.
 ///
-/// Returns `None` when no host responds as the primary. Generic over the
-/// probe so the multi-host selection wiring can be unit-tested with a
-/// mock instead of real sockets.
+/// Returns `Err` carrying the per-host outcomes when no host responds as
+/// the primary. Generic over the probe so the multi-host selection wiring
+/// can be unit-tested with a mock instead of real sockets.
 async fn select_target<P>(
     hosts: &[crate::srv::SrvHost],
     probe: &P,
     probe_timeout: Duration,
-) -> Result<Arc<RwLock<Target>>, Vec<(crate::srv::SrvHost, crate::serve::probe::ProbeOutcome)>>
+) -> Result<watch::Sender<Target>, Vec<(crate::srv::SrvHost, crate::serve::probe::ProbeOutcome)>>
 where
     P: crate::serve::probe::PrimaryProbe + ?Sized,
 {
     match crate::serve::probe::select_primary(hosts, probe, probe_timeout).await {
-        crate::serve::probe::Selection::Primary(primary) => Ok(Arc::new(RwLock::new(Target {
+        crate::serve::probe::Selection::Primary(primary) => Ok(watch::Sender::new(Target {
             host: primary.host,
             port: primary.port,
-        }))),
+        })),
         // No host is currently the primary: hand the per-host rejection
         // reasons back so the constructor can build a diagnostic
         // `NoPrimary` rather than collapsing them into a bare count.
@@ -825,55 +909,71 @@ where
 /// Overwrites `target` with `primary` when it differs from the current
 /// value, returning whether a swap happened. The swap is logged at
 /// `info` so operators can see failovers in the proxy's own logs.
-fn apply_primary(target: &RwLock<Target>, primary: crate::srv::SrvHost) -> bool {
-    let mut guard = target.write().unwrap_or_else(PoisonError::into_inner);
-    if guard.host == primary.host && guard.port == primary.port {
-        return false;
-    }
-    info!(
-        old_host = %guard.host,
-        old_port = guard.port,
-        new_host = %primary.host,
-        new_port = primary.port,
-        "replica-set primary changed; swapping upstream target",
-    );
-    *guard = Target {
+///
+/// Reads the current value via a short synchronous `borrow()` (never held
+/// across an `.await`) and, when it differs, swaps it in with
+/// [`watch::Sender::send_replace`], which notifies any receivers.
+fn apply_primary(target: &watch::Sender<Target>, primary: crate::srv::SrvHost) -> bool {
+    let next = Target {
         host: primary.host,
         port: primary.port,
     };
+    {
+        let current = target.borrow();
+        if *current == next {
+            return false;
+        }
+        info!(
+            old_host = %current.host,
+            old_port = current.port,
+            new_host = %next.host,
+            new_port = next.port,
+            "replica-set primary changed; swapping upstream target",
+        );
+    }
+    target.send_replace(next);
     true
 }
 
-/// Spawns the background failover loop. It sleeps `interval`, then —
-/// while the `Proxy` is still alive (checked via a `Weak` upgrade) —
-/// runs `select` and applies any new primary, until the proxy is dropped.
+/// Spawns the background failover loop. Each iteration `tokio::select!`s
+/// between the interval sleep and the watch channel closing: it sleeps
+/// `interval`, runs `select`, and applies any new primary; but as soon as
+/// the [`Proxy`] is dropped (and with it the keepalive
+/// [`watch::Receiver`]), [`watch::Sender::closed`] resolves and the loop
+/// breaks near-immediately — without waiting out the rest of the interval.
+///
+/// The loop owns only a *cloned* [`watch::Sender`]. A clone keeps the
+/// channel writable for swaps but does **not** keep the [`Proxy`] alive,
+/// so `closed()` still fires the moment the proxy's receiver half drops.
 ///
 /// Generic over `select` so the loop's timing / lifecycle can be unit
 /// tested without real DNS or sockets; production passes a closure that
 /// calls [`resolve_and_select`].
 fn spawn_reprobe_loop<S, Fut>(
     interval: Duration,
-    target: &Arc<RwLock<Target>>,
+    target: &watch::Sender<Target>,
     mut select: S,
 ) -> tokio::task::JoinHandle<()>
 where
     S: FnMut() -> Fut + Send + 'static,
     Fut: Future<Output = Option<crate::srv::SrvHost>> + Send,
 {
-    let weak: Weak<RwLock<Target>> = Arc::downgrade(target);
+    let target = target.clone();
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(interval).await;
-            // Upgrade only momentarily: the loop must not itself keep the
-            // target (and thus the proxy) alive across the sleep above.
-            let Some(target) = weak.upgrade() else {
-                debug!("proxy dropped; stopping failover re-probe loop");
-                break;
-            };
+            tokio::select! {
+                // The proxy was dropped: its receiver half is gone, so
+                // `closed()` resolves. Stop promptly rather than waiting
+                // out the rest of the interval.
+                () = target.closed() => {
+                    debug!("proxy dropped; stopping failover re-probe loop");
+                    break;
+                }
+                () = tokio::time::sleep(interval) => {}
+            }
             if let Some(primary) = select().await {
                 apply_primary(&target, primary);
             }
-            drop(target);
         }
     })
 }
@@ -1018,6 +1118,7 @@ impl<L> Proxy<L> {
     pub fn layer<T>(self, layer: T) -> Proxy<Stack<T, L>> {
         Proxy {
             target: self.target,
+            _target_keepalive: self._target_keepalive,
             tls_connector: self.tls_connector,
             rewrite_hello: self.rewrite_hello,
 
@@ -1626,13 +1727,67 @@ mod tests {
         );
     }
 
+    // ---------- #49: from_srv_with_tls closes the TlsConfig × SRV gap ----------
+    //
+    // The initial SRV resolution runs before any TLS connector is built, so
+    // pointing at a hostname that can't resolve exercises the constructor's
+    // routing for each `TlsConfig` variant without needing a live cluster:
+    // a `SrvResolveError` (rather than a panic or type error) proves the
+    // variant is accepted and threaded through to `from_srv_inner`.
+
+    #[tokio::test]
+    async fn from_srv_with_tls_accepts_system() {
+        let result = Proxy::from_srv_with_tls(
+            "srv-does-not-exist.invalid",
+            TlsConfig::System,
+            FailoverConfig::disabled(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "an unresolvable SRV host must fail rather than build a proxy"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_srv_with_tls_accepts_with_roots() {
+        let result = Proxy::from_srv_with_tls(
+            "srv-does-not-exist.invalid",
+            TlsConfig::WithRoots(RootCertStore::empty()),
+            FailoverConfig::disabled(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "an unresolvable SRV host must fail rather than build a proxy"
+        );
+    }
+
+    #[cfg(feature = "dangerous-insecure-tls")]
+    #[tokio::test]
+    async fn from_srv_with_tls_accepts_insecure() {
+        // The previously-unreachable combination: SRV upstream + Insecure
+        // TLS. We only assert the constructor accepts the variant and routes
+        // it through resolution (which fails on the bogus host).
+        let result = Proxy::from_srv_with_tls(
+            "srv-does-not-exist.invalid",
+            TlsConfig::Insecure,
+            FailoverConfig::disabled(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "an unresolvable SRV host must fail rather than build a proxy"
+        );
+    }
+
     // ---------- failover: target cell + apply_primary ----------
 
-    fn target_cell(host: &str, port: u16) -> Arc<RwLock<Target>> {
-        Arc::new(RwLock::new(Target {
+    fn target_cell(host: &str, port: u16) -> watch::Sender<Target> {
+        watch::Sender::new(Target {
             host: host.into(),
             port,
-        }))
+        })
     }
 
     fn srv_host(host: &str, port: u16) -> crate::srv::SrvHost {
@@ -1640,6 +1795,29 @@ mod tests {
             host: host.into(),
             port,
         }
+    }
+
+    /// #52: the watch channel gives lock-free `borrow().clone()` reads and
+    /// `send_replace` swaps that hand back the *previous* `Target`.
+    #[test]
+    fn watch_send_replace_returns_previous_target() {
+        let cell = target_cell("old.example.com", 27017);
+        // Lock-free read of the current value.
+        assert_eq!(read_target(&cell), ("old.example.com".to_owned(), 27017));
+
+        let previous = cell.send_replace(Target {
+            host: "new.example.com".into(),
+            port: 27018,
+        });
+        assert_eq!(
+            previous,
+            Target {
+                host: "old.example.com".into(),
+                port: 27017,
+            },
+            "send_replace must return the swapped-out target"
+        );
+        assert_eq!(read_target(&cell), ("new.example.com".to_owned(), 27018));
     }
 
     #[test]
@@ -2010,6 +2188,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn reprobe_loop_swaps_target_when_select_returns_new_primary() {
         let cell = target_cell("old.example.com", 27017);
+        // The keepalive receiver stands in for the one the `Proxy` holds:
+        // while it is alive the loop's `closed()` shutdown signal stays
+        // pending, so the loop keeps re-probing.
+        let _keepalive = cell.subscribe();
         let _handle = spawn_reprobe_loop(Duration::from_secs(60), &cell, || async {
             Some(srv_host("new.example.com", 27017))
         });
@@ -2027,6 +2209,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn reprobe_loop_keeps_target_when_select_returns_none() {
         let cell = target_cell("old.example.com", 27017);
+        let _keepalive = cell.subscribe();
         let _handle = spawn_reprobe_loop(Duration::from_secs(60), &cell, || async { None });
 
         tokio::task::yield_now().await;
@@ -2036,11 +2219,17 @@ mod tests {
         assert_eq!(read_target(&cell).0, "old.example.com");
     }
 
+    /// #53: a dropped proxy must end the loop *promptly*, without waiting out
+    /// the rest of the interval. We never advance the clock a full interval
+    /// after the drop, yet the task still joins.
     #[tokio::test(start_paused = true)]
     async fn reprobe_loop_stops_after_proxy_dropped() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let cell = target_cell("old.example.com", 27017);
+        // The keepalive receiver models the `Proxy`'s half: dropping it is
+        // what the loop observes via `closed()`.
+        let keepalive = cell.subscribe();
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_in_loop = calls.clone();
         let handle = spawn_reprobe_loop(Duration::from_secs(60), &cell, move || {
@@ -2053,15 +2242,15 @@ mod tests {
 
         // Let the task register its first sleep before advancing the clock.
         tokio::task::yield_now().await;
-        // One tick runs while the cell (the sole strong ref) is alive.
+        // One tick runs while the keepalive receiver is alive.
         tokio::time::advance(Duration::from_secs(61)).await;
         tokio::task::yield_now().await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        // Drop the only strong reference — the loop holds just a `Weak`.
-        drop(cell);
-        // Next wake fails to upgrade and the task returns.
-        tokio::time::advance(Duration::from_secs(61)).await;
+        // Drop the keepalive receiver — the proxy is gone. The loop's
+        // `closed()` arm fires immediately; we do NOT advance the clock a
+        // full interval, proving the loop notices the drop promptly.
+        drop(keepalive);
         handle.await.expect("loop task joins cleanly after drop");
         assert_eq!(
             calls.load(Ordering::SeqCst),

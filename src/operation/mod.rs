@@ -27,7 +27,7 @@ pub mod op_reply;
 /// Typed wire-protocol operation, selected by [`OPCode`].
 ///
 /// A [`Message`](crate::message::Message) owns exactly one of these.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum Operation {
     /// Legacy OP_QUERY body. Drivers still emit this for the initial
     /// `isMaster` / `hello` handshake before the wire version is known.
@@ -38,10 +38,23 @@ pub enum Operation {
     Reply(OperationReply),
 }
 
+impl std::fmt::Debug for Operation {
+    /// Forwards to the inner body type's hand-written, credential-aware
+    /// [`Debug`] impl so no raw BSON document escapes into logs.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Operation::Query(q) => f.debug_tuple("Query").field(q).finish(),
+            Operation::Message(m) => f.debug_tuple("Message").field(m).finish(),
+            Operation::Reply(r) => f.debug_tuple("Reply").field(r).finish(),
+        }
+    }
+}
+
 /// Failure modes for [`Operation::from_bytes`].
 ///
 /// Each variant flattens the per-opcode parse error.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum OperationParseError {
     /// The OP_MSG body could not be parsed.
     #[error("failed to parse message: {0}")]
@@ -56,6 +69,7 @@ pub enum OperationParseError {
 
 /// Failure modes for [`Operation::write_bytes`].
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum OperationWriteError {
     /// Encoding an OP_MSG body failed (typically BSON serialisation).
     #[error("failed to write message operation: {0}")]

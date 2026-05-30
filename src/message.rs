@@ -46,7 +46,7 @@ use crate::{
 /// let roundtripped = Message::from_bytes(&buf).unwrap();
 /// assert_eq!(msg, roundtripped);
 /// ```
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct Message {
     /// Sender-chosen identifier. Replies reference this in their
     /// [`response_to`](Self::response_to).
@@ -59,8 +59,21 @@ pub struct Message {
     pub operation: Operation,
 }
 
+impl std::fmt::Debug for Message {
+    /// Forwards to the inner [`Operation`]'s hand-written, credential-aware
+    /// [`Debug`] impl so no raw BSON document escapes into logs.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Message")
+            .field("request_id", &self.request_id)
+            .field("response_to", &self.response_to)
+            .field("operation", &self.operation)
+            .finish()
+    }
+}
+
 /// Failure modes for [`Message::from_bytes`].
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum MessageParseError {
     /// The first 16 bytes could not be parsed as a [`MessageHeader`].
     #[error("failed to parse header")]
@@ -73,6 +86,7 @@ pub enum MessageParseError {
 /// Failure modes for [`Message::from_headers_and_bytes`], i.e. parsing when
 /// the header is already known.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum MessageAndHeaderParseError {
     /// The header claims `expected` bytes but only `actual` are available.
     #[error("not enough bytes, expected={expected}, actual={actual}")]
@@ -85,6 +99,7 @@ pub enum MessageAndHeaderParseError {
 
 /// Failure modes for [`Message::write_bytes`].
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum MessageWriteError {
     /// Serialising the operation body failed (e.g. BSON encoding error).
     #[error("failed to write operation: {0}")]
@@ -123,7 +138,7 @@ impl Message {
         bytes: &[u8],
     ) -> Result<Self, MessageAndHeaderParseError> {
         let actual_bytes = bytes.len();
-        let expected_bytes = header.message_length.into_inner() as usize;
+        let expected_bytes = header.message_length.as_usize();
 
         if actual_bytes < expected_bytes {
             return Err(MessageAndHeaderParseError::NotEnoughBytes {
@@ -200,6 +215,34 @@ mod tests {
         message.write_bytes(&mut bytes).expect("write succeeds");
 
         assert_eq!(expected, bytes.as_ref());
+    }
+
+    /// #40 regression: formatting a `Message` whose OP_MSG body carries a
+    /// `saslStart` payload must not leak the secret into the debug output.
+    #[test]
+    fn debug_redacts_sasl_payload_in_message() {
+        use crate::ids::RequestId;
+        use crate::operation::op_msg::{OpMsgSection, OperationMessage, OperationMessageFlags};
+        use bson::doc;
+
+        let msg = Message {
+            request_id: RequestId::new(1),
+            response_to: None,
+            operation: Operation::Message(OperationMessage {
+                flags: OperationMessageFlags::empty(),
+                sections: vec![OpMsgSection::Body(doc! {
+                    "saslStart": 1,
+                    "payload": "SECRET",
+                })],
+                checksum: None,
+            }),
+        };
+        let shown = format!("{msg:?}");
+        assert!(
+            !shown.contains("SECRET"),
+            "message debug output leaked payload: {shown}"
+        );
+        assert!(shown.contains("Message"));
     }
 
     #[test]

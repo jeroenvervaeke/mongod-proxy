@@ -90,6 +90,16 @@ impl LookupFailure {
         }
     }
 
+    /// The human-readable failure message, without the underlying
+    /// resolver error appended.
+    ///
+    /// The full error context — including the wrapped `hickory_*` source
+    /// — is reachable via [`std::error::Error::source`]; this returns just
+    /// the short, proxy-supplied description (e.g. `"srv_lookup"`).
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
     /// Synthetic failure used by tests; production code should always
     /// pair the message with the underlying error via [`new`](Self::new).
     #[cfg(test)]
@@ -103,6 +113,7 @@ impl LookupFailure {
 
 /// Failure modes for [`resolve`].
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum SrvResolveError {
     /// The OS-level resolver configuration (`/etc/resolv.conf` on Unix,
     /// the registry on Windows) could not be read or parsed.
@@ -414,7 +425,7 @@ fn weighted_shuffle_into<R: WeightedRng>(
 /// # Errors
 ///
 /// See [`SrvResolveError`].
-pub async fn resolve(srv_hostname: &str) -> Result<Vec<SrvHost>, SrvResolveError> {
+pub async fn resolve(srv_hostname: impl Into<String>) -> Result<Vec<SrvHost>, SrvResolveError> {
     resolve_with_service_name(srv_hostname, DEFAULT_SRV_SERVICE_NAME).await
 }
 
@@ -436,11 +447,12 @@ pub async fn resolve(srv_hostname: &str) -> Result<Vec<SrvHost>, SrvResolveError
 ///
 /// [Initial DNS Seedlist Discovery spec]: https://github.com/mongodb/specifications/blob/master/source/initial-dns-seedlist-discovery/initial-dns-seedlist-discovery.md
 pub async fn resolve_with_service_name(
-    srv_hostname: &str,
+    srv_hostname: impl Into<String>,
     service_name: &str,
 ) -> Result<Vec<SrvHost>, SrvResolveError> {
+    let srv_hostname = srv_hostname.into();
     let lookup = HickorySrvLookup::from_system_config().map_err(SrvResolveError::ResolverInit)?;
-    resolve_with(srv_hostname, service_name, &lookup).await
+    resolve_with(&srv_hostname, service_name, &lookup).await
 }
 
 /// Pure parser/validator over an injected [`SrvLookup`]. All
@@ -575,6 +587,14 @@ mod tests {
         let mut mock = MockSrvLookup::new();
         mock.expect_lookup().returning(move |_| Ok(records.clone()));
         mock
+    }
+
+    // ---------- LookupFailure ----------
+
+    #[test]
+    fn lookup_failure_message_returns_the_supplied_text() {
+        let failure = LookupFailure::synthetic("nxdomain");
+        assert_eq!(failure.message(), "nxdomain");
     }
 
     // ---------- parent_domain ----------

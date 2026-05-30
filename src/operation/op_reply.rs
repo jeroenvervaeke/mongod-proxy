@@ -21,7 +21,7 @@ use crate::{
 /// result documents. The on-the-wire `numberReturned` integer is *derived*
 /// from `documents.len()` at write time, so it cannot diverge from the
 /// actual batch.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct OperationReply {
     /// Reply flag bits.
     pub flags: OperationReplyFlags,
@@ -31,6 +31,28 @@ pub struct OperationReply {
     pub starting_from: i32,
     /// Result documents in this batch.
     pub documents: Vec<Document>,
+}
+
+impl std::fmt::Debug for OperationReply {
+    /// Renders cursor metadata and flags, routing every result document
+    /// through [`RedactedDoc`](crate::redact::RedactedDoc) so credential-bearing
+    /// handshake replies never reach logs verbatim.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OperationReply")
+            .field("flags", &self.flags)
+            .field("cursor_id", &self.cursor_id)
+            .field("starting_from", &self.starting_from)
+            .field("document_count", &self.documents.len())
+            .field(
+                "documents",
+                &self
+                    .documents
+                    .iter()
+                    .map(crate::redact::RedactedDoc)
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 bitflags! {
@@ -50,6 +72,7 @@ bitflags! {
 
 /// Failure modes for [`OperationReply::from_bytes`].
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum OperationReplyParseError {
     /// Body shorter than the unconditional minimum.
     #[error("not enough bytes, expected at least {min} bytes, got {actual}")]
@@ -69,6 +92,7 @@ pub enum OperationReplyParseError {
 
 /// Failure modes for [`OperationReply::write_bytes`].
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum OperationReplyWriteError {
     /// BSON serialisation of a document failed.
     #[error("failed to serialize document: {0}")]

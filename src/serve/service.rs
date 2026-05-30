@@ -972,6 +972,7 @@ fn route(parsed: crate::uri::ParsedConnectionUri) -> Result<UriRoute, FromUriErr
 
 /// Failure modes for [`Proxy::from_uri`].
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum FromUriError {
     /// The URI did not parse: bad scheme, missing host, invalid port,
     /// invalid `tls=` value, etc. See
@@ -1172,6 +1173,7 @@ struct ProxyClientInner {
 
 /// Failure modes for [`ProxyClient::forward_to`].
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ProxyClientForwardError {
     /// `TcpStream::connect` to the upstream failed (DNS, refused, etc.).
     #[error("failed to connect to proxied server: {0}")]
@@ -1339,6 +1341,7 @@ impl Service<Message> for ProxyClient {
 
 /// Failure modes for an in-flight request against [`ProxyClient`].
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ProxyClientRequestError {
     /// Underlying socket I/O failed.
     #[error("io error: {0}")]

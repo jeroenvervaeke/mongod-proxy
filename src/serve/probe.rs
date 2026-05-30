@@ -66,6 +66,7 @@ pub(crate) const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Failure modes for a single primary probe.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ProbeError {
     /// TCP / TLS connect to the candidate host failed.
     #[error("connect failed: {0}")]
@@ -98,6 +99,7 @@ pub enum ProbeError {
 /// opaque number; an operator could not tell a network-policy problem
 /// from an in-progress election from a cert mismatch.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ProbeOutcome {
     /// The host answered `hello` but reported `isWritablePrimary: false`
     /// (a secondary, arbiter, or other non-primary member) — the replica

@@ -19,6 +19,7 @@ use crate::{
     header::MessageHeader,
     ids::{MessageLength, RequestId, ResponseTo},
     op_code::OPCode,
+    redact::RedactedDoc,
 };
 
 /// Mask of the bits the spec classifies as *required* (`0..16`).
@@ -86,10 +87,7 @@ impl std::fmt::Debug for OpMsgSection {
     /// payloads (e.g. `saslStart`) never reach logs.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            OpMsgSection::Body(doc) => f
-                .debug_tuple("Body")
-                .field(&crate::redact::RedactedDoc(doc))
-                .finish(),
+            OpMsgSection::Body(doc) => f.debug_tuple("Body").field(&RedactedDoc(doc)).finish(),
             OpMsgSection::DocumentSequence {
                 identifier,
                 documents,
@@ -99,10 +97,7 @@ impl std::fmt::Debug for OpMsgSection {
                 .field("document_count", &documents.len())
                 .field(
                     "documents",
-                    &documents
-                        .iter()
-                        .map(crate::redact::RedactedDoc)
-                        .collect::<Vec<_>>(),
+                    &documents.iter().map(RedactedDoc).collect::<Vec<_>>(),
                 )
                 .finish(),
         }

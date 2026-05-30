@@ -19,6 +19,7 @@ use crate::{
     header::MessageHeader,
     ids::{MessageLength, RequestId, ResponseTo},
     op_code::OPCode,
+    redact::RedactedDoc,
 };
 
 /// Legacy OP_QUERY message body.
@@ -56,13 +57,10 @@ impl std::fmt::Debug for OperationQuery {
             .field("full_collection_name", &self.full_collection_name)
             .field("number_to_skip", &self.number_to_skip)
             .field("number_to_return", &self.number_to_return)
-            .field("query", &crate::redact::RedactedDoc(&self.query))
+            .field("query", &RedactedDoc(&self.query))
             .field(
                 "return_fields_selector",
-                &self
-                    .return_fields_selector
-                    .as_ref()
-                    .map(crate::redact::RedactedDoc),
+                &self.return_fields_selector.as_ref().map(RedactedDoc),
             )
             .finish()
     }

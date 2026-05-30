@@ -13,6 +13,7 @@ use crate::{
     header::MessageHeader,
     ids::{MessageLength, RequestId, ResponseTo},
     op_code::OPCode,
+    redact::RedactedDoc,
 };
 
 /// Legacy OP_REPLY body.
@@ -45,11 +46,7 @@ impl std::fmt::Debug for OperationReply {
             .field("document_count", &self.documents.len())
             .field(
                 "documents",
-                &self
-                    .documents
-                    .iter()
-                    .map(crate::redact::RedactedDoc)
-                    .collect::<Vec<_>>(),
+                &self.documents.iter().map(RedactedDoc).collect::<Vec<_>>(),
             )
             .finish()
     }

@@ -469,7 +469,30 @@ impl Proxy<Identity> {
         use_tls: bool,
         failover: FailoverConfig,
     ) -> Result<Self, crate::srv::SrvResolveError> {
-        let hosts = crate::srv::resolve(srv_hostname).await?;
+        Self::from_srv_inner(
+            srv_hostname,
+            crate::srv::DEFAULT_SRV_SERVICE_NAME,
+            use_tls,
+            failover,
+        )
+        .await
+    }
+
+    /// Inner SRV constructor carrying an explicit SRV `service_name`
+    /// (the `srvServiceName` URI override; `mongodb` for the default).
+    ///
+    /// [`from_srv`](Self::from_srv) / [`from_srv_with`](Self::from_srv_with)
+    /// delegate here with the default service name; the
+    /// `mongodb+srv://?srvServiceName=...` arm of
+    /// [`from_uri`](Self::from_uri) passes the override through. The
+    /// background re-probe loop reuses the same service name on every tick.
+    async fn from_srv_inner(
+        srv_hostname: &str,
+        service_name: &str,
+        use_tls: bool,
+        failover: FailoverConfig,
+    ) -> Result<Self, crate::srv::SrvResolveError> {
+        let hosts = crate::srv::resolve_with_service_name(srv_hostname, service_name).await?;
         let tls_connector = use_tls.then(default_tls_connector);
         let probe = crate::serve::probe::HelloProbe::new(tls_connector.clone());
         let probe_timeout = failover.probe_timeout;
@@ -482,6 +505,7 @@ impl Proxy<Identity> {
 
         if let Some(interval) = failover.reprobe_interval {
             let hostname = srv_hostname.to_owned();
+            let service_name = service_name.to_owned();
             let tls = tls_connector.clone();
             // The loop owns only a `Weak` handle to the target, so it
             // self-terminates once the `Proxy` (and its serve loop) is
@@ -489,8 +513,9 @@ impl Proxy<Identity> {
             // re-resolves SRV and re-selects the primary.
             spawn_reprobe_loop(interval, &target, move || {
                 let hostname = hostname.clone();
+                let service_name = service_name.clone();
                 let probe = crate::serve::probe::HelloProbe::new(tls.clone());
-                async move { resolve_and_select(&hostname, &probe, probe_timeout).await }
+                async move { resolve_and_select(&hostname, &service_name, &probe, probe_timeout).await }
             });
         }
 
@@ -566,9 +591,18 @@ impl Proxy<Identity> {
             UriRoute::SeedList { hosts, use_tls } => {
                 Self::from_seed_list(hosts, use_tls, FailoverConfig::default()).await
             }
-            UriRoute::Srv { hostname, use_tls } => Self::from_srv(&hostname, use_tls)
-                .await
-                .map_err(FromUriError::Srv),
+            UriRoute::Srv {
+                hostname,
+                use_tls,
+                service_name,
+            } => {
+                let service_name = service_name
+                    .as_deref()
+                    .unwrap_or(crate::srv::DEFAULT_SRV_SERVICE_NAME);
+                Self::from_srv_inner(&hostname, service_name, use_tls, FailoverConfig::default())
+                    .await
+                    .map_err(FromUriError::Srv)
+            }
         }
     }
 
@@ -748,21 +782,22 @@ where
     picked
 }
 
-/// Re-resolve SRV for `hostname` and re-select the replica-set primary,
-/// returning the chosen host or `None` (logging the reason) when the
-/// lookup fails or no primary is currently reachable.
+/// Re-resolve SRV for `hostname` (under `service_name`) and re-select the
+/// replica-set primary, returning the chosen host or `None` (logging the
+/// reason) when the lookup fails or no primary is currently reachable.
 ///
 /// Used as the per-tick body of the background failover loop. Failures
 /// are non-fatal: the caller keeps the current target on `None`.
 async fn resolve_and_select<P>(
     hostname: &str,
+    service_name: &str,
     probe: &P,
     probe_timeout: Duration,
 ) -> Option<crate::srv::SrvHost>
 where
     P: crate::serve::probe::PrimaryProbe + ?Sized,
 {
-    match crate::srv::resolve(hostname).await {
+    match crate::srv::resolve_with_service_name(hostname, service_name).await {
         Ok(hosts) => {
             let picked = crate::serve::probe::select_primary(&hosts, probe, probe_timeout)
                 .await
@@ -865,7 +900,13 @@ enum UriRoute {
         use_tls: bool,
     },
     /// A `mongodb+srv://hostname/` URI: resolve SRV, then probe.
-    Srv { hostname: String, use_tls: bool },
+    Srv {
+        hostname: String,
+        use_tls: bool,
+        /// The `srvServiceName` override, or `None` to use the default
+        /// `mongodb` service name.
+        service_name: Option<String>,
+    },
 }
 
 /// Classifies a parsed URI into the constructor path it should take,
@@ -876,7 +917,12 @@ enum UriRoute {
 /// unreachable in practice, but routing without an `unwrap`/`expect`
 /// keeps the no-panic policy intact.
 fn route(parsed: crate::uri::ParsedConnectionUri) -> Result<UriRoute, FromUriError> {
-    let crate::uri::ParsedConnectionUri { scheme, hosts, tls } = parsed;
+    let crate::uri::ParsedConnectionUri {
+        scheme,
+        hosts,
+        tls,
+        srv_service_name,
+    } = parsed;
     match scheme {
         crate::uri::Scheme::Mongodb => {
             // Spec default for non-SRV URIs: TLS off.
@@ -914,6 +960,7 @@ fn route(parsed: crate::uri::ParsedConnectionUri) -> Result<UriRoute, FromUriErr
                 Some(h) => Ok(UriRoute::Srv {
                     hostname: h.host,
                     use_tls,
+                    service_name: srv_service_name,
                 }),
                 None => Err(FromUriError::Parse(
                     crate::uri::ConnectionUriError::MissingHost,
@@ -1889,6 +1936,19 @@ mod tests {
             UriRoute::Srv {
                 hostname: "cluster0.foo.mongodb.net".to_owned(),
                 use_tls: true,
+                service_name: None,
+            }
+        );
+    }
+
+    #[test]
+    fn route_srv_uri_carries_srv_service_name_override() {
+        assert_eq!(
+            route_uri("mongodb+srv://cluster0.foo.mongodb.net/?srvServiceName=customdb"),
+            UriRoute::Srv {
+                hostname: "cluster0.foo.mongodb.net".to_owned(),
+                use_tls: true,
+                service_name: Some("customdb".to_owned()),
             }
         );
     }
@@ -1900,6 +1960,7 @@ mod tests {
             UriRoute::Srv {
                 hostname: "cluster0.foo.mongodb.net".to_owned(),
                 use_tls: false,
+                service_name: None,
             }
         );
     }

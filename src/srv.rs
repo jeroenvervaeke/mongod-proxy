@@ -1,9 +1,12 @@
 //! DNS `SRV` lookup for `mongodb+srv://` connection strings.
 //!
 //! MongoDB's [`mongodb+srv` URI scheme] resolves a single hostname into a
-//! list of `host:port` pairs by querying `_mongodb._tcp.<hostname>` for
-//! `SRV` records. Drivers use this to discover every member of a sharded
-//! cluster or replica set without baking the topology into the URI.
+//! list of `host:port` pairs by querying `_<service>._tcp.<hostname>` for
+//! `SRV` records — where `<service>` is `mongodb` by default but can be
+//! overridden via the `srvServiceName` URI option (see
+//! [`resolve_with_service_name`]). Drivers use this to discover every
+//! member of a sharded cluster or replica set without baking the topology
+//! into the URI.
 //!
 //! The proxy only ever forwards to a *single* upstream, so [`resolve`]
 //! returns every SRV record and [`Proxy::from_srv`](crate::Proxy::from_srv)
@@ -27,6 +30,13 @@
 //! [`mongodb+srv` URI scheme]: https://www.mongodb.com/docs/manual/reference/connection-string/#dns-seed-list-connection-format
 
 use hickory_resolver::{TokioResolver, proto::rr::RData};
+
+/// Default SRV service name per the [Initial DNS Seedlist Discovery spec]:
+/// the query is `_mongodb._tcp.<hostname>` unless the `srvServiceName` URI
+/// option overrides the `mongodb` prefix.
+///
+/// [Initial DNS Seedlist Discovery spec]: https://github.com/mongodb/specifications/blob/master/source/initial-dns-seedlist-discovery/initial-dns-seedlist-discovery.md
+pub const DEFAULT_SRV_SERVICE_NAME: &str = "mongodb";
 
 /// One resolved SRV target.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,21 +108,27 @@ pub enum SrvResolveError {
     /// the registry on Windows) could not be read or parsed.
     #[error("failed to initialise DNS resolver: {0}")]
     ResolverInit(#[source] LookupFailure),
-    /// The `_mongodb._tcp.<hostname>` SRV query itself failed: `NXDOMAIN`,
+    /// The `_<service>._tcp.<hostname>` SRV query itself failed: `NXDOMAIN`,
     /// timeout, network failure, malformed response, etc.
-    #[error("SRV lookup for `_mongodb._tcp.{hostname}` failed: {source}")]
+    #[error("SRV lookup for `_{service}._tcp.{hostname}` failed: {source}")]
     Lookup {
         /// The original hostname passed to [`resolve`].
         hostname: String,
+        /// The SRV service name used to build the query prefix
+        /// (`mongodb` by default; see [`DEFAULT_SRV_SERVICE_NAME`]).
+        service: String,
         /// Underlying resolver error.
         #[source]
         source: LookupFailure,
     },
     /// The SRV query succeeded but returned zero usable records.
-    #[error("SRV lookup for `_mongodb._tcp.{hostname}` returned no records")]
+    #[error("SRV lookup for `_{service}._tcp.{hostname}` returned no records")]
     NoRecords {
         /// The original hostname passed to [`resolve`].
         hostname: String,
+        /// The SRV service name used to build the query prefix
+        /// (`mongodb` by default; see [`DEFAULT_SRV_SERVICE_NAME`]).
+        service: String,
     },
     /// An SRV record targeted a host outside the parent domain of the
     /// queried hostname. Matches the
@@ -192,7 +208,7 @@ pub(crate) fn summarise_attempts(
 #[cfg_attr(test, mockall::automock)]
 pub(crate) trait SrvLookup: Send + Sync {
     /// Looks up SRV records for `query` (the *full* DNS name including
-    /// the `_mongodb._tcp.` prefix) and returns every SRV-typed answer.
+    /// the `_<service>._tcp.` prefix) and returns every SRV-typed answer.
     ///
     /// Non-SRV records in the response (e.g. `CNAME` chains the resolver
     /// included as additionals) must already be filtered out by the
@@ -375,14 +391,20 @@ fn weighted_shuffle_into<R: WeightedRng>(
     }
 }
 
-/// Resolves `srv_hostname` via the MongoDB SRV convention.
+/// Resolves `srv_hostname` via the MongoDB SRV convention using the
+/// default `mongodb` service name.
 ///
-/// Queries `_mongodb._tcp.<srv_hostname>` and returns every advertised
-/// `(host, port)` pair. Records are ordered per RFC 2782 — ascending
-/// `priority`, weight-randomised within each priority group — so the
-/// first record callers use is the most-preferred reachable target. The
-/// proxy is single-upstream, so only the chosen primary among these is
-/// ultimately forwarded to.
+/// Thin wrapper over [`resolve_with_service_name`] passing
+/// [`DEFAULT_SRV_SERVICE_NAME`] — i.e. it queries
+/// `_mongodb._tcp.<srv_hostname>`. Use
+/// [`resolve_with_service_name`] when the `srvServiceName` URI option
+/// selects a non-default prefix.
+///
+/// Records are ordered per RFC 2782 — ascending `priority`,
+/// weight-randomised within each priority group — so the first record
+/// callers use is the most-preferred reachable target. The proxy is
+/// single-upstream, so only the chosen primary among these is ultimately
+/// forwarded to.
 ///
 /// The original hostname must have at least two labels (e.g.
 /// `cluster.example.com`). Each returned target must share the original
@@ -393,24 +415,54 @@ fn weighted_shuffle_into<R: WeightedRng>(
 ///
 /// See [`SrvResolveError`].
 pub async fn resolve(srv_hostname: &str) -> Result<Vec<SrvHost>, SrvResolveError> {
+    resolve_with_service_name(srv_hostname, DEFAULT_SRV_SERVICE_NAME).await
+}
+
+/// Resolves `srv_hostname` via the MongoDB SRV convention using an
+/// explicit SRV `service_name`.
+///
+/// Queries `_<service_name>._tcp.<srv_hostname>`; pass
+/// [`DEFAULT_SRV_SERVICE_NAME`] (`mongodb`) for the standard behaviour.
+/// This mirrors the [Initial DNS Seedlist Discovery spec]'s
+/// `srvServiceName` URI option, which lets a deployment publish its SRV
+/// records under a non-default prefix.
+///
+/// Records are ordered and validated identically to [`resolve`]; the
+/// parent-domain check is independent of the service prefix.
+///
+/// # Errors
+///
+/// See [`SrvResolveError`].
+///
+/// [Initial DNS Seedlist Discovery spec]: https://github.com/mongodb/specifications/blob/master/source/initial-dns-seedlist-discovery/initial-dns-seedlist-discovery.md
+pub async fn resolve_with_service_name(
+    srv_hostname: &str,
+    service_name: &str,
+) -> Result<Vec<SrvHost>, SrvResolveError> {
     let lookup = HickorySrvLookup::from_system_config().map_err(SrvResolveError::ResolverInit)?;
-    resolve_with(srv_hostname, &lookup).await
+    resolve_with(srv_hostname, service_name, &lookup).await
 }
 
 /// Pure parser/validator over an injected [`SrvLookup`]. All
-/// `resolve()` behaviour is implemented here; `resolve()` itself just
-/// supplies the real resolver. The test suite exercises every branch
-/// of this function with a mocked [`SrvLookup`].
+/// `resolve()` behaviour is implemented here; the public entry points
+/// just supply the real resolver and (for [`resolve`]) the default
+/// service name. The test suite exercises every branch of this function
+/// with a mocked [`SrvLookup`].
+///
+/// `service_name` selects the `_<service_name>._tcp.` query prefix
+/// (`mongodb` for the default behaviour).
 pub(crate) async fn resolve_with<L: SrvLookup + ?Sized>(
     srv_hostname: &str,
+    service_name: &str,
     lookup: &L,
 ) -> Result<Vec<SrvHost>, SrvResolveError> {
-    let query = format!("_mongodb._tcp.{srv_hostname}");
+    let query = format!("_{service_name}._tcp.{srv_hostname}");
     let raw = lookup
         .lookup(query)
         .await
         .map_err(|source| SrvResolveError::Lookup {
             hostname: srv_hostname.to_owned(),
+            service: service_name.to_owned(),
             source,
         })?;
 
@@ -437,6 +489,7 @@ pub(crate) async fn resolve_with<L: SrvLookup + ?Sized>(
     if hosts.is_empty() {
         return Err(SrvResolveError::NoRecords {
             hostname: srv_hostname.to_owned(),
+            service: service_name.to_owned(),
         });
     }
 
@@ -598,7 +651,7 @@ mod tests {
     async fn resolve_returns_single_record_with_trailing_dot_stripped() {
         let lookup = lookup_returning(vec![raw("cluster0-shard-00-00.foo.mongodb.net.", 27017)]);
 
-        let hosts = resolve_with("cluster0.foo.mongodb.net", &lookup)
+        let hosts = resolve_with("cluster0.foo.mongodb.net", "mongodb", &lookup)
             .await
             .expect("ok");
 
@@ -619,7 +672,7 @@ mod tests {
             raw("cluster0-shard-00-02.foo.mongodb.net.", 27019),
         ]);
 
-        let hosts = resolve_with("cluster0.foo.mongodb.net", &lookup)
+        let hosts = resolve_with("cluster0.foo.mongodb.net", "mongodb", &lookup)
             .await
             .expect("ok");
 
@@ -636,7 +689,7 @@ mod tests {
     async fn resolve_accepts_target_without_trailing_dot() {
         let lookup = lookup_returning(vec![raw("host.foo.mongodb.net", 27017)]);
 
-        let hosts = resolve_with("cluster0.foo.mongodb.net", &lookup)
+        let hosts = resolve_with("cluster0.foo.mongodb.net", "mongodb", &lookup)
             .await
             .expect("ok");
 
@@ -651,7 +704,7 @@ mod tests {
             .with(eq(String::from("_mongodb._tcp.cluster0.foo.mongodb.net")))
             .returning(|_| Ok(vec![raw("host.foo.mongodb.net.", 27017)]));
 
-        let _ = resolve_with("cluster0.foo.mongodb.net", &lookup)
+        let _ = resolve_with("cluster0.foo.mongodb.net", "mongodb", &lookup)
             .await
             .expect("ok");
     }
@@ -665,7 +718,7 @@ mod tests {
             .expect_lookup()
             .returning(|_| Err(LookupFailure::synthetic("nxdomain")));
 
-        let err = resolve_with("cluster0.foo.mongodb.net", &lookup)
+        let err = resolve_with("cluster0.foo.mongodb.net", "mongodb", &lookup)
             .await
             .unwrap_err();
 
@@ -681,13 +734,14 @@ mod tests {
     async fn resolve_returns_no_records_when_lookup_returns_empty_vec() {
         let lookup = lookup_returning(vec![]);
 
-        let err = resolve_with("cluster0.foo.mongodb.net", &lookup)
+        let err = resolve_with("cluster0.foo.mongodb.net", "mongodb", &lookup)
             .await
             .unwrap_err();
 
         match err {
-            SrvResolveError::NoRecords { hostname } => {
+            SrvResolveError::NoRecords { hostname, service } => {
                 assert_eq!(hostname, "cluster0.foo.mongodb.net");
+                assert_eq!(service, "mongodb");
             }
             other => panic!("expected NoRecords, got {other:?}"),
         }
@@ -697,7 +751,7 @@ mod tests {
     async fn resolve_rejects_record_in_unrelated_domain() {
         let lookup = lookup_returning(vec![raw("evil.attacker.com.", 27017)]);
 
-        let err = resolve_with("cluster0.foo.mongodb.net", &lookup)
+        let err = resolve_with("cluster0.foo.mongodb.net", "mongodb", &lookup)
             .await
             .unwrap_err();
 
@@ -721,7 +775,7 @@ mod tests {
         // so it must still be rejected even though it overlaps suffixes.
         let lookup = lookup_returning(vec![raw("other.mongodb.net.", 27017)]);
 
-        let err = resolve_with("cluster0.foo.mongodb.net", &lookup)
+        let err = resolve_with("cluster0.foo.mongodb.net", "mongodb", &lookup)
             .await
             .unwrap_err();
 
@@ -734,7 +788,9 @@ mod tests {
         // Target must therefore live under `example.com`.
         let lookup = lookup_returning(vec![raw("host.example.com.", 27017)]);
 
-        let hosts = resolve_with("example.com", &lookup).await.expect("ok");
+        let hosts = resolve_with("example.com", "mongodb", &lookup)
+            .await
+            .expect("ok");
         assert_eq!(hosts[0].host, "host.example.com");
     }
 
@@ -745,7 +801,7 @@ mod tests {
             raw("good.foo.mongodb.net.", 27018),
         ]);
 
-        let err = resolve_with("cluster0.foo.mongodb.net", &lookup)
+        let err = resolve_with("cluster0.foo.mongodb.net", "mongodb", &lookup)
             .await
             .unwrap_err();
 
@@ -936,7 +992,7 @@ mod tests {
             raw_pw("b.foo.mongodb.net.", 27018, 1, 0),
         ]);
 
-        let hosts = resolve_with("cluster0.foo.mongodb.net", &lookup)
+        let hosts = resolve_with("cluster0.foo.mongodb.net", "mongodb", &lookup)
             .await
             .expect("ok");
 

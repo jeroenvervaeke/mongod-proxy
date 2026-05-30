@@ -34,6 +34,13 @@ pub(crate) struct ParsedConnectionUri {
     /// string. `None` when neither was set — callers apply the
     /// scheme-specific default themselves.
     pub tls: Option<bool>,
+    /// `?srvServiceName=...` override for the SRV query prefix, if present.
+    /// Only valid with the `mongodb+srv://` scheme — pairing it with a
+    /// plain `mongodb://` URI is rejected with
+    /// [`ConnectionUriError::SrvServiceNameOnNonSrv`]. `None` when absent,
+    /// in which case callers fall back to
+    /// [`DEFAULT_SRV_SERVICE_NAME`](crate::srv::DEFAULT_SRV_SERVICE_NAME).
+    pub srv_service_name: Option<String>,
 }
 
 /// One `host[:port]` entry from a connection string's host list.
@@ -90,6 +97,15 @@ pub enum ConnectionUriError {
     /// the SRV record provides both.
     #[error("`mongodb+srv://` must have exactly one host without a port")]
     InvalidSrvHost,
+    /// `srvServiceName=` was set on a plain `mongodb://` URI. The option
+    /// only configures the SRV query prefix, so it is meaningless — and an
+    /// error per the mongo-rust-driver — without the `mongodb+srv://`
+    /// scheme.
+    #[error("`srvServiceName` is only valid with the `mongodb+srv://` scheme")]
+    SrvServiceNameOnNonSrv {
+        /// The `srvServiceName` value as it appeared in the URI.
+        value: String,
+    },
     /// Host segment shape is unparseable (e.g. unmatched `[` for IPv6).
     #[error("invalid host `{0}` (IPv6 literals in `[...]` are not supported)")]
     InvalidHost(String),
@@ -160,7 +176,42 @@ pub(crate) fn parse(uri: &str) -> Result<ParsedConnectionUri, ConnectionUriError
 
     let tls = parse_tls_option(query)?;
 
-    Ok(ParsedConnectionUri { scheme, hosts, tls })
+    // `srvServiceName` only configures the SRV query prefix, so it is an
+    // error on a non-SRV URI (matches the mongo-rust-driver rule).
+    let srv_service_name = match (scheme, parse_srv_service_name(query)?) {
+        (Scheme::Mongodb, Some(value)) => {
+            return Err(ConnectionUriError::SrvServiceNameOnNonSrv { value });
+        }
+        (_, srv_service_name) => srv_service_name,
+    };
+
+    Ok(ParsedConnectionUri {
+        scheme,
+        hosts,
+        tls,
+        srv_service_name,
+    })
+}
+
+/// Extracts the `srvServiceName` query option (case-insensitive key, like
+/// `tls`/`ssl`). Returns the *last* occurrence's value, or `None` when the
+/// option is absent. An empty value is treated as absent so callers fall
+/// back to the default service name rather than building an `_._tcp.`
+/// query.
+fn parse_srv_service_name(query: Option<&str>) -> Result<Option<String>, ConnectionUriError> {
+    let Some(query) = query else {
+        return Ok(None);
+    };
+    let mut value: Option<String> = None;
+    for pair in query.split('&') {
+        let Some((k, v)) = pair.split_once('=') else {
+            continue;
+        };
+        if k.eq_ignore_ascii_case("srvServiceName") && !v.is_empty() {
+            value = Some(v.to_owned());
+        }
+    }
+    Ok(value)
 }
 
 fn parse_host_port(s: &str) -> Result<(String, Option<u16>), ConnectionUriError> {
@@ -240,6 +291,7 @@ mod tests {
                 port,
             }],
             tls,
+            srv_service_name: None,
         }
     }
 
@@ -389,6 +441,7 @@ mod tests {
                     host_spec("host3", Some(27019)),
                 ],
                 tls: None,
+                srv_service_name: None,
             }
         );
     }
@@ -403,6 +456,7 @@ mod tests {
                 scheme: Scheme::Mongodb,
                 hosts: vec![host_spec("host1", None), host_spec("host2", Some(27018))],
                 tls: None,
+                srv_service_name: None,
             }
         );
     }
@@ -564,5 +618,59 @@ mod tests {
                 Some(true)
             )
         );
+    }
+
+    // ---------- srvServiceName query option ----------
+
+    #[test]
+    fn srv_service_name_defaults_to_none_when_absent() {
+        let parsed = parse("mongodb+srv://cluster.foo.mongodb.net/").unwrap();
+        assert_eq!(parsed.srv_service_name, None);
+    }
+
+    #[test]
+    fn srv_service_name_is_picked_up_for_srv_scheme() {
+        let parsed =
+            parse("mongodb+srv://cluster.foo.mongodb.net/?srvServiceName=mongodb").unwrap();
+        assert_eq!(parsed.srv_service_name.as_deref(), Some("mongodb"));
+    }
+
+    #[test]
+    fn srv_service_name_custom_value_is_kept() {
+        let parsed =
+            parse("mongodb+srv://cluster.foo.mongodb.net/?srvServiceName=customdb").unwrap();
+        assert_eq!(parsed.srv_service_name.as_deref(), Some("customdb"));
+    }
+
+    #[test]
+    fn srv_service_name_key_is_case_insensitive() {
+        let parsed = parse("mongodb+srv://cluster.foo.mongodb.net/?SRVSERVICENAME=mongo").unwrap();
+        assert_eq!(parsed.srv_service_name.as_deref(), Some("mongo"));
+    }
+
+    #[test]
+    fn srv_service_name_empty_value_is_treated_as_absent() {
+        // `?srvServiceName=` must not produce an `_._tcp.` query.
+        let parsed = parse("mongodb+srv://cluster.foo.mongodb.net/?srvServiceName=").unwrap();
+        assert_eq!(parsed.srv_service_name, None);
+    }
+
+    #[test]
+    fn srv_service_name_on_plain_mongodb_uri_errors() {
+        assert_eq!(
+            parse("mongodb://host/?srvServiceName=mongodb"),
+            Err(ConnectionUriError::SrvServiceNameOnNonSrv {
+                value: "mongodb".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn srv_service_name_with_tls_round_trips_for_srv_scheme() {
+        let parsed =
+            parse("mongodb+srv://cluster.foo.mongodb.net/?tls=false&srvServiceName=customdb")
+                .unwrap();
+        assert_eq!(parsed.tls, Some(false));
+        assert_eq!(parsed.srv_service_name.as_deref(), Some("customdb"));
     }
 }

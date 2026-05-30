@@ -82,7 +82,7 @@ fn next_conn_id() -> u64 {
 ///
 /// # async fn run() {
 /// let listener = TcpListener::bind("127.0.0.1:27018").await.unwrap();
-/// let proxy = Proxy::new("127.0.0.1", 27017, false).layer(LogLayer);
+/// let proxy = Proxy::new("127.0.0.1", 27017).layer(LogLayer);
 /// serve(listener, proxy).await.unwrap();
 /// # }
 /// ```
@@ -213,7 +213,7 @@ where
     ///
     /// # async fn run() {
     /// let listener = TcpListener::bind("127.0.0.1:27018").await.unwrap();
-    /// let proxy = Proxy::new("127.0.0.1", 27017, false);
+    /// let proxy = Proxy::new("127.0.0.1", 27017);
     /// serve(listener, proxy)
     ///     .run_until(async {
     ///         tokio::signal::ctrl_c().await.ok();

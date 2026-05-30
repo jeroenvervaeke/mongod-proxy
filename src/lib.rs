@@ -26,7 +26,7 @@
 //! // The `hello` / `isMaster` rewrite is on by default; opt out via
 //! // `.disable_rewrite_hello()` if you want the upstream's real topology
 //! // visible to drivers.
-//! let proxy = Proxy::new("127.0.0.1", 27017, /* use_tls = */ false)
+//! let proxy = Proxy::new("127.0.0.1", 27017)
 //!     .layer(LogLayer); // log every parsed request and response
 //!
 //! serve(listener, proxy).await.unwrap();

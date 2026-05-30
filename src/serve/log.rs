@@ -27,7 +27,7 @@
 //! ```
 //! use mongod_proxy::{LogLayer, Proxy};
 //!
-//! let proxy = Proxy::new("127.0.0.1", 27017, false).layer(LogLayer);
+//! let proxy = Proxy::new("127.0.0.1", 27017).layer(LogLayer);
 //! # let _ = proxy;
 //! ```
 

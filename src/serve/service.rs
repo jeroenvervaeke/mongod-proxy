@@ -74,17 +74,16 @@ fn install_default_crypto_provider() {
 /// use mongod_proxy::{Proxy, TlsConfig};
 ///
 /// // Forward to a TLS-terminating upstream using the OS-bundled
-/// // `webpki-roots` trust anchors (the same config `Proxy::new(.., true)`
-/// // builds).
+/// // `webpki-roots` trust anchors.
 /// let proxy = Proxy::with_tls("mongo.example.com", 27017, TlsConfig::System);
 /// # let _ = proxy;
 /// ```
 #[non_exhaustive]
 pub enum TlsConfig {
-    /// Plain TCP — no TLS. Equivalent to `Proxy::new(.., false)`.
+    /// Plain TCP — no TLS. What [`Proxy::new`] selects.
     Disabled,
     /// Standard `webpki-roots` trust anchors, no client cert, SNI on.
-    /// The default TLS behaviour and what `Proxy::new(.., true)` selects.
+    /// The conventional TLS choice for a public/Atlas upstream.
     System,
     /// Validate the upstream certificate against a caller-supplied
     /// [`RootCertStore`] instead of the bundled `webpki-roots` anchors.
@@ -291,9 +290,9 @@ type ServerWriter = FramedWrite<BoxedAsyncWrite, WireEncoder>;
 /// ```
 /// use mongod_proxy::{LogLayer, Proxy};
 ///
-/// // For the doctest we pass `use_tls = false` to avoid a network-dependent
-/// // rustls config; switch to `true` to forward over TLS in real use.
-/// let proxy = Proxy::new("mongo.example.com", 27017, /* use_tls = */ false)
+/// // Plain TCP upstream; use `Proxy::with_tls(.., TlsConfig::System)` to
+/// // forward over TLS instead.
+/// let proxy = Proxy::new("mongo.example.com", 27017)
 ///     .layer(LogLayer);
 /// // `proxy` is now a `Service<SocketAddr>` ready to hand to `serve(...)`.
 /// # let _ = proxy;
@@ -331,12 +330,15 @@ pub struct Proxy<L> {
 
 impl Proxy<Identity> {
     /// Creates a new proxy that forwards every incoming client connection
-    /// to `destination_name:destination_port`.
+    /// to `destination_name:destination_port` over **plain TCP**.
     ///
-    /// When `use_tls` is true the upstream socket is wrapped in a `rustls`
-    /// TLS client using the standard `webpki-roots` trust anchors and SNI
-    /// derived from `destination_name`. When false the upstream socket is
-    /// plain TCP.
+    /// This is the zero-configuration constructor for the common
+    /// local/`directConnection` case. For a TLS upstream, reach for
+    /// [`with_tls`](Proxy::with_tls) and pass the [`TlsConfig`] you want
+    /// ([`TlsConfig::System`] for the standard `webpki-roots` anchors,
+    /// [`TlsConfig::WithRoots`] for an internal CA): the explicit enum keeps
+    /// the trust policy visible at the call site rather than hiding it behind
+    /// a bare `bool`.
     ///
     /// The resulting proxy has the `hello` / `isMaster` rewrite **on by
     /// default** so SDAM-enabled drivers (`mongodb://host:port/` with no
@@ -351,22 +353,18 @@ impl Proxy<Identity> {
     // The `Proxy` struct is already `#[must_use]`, which covers this
     // `-> Self` constructor; a second bare attribute would be redundant
     // (`clippy::double_must_use`).
-    pub fn new(destination_name: impl Into<String>, destination_port: u16, use_tls: bool) -> Self {
-        let tls = if use_tls {
-            TlsConfig::System
-        } else {
-            TlsConfig::Disabled
-        };
-        Self::with_tls(destination_name, destination_port, tls)
+    pub fn new(destination_name: impl Into<String>, destination_port: u16) -> Self {
+        Self::with_tls(destination_name, destination_port, TlsConfig::Disabled)
     }
 
     /// Creates a new proxy forwarding to `destination_name:destination_port`
     /// with explicit control over the upstream TLS trust policy via
     /// [`TlsConfig`].
     ///
-    /// This is the general form of [`Proxy::new`]: `new(.., false)` is
-    /// [`TlsConfig::Disabled`] and `new(.., true)` is [`TlsConfig::System`].
-    /// Reach for `with_tls` to forward to an internal-CA deployment
+    /// This is the general form of [`Proxy::new`]: `new(host, port)` is
+    /// exactly `with_tls(host, port, TlsConfig::Disabled)`. Pass
+    /// [`TlsConfig::System`] for the standard `webpki-roots` anchors, or
+    /// reach further for an internal-CA deployment
     /// ([`TlsConfig::WithRoots`]) or — when the `dangerous-insecure-tls`
     /// feature is enabled — a throwaway self-signed test deployment
     /// ([`TlsConfig::Insecure`]).
@@ -380,7 +378,7 @@ impl Proxy<Identity> {
     /// ```
     /// use mongod_proxy::{Proxy, TlsConfig};
     ///
-    /// // Plain TCP, equivalent to `Proxy::new(.., false)`.
+    /// // Plain TCP, equivalent to `Proxy::new("127.0.0.1", 27017)`.
     /// let proxy = Proxy::with_tls("127.0.0.1", 27017, TlsConfig::Disabled);
     /// # let _ = proxy;
     /// ```
@@ -660,7 +658,14 @@ impl Proxy<Identity> {
                 host,
                 port,
                 use_tls,
-            } => Ok(Self::new(host, port, use_tls)),
+            } => {
+                let tls = if use_tls {
+                    TlsConfig::System
+                } else {
+                    TlsConfig::Disabled
+                };
+                Ok(Self::with_tls(host, port, tls))
+            }
             UriRoute::SeedList { hosts, use_tls } => {
                 Self::from_seed_list(hosts, use_tls, FailoverConfig::default()).await
             }
@@ -1690,20 +1695,20 @@ mod tests {
     }
 
     #[test]
-    fn new_with_use_tls_true_matches_system() {
-        let proxy = Proxy::new("mongo.example.com", 27017, true);
+    fn with_tls_system_builds_connector() {
+        let proxy = Proxy::with_tls("mongo.example.com", 27017, TlsConfig::System);
         assert!(
             proxy.tls_connector.is_some(),
-            "Proxy::new(.., true) must still build a TLS connector"
+            "TlsConfig::System must build a TLS connector"
         );
     }
 
     #[test]
-    fn new_with_use_tls_false_matches_disabled() {
-        let proxy = Proxy::new("mongo.example.com", 27017, false);
+    fn new_is_plain_tcp() {
+        let proxy = Proxy::new("mongo.example.com", 27017);
         assert!(
             proxy.tls_connector.is_none(),
-            "Proxy::new(.., false) must still be plain TCP"
+            "Proxy::new must be plain TCP (no TLS connector)"
         );
     }
 

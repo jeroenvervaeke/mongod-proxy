@@ -94,7 +94,7 @@ async fn explain_layer_captures_typed_events_for_find_and_aggregate() {
     let proxy_port = listener.local_addr().unwrap().port();
     eprintln!("proxy listening on 127.0.0.1:{proxy_port}");
 
-    let proxy = Proxy::new("127.0.0.1", host_port, false).enable_explain_with_sink(tx);
+    let proxy = Proxy::new("127.0.0.1", host_port).enable_explain_with_sink(tx);
 
     let proxy_task = tokio::spawn(async move {
         let _ = serve(listener, proxy).await;

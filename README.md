@@ -58,7 +58,7 @@ async fn main() -> std::io::Result<()> {
     // `Service<Message>` for every incoming client connection. The
     // `hello` / `isMaster` rewrite is on by default — driver URIs
     // without `directConnection=true` just work.
-    let proxy = Proxy::new("127.0.0.1", 27017, /* use_tls = */ false)
+    let proxy = Proxy::new("127.0.0.1", 27017)
         .layer(LogLayer); // log every parsed request and response
 
     serve(listener, proxy).await
@@ -129,8 +129,9 @@ driver-side `authSource` / `replicaSet` / `loadBalanced` options) is
 similarly not fetched.
 
 For callers that don't have a connection string —
-`Proxy::new(host, port, use_tls)` and `Proxy::from_srv(hostname, use_tls)`
-remain available with explicit arguments.
+`Proxy::new(host, port)` (plain TCP), `Proxy::with_tls(host, port, TlsConfig)`,
+and `Proxy::from_srv(hostname, use_tls)` remain available with explicit
+arguments.
 
 The `logger` binary picks the URI up via the `MONGOD_PROXY_UPSTREAM_URI`
 env var (defaults to `mongodb://localhost:27017/`).

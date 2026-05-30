@@ -5,18 +5,27 @@
 
 use super::newtypes::OtherName;
 
+/// Which projection strategy a `PROJECTION_*` stage used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ProjectionKind {
+    /// General-purpose projection. Wire form: `PROJECTION_DEFAULT`.
     Default,
+    /// Fast path for simple field inclusion/exclusion. Wire form:
+    /// `PROJECTION_SIMPLE`.
     Simple,
+    /// Projection served entirely from the index. Wire form:
+    /// `PROJECTION_COVERED`.
     Covered,
 }
 
+/// Which intersection strategy an `AND_*` stage used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum AndKind {
+    /// Sorted index intersection. Wire form: `AND_SORTED`.
     Sorted,
+    /// Hash-based index intersection. Wire form: `AND_HASH`.
     Hash,
 }
 
@@ -31,24 +40,45 @@ pub enum AndKind {
 #[non_exhaustive]
 pub enum Stage {
     // -------- Classic query-plan engine (uppercase wire names) --------
+    /// Full collection scan. Wire form: `COLLSCAN`.
     Collscan,
+    /// Index scan. Wire form: `IXSCAN`.
     Ixscan,
+    /// Fetch full documents by record id. Wire form: `FETCH`.
     Fetch,
+    /// Blocking sort. Wire form: `SORT`.
     Sort,
+    /// Merge already-sorted inputs. Wire form: `SORT_MERGE`.
     SortMerge,
+    /// Limit the number of results. Wire form: `LIMIT`.
     Limit,
+    /// Skip leading results. Wire form: `SKIP`.
     Skip,
+    /// Grouping stage. Wire form: `GROUP`.
     Group,
+    /// Projection stage, tagged with its strategy. Wire form: `PROJECTION_*`.
     Project(ProjectionKind),
+    /// Union of child plans. Wire form: `OR`.
     Or,
+    /// Index intersection, tagged with its strategy. Wire form: `AND_*`.
     And(AndKind),
+    /// Subplan for rooted `$or` queries. Wire form: `SUBPLAN`.
     Subplan,
+    /// Filters out documents not owned by this shard. Wire form:
+    /// `SHARDING_FILTER`.
     ShardingFilter,
+    /// Returns index keys instead of documents. Wire form: `RETURN_KEY`.
     ReturnKey,
+    /// Count stage. Wire form: `COUNT`.
     Count,
+    /// Count served from an index. Wire form: `COUNT_SCAN`.
     CountScan,
+    /// Distinct served by skipping duplicate index keys. Wire form:
+    /// `DISTINCT_SCAN`.
     DistinctScan,
+    /// Update stage. Wire form: `UPDATE`.
     UpdateStage,
+    /// Delete stage. Wire form: `DELETE`.
     DeleteStage,
 
     // -------- Slot-Based Execution engine (MongoDB 8+, lowercase wire names) --------
@@ -57,27 +87,48 @@ pub enum Stage {
     // consumers can tell which engine actually executed the query.
     // Folding `scan` into `Collscan` would lie about the execution
     // engine.
+    /// SBE collection scan. Wire form: `scan`.
     SbeScan,
+    /// SBE index scan. Wire form: `ixscan`.
     SbeIxscan,
+    /// SBE index seek. Wire form: `ixseek`.
     SbeIxseek,
+    /// SBE document fetch. Wire form: `fetch`.
     SbeFetch,
+    /// SBE residual filter. Wire form: `filter`.
     SbeFilter,
+    /// SBE projection. Wire form: `project`.
     SbeProject,
+    /// SBE grouping. Wire form: `group`.
     SbeGroup,
+    /// SBE sort. Wire form: `sort`.
     SbeSort,
+    /// SBE limit. Wire form: `limit`.
     SbeLimit,
+    /// SBE skip. Wire form: `skip`.
     SbeSkip,
+    /// SBE union. Wire form: `or`.
     SbeOr,
+    /// SBE array unwind. Wire form: `unwind`.
     SbeUnwind,
+    /// SBE hash lookup (join). Wire form: `hash_lookup`.
     SbeHashLookup,
+    /// SBE merge of sorted inputs. Wire form: `merge`.
     SbeMerge,
 
     // -------- MongoDB 8 "express" fast paths (single-document by `_id`). --------
+    /// Express single-document index scan. Wire form: `EXPRESS_IXSCAN`.
     ExpressIxscan,
+    /// Express scan over a clustered index. Wire form:
+    /// `EXPRESS_CLUSTERED_IXSCAN`.
     ExpressClusteredIxscan,
+    /// Express single-document update. Wire form: `EXPRESS_UPDATE`.
     ExpressUpdate,
+    /// Express single-document delete. Wire form: `EXPRESS_DELETE`.
     ExpressDelete,
 
+    /// Any stage name not modelled above, kept as a lowercase-normalised
+    /// string for forward compatibility.
     Other(OtherName),
 }
 

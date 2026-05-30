@@ -23,7 +23,12 @@ macro_rules! open_vocab_enum {
         #[derive(Debug, Clone, PartialEq, Eq, Hash)]
         #[non_exhaustive]
         pub enum $Name {
-            $($variant,)+
+            $(
+                #[doc = concat!("The `", stringify!($variant), "` variant.")]
+                $variant,
+            )+
+            /// Any wire value not modelled by an explicit variant, kept as a
+            /// lowercase-normalised string for forward compatibility.
             Other(OtherName),
         }
 

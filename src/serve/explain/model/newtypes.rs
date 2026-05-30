@@ -6,6 +6,7 @@
 
 use nutype::nutype;
 
+/// A database name was empty (or whitespace-only) after trimming.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error("database name must be non-empty after trimming")]
 pub struct DatabaseError;
@@ -27,6 +28,7 @@ fn validate_database(s: &str) -> Result<(), DatabaseError> {
 )]
 pub struct Database(String);
 
+/// A collection name was empty (or whitespace-only) after trimming.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error("collection name must be non-empty after trimming")]
 pub struct CollectionError;
@@ -48,6 +50,7 @@ fn validate_collection(s: &str) -> Result<(), CollectionError> {
 )]
 pub struct Collection(String);
 
+/// An index name was the empty string.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error("index name must be non-empty")]
 pub struct IndexNameError;
@@ -67,6 +70,7 @@ fn validate_index_name(s: &str) -> Result<(), IndexNameError> {
 )]
 pub struct IndexName(String);
 
+/// A `DocsReturned` count was negative; carries the offending value.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error("DocsReturned must be non-negative, got {0}")]
 pub struct DocsReturnedError(pub i64);
@@ -86,6 +90,7 @@ fn validate_docs_returned(n: &i64) -> Result<(), DocsReturnedError> {
 )]
 pub struct DocsReturned(i64);
 
+/// A `DocsExamined` count was negative; carries the offending value.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error("DocsExamined must be non-negative, got {0}")]
 pub struct DocsExaminedError(pub i64);
@@ -105,6 +110,7 @@ fn validate_docs_examined(n: &i64) -> Result<(), DocsExaminedError> {
 )]
 pub struct DocsExamined(i64);
 
+/// A `KeysExamined` count was negative; carries the offending value.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error("KeysExamined must be non-negative, got {0}")]
 pub struct KeysExaminedError(pub i64);
@@ -134,6 +140,7 @@ pub struct AggregateTime(std::time::Duration);
 #[nutype(derive(Debug, Clone, Copy, PartialEq, Eq, Hash, From, Into))]
 pub struct NodeTime(std::time::Duration);
 
+/// A server error code was not positive; carries the offending value.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error("server error code must be positive, got {0}")]
 pub struct ServerErrorCodeError(pub i32);

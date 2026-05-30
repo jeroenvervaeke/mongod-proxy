@@ -90,7 +90,12 @@ pub enum MessageParseError {
 pub enum MessageAndHeaderParseError {
     /// The header claims `expected` bytes but only `actual` are available.
     #[error("not enough bytes, expected={expected}, actual={actual}")]
-    NotEnoughBytes { actual: usize, expected: usize },
+    NotEnoughBytes {
+        /// Number of body bytes actually available.
+        actual: usize,
+        /// Number of body bytes the header declared.
+        expected: usize,
+    },
     /// The body bytes did not parse as the [`Operation`] indicated by the
     /// header's opcode.
     #[error("failed to parse operation: {0}")]

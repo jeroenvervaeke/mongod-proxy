@@ -199,7 +199,12 @@ impl std::fmt::Debug for OperationMessage {
 pub enum OperationMessageParseError {
     /// Body shorter than the unconditional minimum (flag bits + first kind byte).
     #[error("not enough bytes, expected at least {min} bytes, got {actual}")]
-    NotEnoughBytes { actual: usize, min: usize },
+    NotEnoughBytes {
+        /// Number of body bytes actually available.
+        actual: usize,
+        /// Minimum number of bytes required to begin parsing.
+        min: usize,
+    },
     /// One or more *required* flag bits (`0..16`) set are not understood.
     /// The included `u32` is the unknown bits only (known bits masked off).
     #[error("unknown required flag bits set: {0:#010x}")]
@@ -212,7 +217,10 @@ pub enum OperationMessageParseError {
     MissingChecksum,
     /// A kind-1 section's self-declared size did not fit in the buffer.
     #[error("document sequence section size {size} out of range")]
-    InvalidDocumentSequenceSize { size: i32 },
+    InvalidDocumentSequenceSize {
+        /// The out-of-range section size declared in the kind-1 header.
+        size: i32,
+    },
     /// A kind-1 section's identifier ended without a NUL terminator.
     #[error("document sequence identifier missing NUL terminator: {0}")]
     DocumentSequenceIdentifierMissingNul(#[from] FromBytesUntilNulError),

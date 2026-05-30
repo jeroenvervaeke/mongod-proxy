@@ -76,7 +76,12 @@ bitflags! {
 pub enum OperationReplyParseError {
     /// Body shorter than the unconditional minimum.
     #[error("not enough bytes, expected at least {min} bytes, got {actual}")]
-    NotEnoughBytes { actual: usize, min: usize },
+    NotEnoughBytes {
+        /// Number of body bytes actually available.
+        actual: usize,
+        /// Minimum number of bytes required to begin parsing.
+        min: usize,
+    },
     /// One or more unknown flag bits were set. The `u32` carries unknown
     /// bits only.
     #[error("unknown reply flag bits set: {0:#010x}")]
@@ -84,7 +89,9 @@ pub enum OperationReplyParseError {
     /// Parsing the document at index `n` failed.
     #[error("failed to parse document (n={n}): {source}")]
     FailedToParseDocument {
+        /// Zero-based index of the reply document that failed to parse.
         n: usize,
+        /// The underlying BSON parsing error.
         #[source]
         source: bson::error::Error,
     },

@@ -46,12 +46,14 @@ pub struct ExplainLayer<Sk: Clone = TracingOnly> {
 }
 
 impl ExplainLayer<TracingOnly> {
+    /// Creates an explain layer with the default [`TracingOnly`] sink.
     pub fn new() -> Self {
         Self { sink: TracingOnly }
     }
 }
 
 impl<Sk: Clone> ExplainLayer<Sk> {
+    /// Creates an explain layer that emits captured events to `sink`.
     pub fn with_sink(sink: Sk) -> Self {
         Self { sink }
     }

@@ -7,9 +7,16 @@ pub mod open_vocab;
 pub mod plan_details;
 pub mod stage;
 
-pub use event::*;
-pub use namespace::*;
-pub use newtypes::*;
-pub use open_vocab::*;
-pub use plan_details::*;
-pub use stage::*;
+pub use event::{ExplainEvent, ExplainTotals, MalformedOkShape, PlanNode, UnsupportedShape};
+pub use namespace::{Namespace, NamespaceParseError, NamespaceParseErrorKind};
+pub use newtypes::{
+    AggregateTime, Collection, CollectionError, Database, DatabaseError, DocsExamined,
+    DocsExaminedError, DocsReturned, DocsReturnedError, IndexName, IndexNameError, KeysExamined,
+    KeysExaminedError, NodeTime, OtherName, ServerErrorCode, ServerErrorCodeError,
+};
+pub use open_vocab::{Command, Direction, ErrorLabel, ServerErrorCodeName};
+pub use plan_details::{
+    BoundValue, Filter, Inclusivity, IndexBoundRange, IndexBounds, IndexBoundsParseError,
+    IndexFieldKind, KeyPattern, KeyPatternField,
+};
+pub use stage::{AndKind, ProjectionKind, Stage};

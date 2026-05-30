@@ -25,7 +25,9 @@ pub trait ExplainSink<E>
 where
     E: std::error::Error,
 {
+    /// Records a successfully captured explain event.
     fn record(&self, event: ExplainEvent);
+    /// Records an explain-branch failure. Defaults to a no-op.
     fn record_error(&self, _err: &ExplainError<E>) {}
 }
 

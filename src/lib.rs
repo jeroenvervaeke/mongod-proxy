@@ -1,3 +1,5 @@
+#![warn(missing_docs)]
+#![warn(rustdoc::broken_intra_doc_links)]
 //! A pluggable transparent proxy for the MongoDB wire protocol.
 //!
 //! `mongod-proxy` accepts MongoDB driver connections, parses the wire-protocol

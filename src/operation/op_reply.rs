@@ -63,7 +63,7 @@ pub enum OperationReplyParseError {
     FailedToParseDocument {
         n: usize,
         #[source]
-        source: bson::de::Error,
+        source: bson::error::Error,
     },
 }
 
@@ -72,7 +72,7 @@ pub enum OperationReplyParseError {
 pub enum OperationReplyWriteError {
     /// BSON serialisation of a document failed.
     #[error("failed to serialize document: {0}")]
-    SerializeDocumentError(#[from] bson::ser::Error),
+    SerializeDocumentError(#[from] bson::error::Error),
     /// `documents.len()` doesn't fit in the `i32` `numberReturned` field.
     /// In practice this never happens — wire-protocol message size limits
     /// kick in long before two-billion-plus documents do.

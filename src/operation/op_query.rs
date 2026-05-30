@@ -89,10 +89,10 @@ pub enum OperationQueryParseError {
     InvalidUtf8CollectionName(#[from] Utf8Error),
     /// BSON parsing of the query document failed.
     #[error("failed to parse query: {0}")]
-    FailedToParseQuery(#[source] bson::de::Error),
+    FailedToParseQuery(#[source] bson::error::Error),
     /// BSON parsing of the projection document failed.
     #[error("failed to parse return fields selector: {0}")]
-    FailedToParseReturnFieldsSelector(#[source] bson::de::Error),
+    FailedToParseReturnFieldsSelector(#[source] bson::error::Error),
 }
 
 /// Failure modes for [`OperationQuery::write_bytes`].
@@ -100,10 +100,10 @@ pub enum OperationQueryParseError {
 pub enum OperationQueryWriteError {
     /// BSON serialisation of `query` failed.
     #[error("failed to serialize query: {0}")]
-    SerializeQueryError(#[source] bson::ser::Error),
+    SerializeQueryError(#[source] bson::error::Error),
     /// BSON serialisation of `return_fields_selector` failed.
     #[error("failed to serialize return field selector: {0}")]
-    SerializeReturnFieldSelectorError(#[source] bson::ser::Error),
+    SerializeReturnFieldSelectorError(#[source] bson::error::Error),
     /// `full_collection_name` contained an interior NUL byte and so cannot
     /// be encoded as a C string.
     #[error("collection name contains null byte: {0}")]
@@ -202,11 +202,11 @@ impl OperationQuery {
         request_id: RequestId,
         response_to: Option<ResponseTo>,
     ) -> Result<(), OperationQueryWriteError> {
-        let query_bytes =
-            bson::to_vec(&self.query).map_err(OperationQueryWriteError::SerializeQueryError)?;
+        let query_bytes = bson::serialize_to_vec(&self.query)
+            .map_err(OperationQueryWriteError::SerializeQueryError)?;
 
         let return_fields_selector_bytes = match &self.return_fields_selector {
-            Some(doc) => bson::to_vec(doc)
+            Some(doc) => bson::serialize_to_vec(doc)
                 .map_err(OperationQueryWriteError::SerializeReturnFieldSelectorError)?,
             None => Vec::new(),
         };
@@ -278,7 +278,7 @@ mod tests {
         body.push(0); // null terminator
         body.extend_from_slice(&0i32.to_le_bytes()); // skip
         body.extend_from_slice(&0i32.to_le_bytes()); // return
-        let doc_bytes = bson::to_vec(&doc! {}).unwrap();
+        let doc_bytes = bson::serialize_to_vec(&doc! {}).unwrap();
         body.extend_from_slice(&doc_bytes);
         let err = OperationQuery::from_bytes(&body).unwrap_err();
         assert!(matches!(err, OperationQueryParseError::UnknownFlagBits(_)));

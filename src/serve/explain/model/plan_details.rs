@@ -383,8 +383,8 @@ mod tests {
     #[test]
     fn key_pattern_from_document() {
         let doc = doc! { "year": 1, "title": "text" };
-        let bytes = bson::to_vec(&doc).unwrap();
-        let kp: KeyPattern = bson::from_slice(&bytes).unwrap();
+        let bytes = bson::serialize_to_vec(&doc).unwrap();
+        let kp: KeyPattern = bson::deserialize_from_slice(&bytes).unwrap();
         match kp {
             KeyPattern::Document(fields) => {
                 assert_eq!(fields.len(), 2);
@@ -399,7 +399,7 @@ mod tests {
 
     #[test]
     fn key_pattern_express_string_preserved_verbatim() {
-        // bson::from_slice for a top-level string requires the BSON value
+        // bson::deserialize_from_slice for a top-level string requires the BSON value
         // to be wrapped. Skip cross-format test; the parse_express_string
         // helper round-trip is exercised separately.
         assert_eq!(

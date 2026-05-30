@@ -460,8 +460,8 @@ mod tests {
         let body = hello_body(&msg);
 
         // The bare probe fields stay intact alongside the new client doc.
-        assert_eq!(body.get_i32("hello"), Ok(1));
-        assert_eq!(body.get_str("$db"), Ok("admin"));
+        assert_eq!(body.get_i32("hello").unwrap(), 1);
+        assert_eq!(body.get_str("$db").unwrap(), "admin");
 
         let client = body
             .get_document("client")
@@ -470,10 +470,10 @@ mod tests {
         let driver = client
             .get_document("driver")
             .expect("client must carry a driver sub-document");
-        assert_eq!(driver.get_str("name"), Ok("mongod-proxy"));
+        assert_eq!(driver.get_str("name").unwrap(), "mongod-proxy");
         assert_eq!(
-            driver.get_str("version"),
-            Ok(env!("CARGO_PKG_VERSION")),
+            driver.get_str("version").unwrap(),
+            env!("CARGO_PKG_VERSION"),
             "driver version must be the crate version",
         );
         assert!(
@@ -484,18 +484,18 @@ mod tests {
         let os = client
             .get_document("os")
             .expect("client must carry an os sub-document");
-        assert_eq!(os.get_str("type"), Ok(std::env::consts::OS));
+        assert_eq!(os.get_str("type").unwrap(), std::env::consts::OS);
         assert!(
             !os.get_str("type").unwrap().is_empty(),
             "os.type must be present and non-empty",
         );
-        assert_eq!(os.get_str("architecture"), Ok(std::env::consts::ARCH));
+        assert_eq!(os.get_str("architecture").unwrap(), std::env::consts::ARCH);
         assert!(
             !os.get_str("architecture").unwrap().is_empty(),
             "os.architecture must be present and non-empty",
         );
 
-        assert_eq!(client.get_str("platform"), Ok("Rust"));
+        assert_eq!(client.get_str("platform").unwrap(), "Rust");
     }
 
     // ---------- select_primary ----------

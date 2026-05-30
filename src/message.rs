@@ -46,7 +46,7 @@ use crate::{
 /// let roundtripped = Message::from_bytes(&buf).unwrap();
 /// assert_eq!(msg, roundtripped);
 /// ```
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Message {
     /// Sender-chosen identifier. Replies reference this in their
     /// [`response_to`](Self::response_to).
@@ -57,18 +57,6 @@ pub struct Message {
     pub response_to: Option<ResponseTo>,
     /// The typed body. Determines the on-the-wire opcode at write time.
     pub operation: Operation,
-}
-
-impl std::fmt::Debug for Message {
-    /// Forwards to the inner [`Operation`]'s hand-written, credential-aware
-    /// [`Debug`] impl so no raw BSON document escapes into logs.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Message")
-            .field("request_id", &self.request_id)
-            .field("response_to", &self.response_to)
-            .field("operation", &self.operation)
-            .finish()
-    }
 }
 
 /// Failure modes for [`Message::from_bytes`].

@@ -27,7 +27,7 @@ pub mod op_reply;
 /// Typed wire-protocol operation, selected by [`OPCode`].
 ///
 /// A [`Message`](crate::message::Message) owns exactly one of these.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Operation {
     /// Legacy OP_QUERY body. Drivers still emit this for the initial
     /// `isMaster` / `hello` handshake before the wire version is known.
@@ -36,18 +36,6 @@ pub enum Operation {
     Message(OperationMessage),
     /// Legacy OP_REPLY body. Servers emit this in response to OP_QUERY.
     Reply(OperationReply),
-}
-
-impl std::fmt::Debug for Operation {
-    /// Forwards to the inner body type's hand-written, credential-aware
-    /// [`Debug`] impl so no raw BSON document escapes into logs.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Operation::Query(q) => f.debug_tuple("Query").field(q).finish(),
-            Operation::Message(m) => f.debug_tuple("Message").field(m).finish(),
-            Operation::Reply(r) => f.debug_tuple("Reply").field(r).finish(),
-        }
-    }
 }
 
 /// Failure modes for [`Operation::from_bytes`].

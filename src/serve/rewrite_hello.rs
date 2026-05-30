@@ -90,7 +90,7 @@
 //!
 //! // Driver URIs like `mongodb://127.0.0.1:27018/` (no directConnection)
 //! // reach the proxy as a Standalone and stay on this socket.
-//! let proxy = Proxy::new("127.0.0.1", 27017, false);
+//! let proxy = Proxy::new("127.0.0.1", 27017);
 //! # let _ = proxy;
 //! ```
 //!
@@ -100,7 +100,7 @@
 //! ```
 //! use mongod_proxy::Proxy;
 //!
-//! let proxy = Proxy::new("127.0.0.1", 27017, false).disable_rewrite_hello();
+//! let proxy = Proxy::new("127.0.0.1", 27017).disable_rewrite_hello();
 //! # let _ = proxy;
 //! ```
 

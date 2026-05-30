@@ -22,7 +22,7 @@ use std::io::{self, IsTerminal};
 use anyhow::{Context, Result};
 use mongod_proxy::{
     Direction, ExplainEvent, Filter, Inclusivity, IndexBounds, IndexFieldKind, KeyPattern,
-    PlanNode, Proxy, Stage, serve,
+    PlanNode, Proxy, Stage, TlsConfig, serve,
 };
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -80,7 +80,12 @@ async fn main() -> Result<()> {
         }
     });
 
-    let proxy = Proxy::new(upstream_host, upstream_port, use_tls).enable_explain_with_sink(tx);
+    let tls = if use_tls {
+        TlsConfig::System
+    } else {
+        TlsConfig::Disabled
+    };
+    let proxy = Proxy::with_tls(upstream_host, upstream_port, tls).enable_explain_with_sink(tx);
 
     serve(listener, proxy).await.context("run mongodb proxy")?;
     let _ = consumer.await;

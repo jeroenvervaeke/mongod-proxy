@@ -106,7 +106,7 @@ async fn proxy_intercepts_every_command_we_send(
     // The `hello` / `isMaster` rewrite is on by default — the replica-set
     // case relies on it so the driver doesn't reconnect to the upstream
     // container hostname.
-    let proxy = Proxy::new("127.0.0.1", host_port, false)
+    let proxy = Proxy::new("127.0.0.1", host_port)
         .layer(LogLayer)
         .layer(recorder.layer());
 

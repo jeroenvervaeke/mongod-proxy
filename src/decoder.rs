@@ -100,7 +100,7 @@ impl Decoder for WireDecoder {
         // for more data. Peek the length without consuming so we can
         // return `Ok(None)` before taking ownership.
         let frame_len = match &self.next_header {
-            Some(h) => h.message_length.into_inner() as usize,
+            Some(h) => h.message_length.as_usize(),
             None => return Ok(None),
         };
         if buf.len() < frame_len {

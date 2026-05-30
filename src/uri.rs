@@ -64,6 +64,7 @@ pub(crate) enum Scheme {
 
 /// Failure modes for [`Proxy::from_uri`](crate::Proxy::from_uri).
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ConnectionUriError {
     /// URI does not contain `://`.
     #[error("connection string is missing the `://` scheme separator")]

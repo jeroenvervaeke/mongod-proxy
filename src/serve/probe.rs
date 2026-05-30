@@ -50,6 +50,7 @@ use crate::operation::{
     op_msg::{OpMsgSection, OperationMessage, OperationMessageFlags},
 };
 use crate::serve::service::{ProxyClient, ProxyClientForwardError, ProxyClientRequestError};
+use crate::srv::SrvHost;
 
 /// Default per-host budget for the dial + `hello` round-trip during
 /// primary selection. Hosts that don't reply in time are skipped rather
@@ -66,6 +67,7 @@ pub(crate) const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Failure modes for a single primary probe.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ProbeError {
     /// TCP / TLS connect to the candidate host failed.
     #[error("connect failed: {0}")]
@@ -98,6 +100,7 @@ pub enum ProbeError {
 /// opaque number; an operator could not tell a network-policy problem
 /// from an in-progress election from a cert mismatch.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ProbeOutcome {
     /// The host answered `hello` but reported `isWritablePrimary: false`
     /// (a secondary, arbiter, or other non-primary member) — the replica
@@ -128,10 +131,10 @@ pub enum ProbeOutcome {
 pub(crate) enum Selection {
     /// A candidate reported `isWritablePrimary == true`; it becomes the
     /// upstream.
-    Primary(crate::srv::SrvHost),
+    Primary(SrvHost),
     /// No candidate did. Carries each probed host paired with the reason
     /// it was rejected, in probe-completion order.
-    NoPrimary(Vec<(crate::srv::SrvHost, ProbeOutcome)>),
+    NoPrimary(Vec<(SrvHost, ProbeOutcome)>),
 }
 
 impl Selection {
@@ -141,7 +144,7 @@ impl Selection {
     /// and logs its own "kept current target" message on `None` — the
     /// per-host rejection reasons matter only for the *startup* error the
     /// caller surfaces, not for a steady-state re-probe tick.
-    pub(crate) fn into_primary(self) -> Option<crate::srv::SrvHost> {
+    pub(crate) fn into_primary(self) -> Option<SrvHost> {
         match self {
             Selection::Primary(host) => Some(host),
             Selection::NoPrimary(_) => None,
@@ -248,11 +251,7 @@ impl PrimaryProbe for HelloProbe {
 /// failure ([`ProbeOutcome::Failed`]), or a timeout
 /// ([`ProbeOutcome::TimedOut`]) — so the caller can surface *why* startup
 /// found no primary rather than just *how many* hosts it tried.
-pub(crate) async fn select_primary<P>(
-    hosts: &[crate::srv::SrvHost],
-    probe: &P,
-    timeout: Duration,
-) -> Selection
+pub(crate) async fn select_primary<P>(hosts: &[SrvHost], probe: &P, timeout: Duration) -> Selection
 where
     P: PrimaryProbe + ?Sized,
 {
@@ -363,7 +362,7 @@ fn extract_is_writable_primary(msg: &Message) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use crate::srv::SrvHost;
+    use SrvHost;
 
     use super::*;
 
@@ -978,6 +977,17 @@ mod tests {
         let messages = layer.messages.clone();
         let subscriber = Registry::default().with(layer);
         let _guard = tracing::subscriber::set_default(subscriber);
+        // `tracing` caches each callsite's interest globally the first time it
+        // is evaluated. Because this capturing subscriber is installed only on
+        // the current thread (`set_default`, not `set_global_default`), a
+        // callsite first hit while the global default is `NoSubscriber` can
+        // cache its interest as "never" — after which the `info!`/`debug!`
+        // events in `select_primary` are skipped before this thread-local
+        // subscriber is ever consulted, and the assertions flake depending on
+        // cross-test scheduling. Rebuilding the cache re-evaluates every
+        // callsite against the now-installed subscriber, making capture
+        // deterministic.
+        tracing::callsite::rebuild_interest_cache();
         fut.await;
         let buf = messages.lock().expect("messages mutex poisoned");
         buf.clone()

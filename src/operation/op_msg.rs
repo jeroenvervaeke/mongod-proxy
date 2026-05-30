@@ -19,6 +19,7 @@ use crate::{
     header::MessageHeader,
     ids::{MessageLength, RequestId, ResponseTo},
     op_code::OPCode,
+    redact::RedactedDoc,
 };
 
 /// Mask of the bits the spec classifies as *required* (`0..16`).
@@ -63,7 +64,7 @@ bitflags! {
 /// `delete`) additionally carry one or more [`OpMsgSection::DocumentSequence`]
 /// sections that contain the array of documents / updates / deletes, lifted
 /// out of the body for wire efficiency.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum OpMsgSection {
     /// Kind-0: a single BSON document (the "body"). By convention the first
     /// key of the document is the command name (`find`, `insert`, ...).
@@ -78,6 +79,29 @@ pub enum OpMsgSection {
         /// The documents themselves, in order.
         documents: Vec<Document>,
     },
+}
+
+impl std::fmt::Debug for OpMsgSection {
+    /// Renders structural metadata, routing every embedded BSON document
+    /// through [`RedactedDoc`] so credential-bearing
+    /// payloads (e.g. `saslStart`) never reach logs.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OpMsgSection::Body(doc) => f.debug_tuple("Body").field(&RedactedDoc(doc)).finish(),
+            OpMsgSection::DocumentSequence {
+                identifier,
+                documents,
+            } => f
+                .debug_struct("DocumentSequence")
+                .field("identifier", identifier)
+                .field("document_count", &documents.len())
+                .field(
+                    "documents",
+                    &documents.iter().map(RedactedDoc).collect::<Vec<_>>(),
+                )
+                .finish(),
+        }
+    }
 }
 
 impl OpMsgSection {
@@ -151,10 +175,16 @@ pub struct OperationMessage {
 
 /// Failure modes for [`OperationMessage::from_bytes`].
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum OperationMessageParseError {
     /// Body shorter than the unconditional minimum (flag bits + first kind byte).
     #[error("not enough bytes, expected at least {min} bytes, got {actual}")]
-    NotEnoughBytes { actual: usize, min: usize },
+    NotEnoughBytes {
+        /// Number of body bytes actually available.
+        actual: usize,
+        /// Minimum number of bytes required to begin parsing.
+        min: usize,
+    },
     /// One or more *required* flag bits (`0..16`) set are not understood.
     /// The included `u32` is the unknown bits only (known bits masked off).
     #[error("unknown required flag bits set: {0:#010x}")]
@@ -167,7 +197,10 @@ pub enum OperationMessageParseError {
     MissingChecksum,
     /// A kind-1 section's self-declared size did not fit in the buffer.
     #[error("document sequence section size {size} out of range")]
-    InvalidDocumentSequenceSize { size: i32 },
+    InvalidDocumentSequenceSize {
+        /// The out-of-range section size declared in the kind-1 header.
+        size: i32,
+    },
     /// A kind-1 section's identifier ended without a NUL terminator.
     #[error("document sequence identifier missing NUL terminator: {0}")]
     DocumentSequenceIdentifierMissingNul(#[from] FromBytesUntilNulError),
@@ -181,6 +214,7 @@ pub enum OperationMessageParseError {
 
 /// Failure modes for [`OperationMessage::write_bytes`].
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum OperationMessageWriteError {
     /// Serialising a section's BSON document failed.
     #[error("failed to serialize sections: {0}")]
@@ -346,7 +380,16 @@ fn parse_sections(bytes: &[u8]) -> Result<Vec<OpMsgSection>, OperationMessagePar
     let mut sections = Vec::new();
     while (cursor.position() as usize) < bytes.len() {
         let pos = cursor.position() as usize;
-        let kind = bytes[pos];
+        // #46: carry robustness in the type system rather than relying on a
+        // re-derived `pos < bytes.len()` invariant. `pos` came straight from
+        // `cursor.position()` which the loop guard bounds, but bounds-checked
+        // `get` keeps that guarantee local and refactor-proof.
+        let kind = *bytes
+            .get(pos)
+            .ok_or(OperationMessageParseError::NotEnoughBytes {
+                actual: bytes.len(),
+                min: pos + 1,
+            })?;
         cursor.set_position(pos as u64 + 1);
         match kind {
             0 => {
@@ -355,39 +398,56 @@ fn parse_sections(bytes: &[u8]) -> Result<Vec<OpMsgSection>, OperationMessagePar
             }
             1 => {
                 let section_start = cursor.position() as usize;
-                if bytes.len() < section_start + 4 {
-                    return Err(OperationMessageParseError::InvalidDocumentSequenceSize {
-                        size: 0,
-                    });
-                }
+                // The 4-byte size prefix must be fully present.
+                let size_bytes = bytes
+                    .get(section_start..section_start + 4)
+                    .ok_or(OperationMessageParseError::InvalidDocumentSequenceSize { size: 0 })?;
                 let size = i32::from_le_bytes([
-                    bytes[section_start],
-                    bytes[section_start + 1],
-                    bytes[section_start + 2],
-                    bytes[section_start + 3],
+                    size_bytes[0],
+                    size_bytes[1],
+                    size_bytes[2],
+                    size_bytes[3],
                 ]);
-                if size < 5 || (section_start + size as usize) > bytes.len() {
+                // The size field counts itself (>= 4) plus a NUL-terminated
+                // identifier (>= 1), so the smallest valid section is 5 bytes.
+                // It must also fit inside the remaining buffer.
+                if size < 5 {
                     return Err(OperationMessageParseError::InvalidDocumentSequenceSize { size });
                 }
-                // Section payload (identifier + docs) excludes the kind byte
-                // and includes the size field itself.
-                let payload_end = section_start + size as usize;
-                cursor.set_position(section_start as u64 + 4);
+                let payload_end = section_start
+                    .checked_add(size as usize)
+                    .filter(|&end| end <= bytes.len())
+                    .ok_or(OperationMessageParseError::InvalidDocumentSequenceSize { size })?;
 
-                let identifier_bytes = &bytes[cursor.position() as usize..payload_end];
+                // Identifier lives between the size field and the first doc.
+                let ident_start = section_start + 4;
+                let identifier_bytes = bytes
+                    .get(ident_start..payload_end)
+                    .ok_or(OperationMessageParseError::InvalidDocumentSequenceSize { size })?;
                 let identifier_cstr = CStr::from_bytes_until_nul(identifier_bytes)?;
                 let identifier = identifier_cstr.to_str()?.to_owned();
-                cursor.set_position(cursor.position() + identifier_cstr.count_bytes() as u64 + 1);
+                let ident_end = ident_start + identifier_cstr.count_bytes() + 1;
 
+                // #45: parse the document sequence from a sub-slice bounded by
+                // `payload_end`, so a doc whose internal length prefix points
+                // past the section boundary (but still inside the outer buffer)
+                // physically cannot be read across the declared section.
+                let docs_bytes = bytes
+                    .get(ident_end..payload_end)
+                    .ok_or(OperationMessageParseError::InvalidDocumentSequenceSize { size })?;
+                let mut reader = Cursor::new(docs_bytes);
                 let mut documents = Vec::new();
-                while (cursor.position() as usize) < payload_end {
-                    let doc = Document::from_reader(&mut cursor)?;
+                while (reader.position() as usize) < docs_bytes.len() {
+                    let doc = Document::from_reader(&mut reader)?;
                     documents.push(doc);
                 }
                 sections.push(OpMsgSection::DocumentSequence {
                     identifier,
                     documents,
                 });
+
+                // Advance the outer cursor past the whole section.
+                cursor.set_position(payload_end as u64);
             }
             other => return Err(OperationMessageParseError::InvalidKind(other)),
         }
@@ -580,5 +640,109 @@ mod tests {
         body.push(99); // unknown kind
         let err = OperationMessage::from_bytes(&body).unwrap_err();
         assert!(matches!(err, OperationMessageParseError::InvalidKind(99)));
+    }
+
+    /// #45 regression: a kind-1 document-sequence whose inner BSON doc declares
+    /// a length prefix that runs past the section's declared `payload_end` (but
+    /// still inside the outer buffer) must NOT be read across the section
+    /// boundary into whatever follows. Parsing must error rather than consume
+    /// the next section's bytes.
+    #[test]
+    fn parse_kind1_doc_cannot_overrun_section_boundary() {
+        // Build the document-sequence payload by hand so we can lie about the
+        // inner doc length.
+        let identifier = b"documents\0";
+
+        // Inner doc claims to be 12 bytes long but we only place it inside a
+        // section sized to hold an 8-byte doc body, so the doc reader would
+        // have to read past `payload_end` to satisfy the (lying) length.
+        let mut doc_with_overrunning_len = Vec::new();
+        doc_with_overrunning_len.extend_from_slice(&12i32.to_le_bytes()); // length lies (too big)
+        doc_with_overrunning_len.extend_from_slice(&[0u8; 3]); // only 3 of the claimed bytes present in-section
+
+        // Section size counts: size field (4) + identifier + the in-section doc bytes.
+        let section_size = 4 + identifier.len() + doc_with_overrunning_len.len();
+
+        let mut section = Vec::new();
+        section.extend_from_slice(&(section_size as i32).to_le_bytes());
+        section.extend_from_slice(identifier);
+        section.extend_from_slice(&doc_with_overrunning_len);
+
+        // Append a *valid* trailing body section. If the kind-1 parser overran,
+        // it would start consuming these bytes instead of erroring.
+        let trailing = bson::serialize_to_vec(&doc! { "next": "section" }).unwrap();
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u32.to_le_bytes()); // flags
+        body.push(1); // kind-1
+        body.extend_from_slice(&section);
+        body.push(0); // kind-0 trailing body
+        body.extend_from_slice(&trailing);
+
+        // Must error (the in-section doc is malformed/truncated), and crucially
+        // must not have read across into the trailing section.
+        let err = OperationMessage::from_bytes(&body).unwrap_err();
+        assert!(matches!(err, OperationMessageParseError::InvalidBson(_)));
+    }
+
+    /// #45 regression (boundary stop): a well-formed kind-1 section followed by
+    /// another section must parse the document sequence only up to its own
+    /// declared boundary, leaving the following section intact.
+    #[test]
+    fn parse_kind1_stops_at_section_boundary() {
+        let msg = OperationMessage {
+            flags: OperationMessageFlags::empty(),
+            sections: vec![
+                OpMsgSection::DocumentSequence {
+                    identifier: "documents".to_owned(),
+                    documents: vec![doc! { "a": 1 }],
+                },
+                OpMsgSection::Body(doc! { "after": 2 }),
+            ],
+            checksum: None,
+        };
+        let mut buf = BytesMut::new();
+        msg.write_bytes(&mut buf, RequestId::new(1), None).unwrap();
+        let body = &buf[MessageHeader::size()..];
+        let parsed = OperationMessage::from_bytes(body).unwrap();
+        assert_eq!(parsed, msg);
+    }
+
+    /// #40 regression: formatting an `OperationMessage` whose body carries a
+    /// `saslStart` payload must not leak the secret payload into the output.
+    #[test]
+    fn debug_redacts_sasl_payload() {
+        let msg = OperationMessage {
+            flags: OperationMessageFlags::empty(),
+            sections: vec![OpMsgSection::Body(doc! {
+                "saslStart": 1,
+                "payload": "SECRET",
+            })],
+            checksum: None,
+        };
+        let shown = format!("{msg:?}");
+        assert!(
+            !shown.contains("SECRET"),
+            "debug output leaked payload: {shown}"
+        );
+        // Structural metadata is still present.
+        assert!(shown.contains("saslStart"));
+        assert!(shown.contains("OperationMessage"));
+    }
+
+    /// #46 regression: a truncated section header (the leading kind byte is the
+    /// last byte of the buffer, with a kind-1 size prefix that does not fit)
+    /// must surface a structured error rather than panic on direct indexing.
+    #[test]
+    fn parse_errors_on_truncated_section_header() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u32.to_le_bytes()); // flags
+        body.push(1); // kind-1, but no 4-byte size prefix follows
+        body.extend_from_slice(&[0u8, 0u8]); // only 2 of the 4 size bytes
+        let err = OperationMessage::from_bytes(&body).unwrap_err();
+        assert!(matches!(
+            err,
+            OperationMessageParseError::InvalidDocumentSequenceSize { .. }
+        ));
     }
 }

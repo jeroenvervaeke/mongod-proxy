@@ -43,6 +43,18 @@ pub struct ResponseTo(std::num::NonZeroI32);
 )]
 pub struct MessageLength(i32);
 
+impl MessageLength {
+    /// Returns the validated length as a `usize`.
+    ///
+    /// The inner value is validated to lie in `16..=48 MiB`, so it is always
+    /// non-negative and the `usize::try_from` conversion can never fail; the
+    /// `unwrap_or(0)` is therefore unreachable and exists only to keep this
+    /// method panic-free (no `unwrap`/`expect`) under all targets.
+    pub fn as_usize(&self) -> usize {
+        usize::try_from(self.into_inner()).unwrap_or(0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,5 +137,17 @@ mod tests {
     fn message_length_rejects_above_48mib() {
         let over = 48 * 1024 * 1024 + 1;
         assert!(MessageLength::try_new(over).is_err());
+    }
+
+    #[test]
+    fn message_length_as_usize_matches_inner() {
+        let m = MessageLength::try_new(1234).unwrap();
+        assert_eq!(m.as_usize(), 1234usize);
+
+        let min = MessageLength::try_new(16).unwrap();
+        assert_eq!(min.as_usize(), 16usize);
+
+        let max = MessageLength::try_new(48 * 1024 * 1024).unwrap();
+        assert_eq!(max.as_usize(), (48 * 1024 * 1024) as usize);
     }
 }

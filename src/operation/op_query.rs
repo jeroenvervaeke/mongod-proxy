@@ -19,6 +19,7 @@ use crate::{
     header::MessageHeader,
     ids::{MessageLength, RequestId, ResponseTo},
     op_code::OPCode,
+    redact::RedactedDoc,
 };
 
 /// Legacy OP_QUERY message body.
@@ -27,7 +28,7 @@ use crate::{
 /// query / projection BSON documents. Even though modern drivers only use
 /// it for the handshake, this struct models the full layout so the proxy
 /// is forward-compatible with traffic from older drivers.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct OperationQuery {
     /// Bit flags controlling cursor behaviour.
     pub flags: OperationQueryFlags,
@@ -43,6 +44,26 @@ pub struct OperationQuery {
     pub query: Document,
     /// Optional projection / field selector document.
     pub return_fields_selector: Option<Document>,
+}
+
+impl std::fmt::Debug for OperationQuery {
+    /// Renders the namespace, pagination hints, and flags, routing the query
+    /// and projection documents through
+    /// [`RedactedDoc`] so credential-bearing
+    /// handshake documents never reach logs verbatim.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OperationQuery")
+            .field("flags", &self.flags)
+            .field("full_collection_name", &self.full_collection_name)
+            .field("number_to_skip", &self.number_to_skip)
+            .field("number_to_return", &self.number_to_return)
+            .field("query", &RedactedDoc(&self.query))
+            .field(
+                "return_fields_selector",
+                &self.return_fields_selector.as_ref().map(RedactedDoc),
+            )
+            .finish()
+    }
 }
 
 bitflags! {
@@ -73,10 +94,16 @@ bitflags! {
 
 /// Failure modes for [`OperationQuery::from_bytes`].
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum OperationQueryParseError {
     /// Body shorter than the unconditional minimum.
     #[error("not enough bytes, expected at least {min} bytes, got {actual}")]
-    NotEnoughBytes { actual: usize, min: usize },
+    NotEnoughBytes {
+        /// Number of body bytes actually available.
+        actual: usize,
+        /// Minimum number of bytes required to begin parsing.
+        min: usize,
+    },
     /// One or more unknown flag bits were set on the wire. The `u32` carries
     /// the unknown bits only.
     #[error("unknown query flag bits set: {0:#010x}")]
@@ -97,6 +124,7 @@ pub enum OperationQueryParseError {
 
 /// Failure modes for [`OperationQuery::write_bytes`].
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum OperationQueryWriteError {
     /// BSON serialisation of `query` failed.
     #[error("failed to serialize query: {0}")]
@@ -155,7 +183,9 @@ impl OperationQuery {
         if bytes.len() < TAIL_MIN {
             return Err(OperationQueryParseError::NotEnoughBytes {
                 actual: actual_len,
-                min: actual_len - bytes.len() + TAIL_MIN,
+                min: actual_len
+                    .saturating_sub(bytes.len())
+                    .saturating_add(TAIL_MIN),
             });
         }
 

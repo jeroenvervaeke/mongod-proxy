@@ -10,7 +10,7 @@
 use std::{
     net::SocketAddr,
     pin::Pin,
-    sync::{Arc, Once, PoisonError, RwLock, Weak},
+    sync::{Arc, Once},
     task::{Context, Poll},
     time::Duration,
 };
@@ -20,7 +20,7 @@ use rustls_pki_types::{InvalidDnsNameError, ServerName};
 use tokio::{
     io::{self, AsyncRead, AsyncWrite, split},
     net::TcpStream,
-    sync::{Mutex, OwnedMutexGuard},
+    sync::{Mutex, OwnedMutexGuard, watch},
 };
 #[cfg(feature = "dangerous-insecure-tls")]
 use tokio_rustls::rustls::{
@@ -44,7 +44,19 @@ use crate::{
     encoder::{WireEncoder, WireEncoderError},
     message::Message,
     operation::{Operation, op_msg::OperationMessageFlags},
-    serve::rewrite_hello::{RewriteHelloLayer, RewriteHelloService},
+    serve::{
+        explain::{ExplainLayer, TracingOnly},
+        probe::{
+            DEFAULT_PROBE_TIMEOUT, HelloProbe, PrimaryProbe, ProbeOutcome, Selection,
+            select_primary,
+        },
+        rewrite_hello::{RewriteHelloLayer, RewriteHelloService},
+    },
+    srv::{
+        DEFAULT_SRV_SERVICE_NAME, SrvHost, SrvResolveError, resolve_with_service_name,
+        summarise_attempts,
+    },
+    uri,
 };
 
 /// Ensures rustls has a usable [`CryptoProvider`](tokio_rustls::rustls::crypto::CryptoProvider).
@@ -74,17 +86,16 @@ fn install_default_crypto_provider() {
 /// use mongod_proxy::{Proxy, TlsConfig};
 ///
 /// // Forward to a TLS-terminating upstream using the OS-bundled
-/// // `webpki-roots` trust anchors (the same config `Proxy::new(.., true)`
-/// // builds).
+/// // `webpki-roots` trust anchors.
 /// let proxy = Proxy::with_tls("mongo.example.com", 27017, TlsConfig::System);
 /// # let _ = proxy;
 /// ```
 #[non_exhaustive]
 pub enum TlsConfig {
-    /// Plain TCP — no TLS. Equivalent to `Proxy::new(.., false)`.
+    /// Plain TCP — no TLS. What [`Proxy::new`] selects.
     Disabled,
     /// Standard `webpki-roots` trust anchors, no client cert, SNI on.
-    /// The default TLS behaviour and what `Proxy::new(.., true)` selects.
+    /// The conventional TLS choice for a public/Atlas upstream.
     System,
     /// Validate the upstream certificate against a caller-supplied
     /// [`RootCertStore`] instead of the bundled `webpki-roots` anchors.
@@ -241,25 +252,27 @@ impl ServerCertVerifier for InsecureServerVerifier {
 
 /// The upstream `host:port` the proxy currently forwards to.
 ///
-/// Held behind an [`Arc<RwLock<Target>>`] inside [`Proxy`] so the
+/// Held behind a [`tokio::sync::watch`] channel inside [`Proxy`] so the
 /// background failover loop spawned by [`Proxy::from_srv`] can swap it
 /// out atomically when the replica-set primary changes, without
 /// disturbing connections already in flight (each [`ProxyClient`] keeps
 /// the socket it dialled; only *new* connections read the swapped value).
+/// A watch channel gives lock-free reads (`tx.borrow().clone()`) with no
+/// poison handling, and lets the re-probe loop observe the channel
+/// closing when the [`Proxy`] (and thus the [`watch::Sender`]) drops.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Target {
     host: String,
     port: u16,
 }
 
-/// Reads the current upstream target, tolerating a poisoned lock.
+/// Reads the current upstream target from the watch channel.
 ///
-/// The only writer is the single-threaded failover loop and its critical
-/// section can't panic, so poisoning is effectively impossible — but the
-/// no-panic policy still forbids `unwrap()`, so we recover the guard via
-/// [`PoisonError::into_inner`] rather than risk a panic.
-fn read_target(target: &RwLock<Target>) -> (String, u16) {
-    let guard = target.read().unwrap_or_else(PoisonError::into_inner);
+/// The borrow is synchronous and short-lived — cloned out immediately and
+/// never held across an `.await` — so there is no lock to poison and no
+/// guard to leak. Returns an owned `(host, port)` pair for the caller.
+fn read_target(target: &watch::Sender<Target>) -> (String, u16) {
+    let guard = target.borrow();
     (guard.host.clone(), guard.port)
 }
 
@@ -289,20 +302,33 @@ type ServerWriter = FramedWrite<BoxedAsyncWrite, WireEncoder>;
 /// ```
 /// use mongod_proxy::{LogLayer, Proxy};
 ///
-/// // For the doctest we pass `use_tls = false` to avoid a network-dependent
-/// // rustls config; switch to `true` to forward over TLS in real use.
-/// let proxy = Proxy::new("mongo.example.com", 27017, /* use_tls = */ false)
+/// // Plain TCP upstream; use `Proxy::with_tls(.., TlsConfig::System)` to
+/// // forward over TLS instead.
+/// let proxy = Proxy::new("mongo.example.com", 27017)
 ///     .layer(LogLayer);
 /// // `proxy` is now a `Service<SocketAddr>` ready to hand to `serve(...)`.
 /// # let _ = proxy;
 /// ```
+#[must_use = "a Proxy does nothing until passed to serve()"]
 pub struct Proxy<L> {
     /// Current upstream target, read fresh for every accepted connection.
     ///
     /// For [`Proxy::new`] this never changes. For [`Proxy::from_srv`] a
     /// background task swaps it on replica-set failover (see
     /// [`Proxy::from_srv_with`] and [`FailoverConfig`]).
-    target: Arc<RwLock<Target>>,
+    ///
+    /// Stored as the [`watch::Sender`] half: it both holds the latest
+    /// [`Target`] (read via `borrow()`) and keeps the channel open. Reads
+    /// are lock-free `borrow().clone()`s; failover swaps go through
+    /// [`watch::Sender::send_replace`].
+    target: watch::Sender<Target>,
+    /// Keepalive [`watch::Receiver`] held purely so the background re-probe
+    /// loop can detect this [`Proxy`] being dropped: the loop owns a cloned
+    /// [`watch::Sender`] (so it can swap the target) and waits on
+    /// [`watch::Sender::closed`], which resolves only once every receiver is
+    /// gone. Dropping the [`Proxy`] drops this receiver, closing the
+    /// channel and signalling the loop to stop near-immediately.
+    _target_keepalive: watch::Receiver<Target>,
     tls_connector: Option<Arc<TlsConnector>>,
     /// When true, every per-connection service has a [`RewriteHelloLayer`]
     /// inserted *between* the user-supplied layer stack and the inner
@@ -316,12 +342,15 @@ pub struct Proxy<L> {
 
 impl Proxy<Identity> {
     /// Creates a new proxy that forwards every incoming client connection
-    /// to `destination_name:destination_port`.
+    /// to `destination_name:destination_port` over **plain TCP**.
     ///
-    /// When `use_tls` is true the upstream socket is wrapped in a `rustls`
-    /// TLS client using the standard `webpki-roots` trust anchors and SNI
-    /// derived from `destination_name`. When false the upstream socket is
-    /// plain TCP.
+    /// This is the zero-configuration constructor for the common
+    /// local/`directConnection` case. For a TLS upstream, reach for
+    /// [`with_tls`](Proxy::with_tls) and pass the [`TlsConfig`] you want
+    /// ([`TlsConfig::System`] for the standard `webpki-roots` anchors,
+    /// [`TlsConfig::WithRoots`] for an internal CA): the explicit enum keeps
+    /// the trust policy visible at the call site rather than hiding it behind
+    /// a bare `bool`.
     ///
     /// The resulting proxy has the `hello` / `isMaster` rewrite **on by
     /// default** so SDAM-enabled drivers (`mongodb://host:port/` with no
@@ -333,22 +362,21 @@ impl Proxy<Identity> {
     /// Opt out with [`disable_rewrite_hello`](Proxy::disable_rewrite_hello)
     /// only when you specifically need the upstream's topology visible to
     /// drivers.
-    pub fn new(destination_name: impl Into<String>, destination_port: u16, use_tls: bool) -> Self {
-        let tls = if use_tls {
-            TlsConfig::System
-        } else {
-            TlsConfig::Disabled
-        };
-        Self::with_tls(destination_name, destination_port, tls)
+    // The `Proxy` struct is already `#[must_use]`, which covers this
+    // `-> Self` constructor; a second bare attribute would be redundant
+    // (`clippy::double_must_use`).
+    pub fn new(destination_name: impl Into<String>, destination_port: u16) -> Self {
+        Self::with_tls(destination_name, destination_port, TlsConfig::Disabled)
     }
 
     /// Creates a new proxy forwarding to `destination_name:destination_port`
     /// with explicit control over the upstream TLS trust policy via
     /// [`TlsConfig`].
     ///
-    /// This is the general form of [`Proxy::new`]: `new(.., false)` is
-    /// [`TlsConfig::Disabled`] and `new(.., true)` is [`TlsConfig::System`].
-    /// Reach for `with_tls` to forward to an internal-CA deployment
+    /// This is the general form of [`Proxy::new`]: `new(host, port)` is
+    /// exactly `with_tls(host, port, TlsConfig::Disabled)`. Pass
+    /// [`TlsConfig::System`] for the standard `webpki-roots` anchors, or
+    /// reach further for an internal-CA deployment
     /// ([`TlsConfig::WithRoots`]) or — when the `dangerous-insecure-tls`
     /// feature is enabled — a throwaway self-signed test deployment
     /// ([`TlsConfig::Insecure`]).
@@ -362,30 +390,36 @@ impl Proxy<Identity> {
     /// ```
     /// use mongod_proxy::{Proxy, TlsConfig};
     ///
-    /// // Plain TCP, equivalent to `Proxy::new(.., false)`.
+    /// // Plain TCP, equivalent to `Proxy::new("127.0.0.1", 27017)`.
     /// let proxy = Proxy::with_tls("127.0.0.1", 27017, TlsConfig::Disabled);
     /// # let _ = proxy;
     /// ```
+    // The `Proxy` struct is already `#[must_use]` (see `Proxy::new`).
     pub fn with_tls(
         destination_name: impl Into<String>,
         destination_port: u16,
         tls: TlsConfig,
     ) -> Self {
         let tls_connector = build_tls_connector(tls);
-        let target = Arc::new(RwLock::new(Target {
+        let target = watch::Sender::new(Target {
             host: destination_name.into(),
             port: destination_port,
-        }));
+        });
         Self::with_target(target, tls_connector)
     }
 
-    /// Inner constructor over a pre-built, swappable [`Target`] cell and a
-    /// shared `Arc<TlsConnector>`. [`Proxy::from_srv`] hands in a cell it
-    /// also wired a background failover loop to; [`Proxy::new`] hands in a
-    /// cell that never changes.
-    fn with_target(target: Arc<RwLock<Target>>, tls_connector: Option<Arc<TlsConnector>>) -> Self {
+    /// Inner constructor over a pre-built, swappable [`Target`] channel and
+    /// a shared `Arc<TlsConnector>`. [`Proxy::from_srv`] hands in a sender
+    /// it also wired a background failover loop to; [`Proxy::new`] hands in
+    /// a sender whose value never changes.
+    fn with_target(
+        target: watch::Sender<Target>,
+        tls_connector: Option<Arc<TlsConnector>>,
+    ) -> Self {
+        let _target_keepalive = target.subscribe();
         Self {
             target,
+            _target_keepalive,
             tls_connector,
             rewrite_hello: true,
 
@@ -426,8 +460,8 @@ impl Proxy<Identity> {
     ///
     /// # Errors
     ///
-    /// See [`crate::srv::SrvResolveError`]. New here:
-    /// [`SrvResolveError::NoPrimary`](crate::srv::SrvResolveError::NoPrimary)
+    /// See [`SrvResolveError`]. New here:
+    /// [`SrvResolveError::NoPrimary`]
     /// fires when every SRV-resolved host responds (or fails to
     /// respond) without identifying itself as the primary.
     ///
@@ -441,10 +475,11 @@ impl Proxy<Identity> {
     /// # let _ = proxy;
     /// # Ok(()) }
     /// ```
+    #[must_use = "a Proxy does nothing until passed to serve()"]
     pub async fn from_srv(
-        srv_hostname: &str,
+        srv_hostname: impl Into<String>,
         use_tls: bool,
-    ) -> Result<Self, crate::srv::SrvResolveError> {
+    ) -> Result<Self, SrvResolveError> {
         Self::from_srv_with(srv_hostname, use_tls, FailoverConfig::default()).await
     }
 
@@ -460,19 +495,60 @@ impl Proxy<Identity> {
     /// # Errors
     ///
     /// Same as [`from_srv`](Self::from_srv): see
-    /// [`crate::srv::SrvResolveError`]. Only the *initial* selection can
+    /// [`SrvResolveError`]. Only the *initial* selection can
     /// fail here — once the proxy is built, later re-probe failures are
     /// logged via `tracing` and leave the current target in place rather
     /// than tearing the proxy down.
+    #[must_use = "a Proxy does nothing until passed to serve()"]
     pub async fn from_srv_with(
-        srv_hostname: &str,
+        srv_hostname: impl Into<String>,
         use_tls: bool,
         failover: FailoverConfig,
-    ) -> Result<Self, crate::srv::SrvResolveError> {
+    ) -> Result<Self, SrvResolveError> {
+        let tls = if use_tls {
+            TlsConfig::System
+        } else {
+            TlsConfig::Disabled
+        };
+        Self::from_srv_with_tls(srv_hostname, tls, failover).await
+    }
+
+    /// Like [`from_srv_with`](Self::from_srv_with) but with full control
+    /// over the upstream TLS trust policy via [`TlsConfig`], closing the
+    /// gap where SRV-resolved upstreams could only ever use the default
+    /// `webpki-roots` connector.
+    ///
+    /// [`from_srv`](Self::from_srv) / [`from_srv_with`](Self::from_srv_with)
+    /// take only `use_tls: bool`, which hard-codes
+    /// [`TlsConfig::System`] (or [`TlsConfig::Disabled`]). That left
+    /// [`TlsConfig::WithRoots`] (forward to an internal-CA Atlas-like
+    /// cluster) and — under the `dangerous-insecure-tls` feature —
+    /// [`TlsConfig::Insecure`] unreachable for SRV deployments. This
+    /// constructor builds the upstream connector from the supplied
+    /// [`TlsConfig`] through the same internal `build_tls_connector` helper
+    /// [`Proxy::with_tls`] and [`Proxy::from_uri`] use, instead of the
+    /// default connector.
+    ///
+    /// Note: the same [`TlsConfig`] is also used for the `hello` probes
+    /// that select (and re-select) the primary, so a private-CA cluster is
+    /// probed under the policy it is forwarded under.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`from_srv_with`](Self::from_srv_with): see
+    /// [`SrvResolveError`]. Only the initial selection can
+    /// fail; later re-probe failures are logged and leave the current
+    /// target in place.
+    #[must_use = "a Proxy does nothing until passed to serve()"]
+    pub async fn from_srv_with_tls(
+        srv_hostname: impl Into<String>,
+        tls: TlsConfig,
+        failover: FailoverConfig,
+    ) -> Result<Self, SrvResolveError> {
         Self::from_srv_inner(
-            srv_hostname,
-            crate::srv::DEFAULT_SRV_SERVICE_NAME,
-            use_tls,
+            &srv_hostname.into(),
+            DEFAULT_SRV_SERVICE_NAME,
+            tls,
             failover,
         )
         .await
@@ -489,37 +565,43 @@ impl Proxy<Identity> {
     async fn from_srv_inner(
         srv_hostname: &str,
         service_name: &str,
-        use_tls: bool,
+        tls: TlsConfig,
         failover: FailoverConfig,
-    ) -> Result<Self, crate::srv::SrvResolveError> {
-        let hosts = crate::srv::resolve_with_service_name(srv_hostname, service_name).await?;
-        let tls_connector = use_tls.then(default_tls_connector);
-        let probe = crate::serve::probe::HelloProbe::new(tls_connector.clone());
+    ) -> Result<Self, SrvResolveError> {
+        let hosts = resolve_with_service_name(srv_hostname, service_name).await?;
+        let tls_connector = build_tls_connector(tls);
+        let probe = HelloProbe::new(tls_connector.clone());
         let probe_timeout = failover.probe_timeout;
         let target = select_target(&hosts, &probe, probe_timeout)
             .await
-            .map_err(|attempts| crate::srv::SrvResolveError::NoPrimary {
+            .map_err(|attempts| SrvResolveError::NoPrimary {
                 hostname: srv_hostname.to_owned(),
                 attempts,
             })?;
+
+        // Build the proxy first so its keepalive `watch::Receiver` exists
+        // before the loop is spawned: the loop's `closed()` shutdown signal
+        // keys off that receiver, so spawning after construction is
+        // race-free.
+        let proxy = Self::with_target(target, tls_connector.clone());
 
         if let Some(interval) = failover.reprobe_interval {
             let hostname = srv_hostname.to_owned();
             let service_name = service_name.to_owned();
             let tls = tls_connector.clone();
-            // The loop owns only a `Weak` handle to the target, so it
-            // self-terminates once the `Proxy` (and its serve loop) is
-            // dropped. Each tick builds a self-contained future that
+            // The loop owns only a cloned `watch::Sender`, so it
+            // self-terminates once the `Proxy` (and its keepalive receiver)
+            // is dropped. Each tick builds a self-contained future that
             // re-resolves SRV and re-selects the primary.
-            spawn_reprobe_loop(interval, &target, move || {
+            spawn_reprobe_loop(interval, &proxy.target, move || {
                 let hostname = hostname.clone();
                 let service_name = service_name.clone();
-                let probe = crate::serve::probe::HelloProbe::new(tls.clone());
+                let probe = HelloProbe::new(tls.clone());
                 async move { resolve_and_select(&hostname, &service_name, &probe, probe_timeout).await }
             });
         }
 
-        Ok(Self::with_target(target, tls_connector))
+        Ok(proxy)
     }
 
     /// Constructs a proxy from any MongoDB connection string — both
@@ -562,7 +644,7 @@ impl Proxy<Identity> {
     /// # Errors
     ///
     /// Returns [`FromUriError::Parse`] for any URI shape rejected by
-    /// [`crate::uri::ConnectionUriError`], [`FromUriError::Srv`] if the
+    /// [`uri::ConnectionUriError`], [`FromUriError::Srv`] if the
     /// SRV lookup fails on a `mongodb+srv://` URI, or
     /// [`FromUriError::NoPrimary`] if a multi-host seed list resolves but
     /// none of its hosts responds as the primary.
@@ -580,14 +662,22 @@ impl Proxy<Identity> {
     /// # let _ = proxy;
     /// # Ok(()) }
     /// ```
+    #[must_use = "a Proxy does nothing until passed to serve()"]
     pub async fn from_uri(uri: &str) -> Result<Self, FromUriError> {
-        let parsed = crate::uri::parse(uri).map_err(FromUriError::Parse)?;
+        let parsed = uri::parse(uri).map_err(FromUriError::Parse)?;
         match route(parsed)? {
             UriRoute::Single {
                 host,
                 port,
                 use_tls,
-            } => Ok(Self::new(host, port, use_tls)),
+            } => {
+                let tls = if use_tls {
+                    TlsConfig::System
+                } else {
+                    TlsConfig::Disabled
+                };
+                Ok(Self::with_tls(host, port, tls))
+            }
             UriRoute::SeedList { hosts, use_tls } => {
                 Self::from_seed_list(hosts, use_tls, FailoverConfig::default()).await
             }
@@ -596,10 +686,13 @@ impl Proxy<Identity> {
                 use_tls,
                 service_name,
             } => {
-                let service_name = service_name
-                    .as_deref()
-                    .unwrap_or(crate::srv::DEFAULT_SRV_SERVICE_NAME);
-                Self::from_srv_inner(&hostname, service_name, use_tls, FailoverConfig::default())
+                let service_name = service_name.as_deref().unwrap_or(DEFAULT_SRV_SERVICE_NAME);
+                let tls = if use_tls {
+                    TlsConfig::System
+                } else {
+                    TlsConfig::Disabled
+                };
+                Self::from_srv_inner(&hostname, service_name, tls, FailoverConfig::default())
                     .await
                     .map_err(FromUriError::Srv)
             }
@@ -616,29 +709,33 @@ impl Proxy<Identity> {
     /// [`from_uri`](Self::from_uri). Single-host URIs don't come through
     /// here: with one named host there's nothing to select.
     async fn from_seed_list(
-        hosts: Vec<crate::srv::SrvHost>,
+        hosts: Vec<SrvHost>,
         use_tls: bool,
         failover: FailoverConfig,
     ) -> Result<Self, FromUriError> {
         let tls_connector = use_tls.then(default_tls_connector);
-        let probe = crate::serve::probe::HelloProbe::new(tls_connector.clone());
+        let probe = HelloProbe::new(tls_connector.clone());
         let probe_timeout = failover.probe_timeout;
         let target = select_target(&hosts, &probe, probe_timeout)
             .await
             .map_err(|attempts| FromUriError::NoPrimary { attempts })?;
 
+        // Build the proxy first so its keepalive `watch::Receiver` exists
+        // before the loop is spawned (see `from_srv_inner`).
+        let proxy = Self::with_target(target, tls_connector.clone());
+
         if let Some(interval) = failover.reprobe_interval {
-            let tls = tls_connector.clone();
+            let tls = tls_connector;
             // The seed list is static — no DNS to re-resolve — so each
             // tick simply re-probes the same hosts for the current primary.
-            spawn_reprobe_loop(interval, &target, move || {
-                let probe = crate::serve::probe::HelloProbe::new(tls.clone());
+            spawn_reprobe_loop(interval, &proxy.target, move || {
+                let probe = HelloProbe::new(tls.clone());
                 let hosts = hosts.clone();
                 async move { reselect_seed_list(&hosts, &probe, probe_timeout).await }
             });
         }
 
-        Ok(Self::with_target(target, tls_connector))
+        Ok(proxy)
     }
 }
 
@@ -658,13 +755,14 @@ impl Proxy<Identity> {
 /// startup selection and every background re-probe, so a deployment that
 /// cold-starts slowly (Atlas free-tier) or sits behind a high-latency
 /// link can widen the budget instead of failing startup with a spurious
-/// [`SrvResolveError::NoPrimary`](crate::srv::SrvResolveError::NoPrimary).
+/// [`SrvResolveError::NoPrimary`].
 ///
 /// Construct it via [`default`](Self::default), [`every`](Self::every), or
 /// [`disabled`](Self::disabled) and tune with the builder methods
 /// (e.g. [`with_probe_timeout`](Self::with_probe_timeout)); the struct is
 /// `#[non_exhaustive]` so new knobs can be added without breaking callers.
 #[derive(Debug, Clone)]
+#[must_use = "a FailoverConfig does nothing until passed to a from_srv* constructor"]
 #[non_exhaustive]
 pub struct FailoverConfig {
     /// How often to re-resolve SRV and re-select the primary. `None`
@@ -685,7 +783,7 @@ impl Default for FailoverConfig {
     fn default() -> Self {
         Self {
             reprobe_interval: Some(DEFAULT_REPROBE_INTERVAL),
-            probe_timeout: crate::serve::probe::DEFAULT_PROBE_TIMEOUT,
+            probe_timeout: DEFAULT_PROBE_TIMEOUT,
         }
     }
 }
@@ -732,28 +830,29 @@ impl FailoverConfig {
 }
 
 /// Probe `hosts` for the replica-set primary and, when one is found,
-/// wrap it in the swappable [`Target`] cell every constructor shares.
+/// wrap it in the swappable [`Target`] watch channel every constructor
+/// shares.
 ///
-/// Returns `None` when no host responds as the primary. Generic over the
-/// probe so the multi-host selection wiring can be unit-tested with a
-/// mock instead of real sockets.
+/// Returns `Err` carrying the per-host outcomes when no host responds as
+/// the primary. Generic over the probe so the multi-host selection wiring
+/// can be unit-tested with a mock instead of real sockets.
 async fn select_target<P>(
-    hosts: &[crate::srv::SrvHost],
+    hosts: &[SrvHost],
     probe: &P,
     probe_timeout: Duration,
-) -> Result<Arc<RwLock<Target>>, Vec<(crate::srv::SrvHost, crate::serve::probe::ProbeOutcome)>>
+) -> Result<watch::Sender<Target>, Vec<(SrvHost, ProbeOutcome)>>
 where
-    P: crate::serve::probe::PrimaryProbe + ?Sized,
+    P: PrimaryProbe + ?Sized,
 {
-    match crate::serve::probe::select_primary(hosts, probe, probe_timeout).await {
-        crate::serve::probe::Selection::Primary(primary) => Ok(Arc::new(RwLock::new(Target {
+    match select_primary(hosts, probe, probe_timeout).await {
+        Selection::Primary(primary) => Ok(watch::Sender::new(Target {
             host: primary.host,
             port: primary.port,
-        }))),
+        })),
         // No host is currently the primary: hand the per-host rejection
         // reasons back so the constructor can build a diagnostic
         // `NoPrimary` rather than collapsing them into a bare count.
-        crate::serve::probe::Selection::NoPrimary(attempts) => Err(attempts),
+        Selection::NoPrimary(attempts) => Err(attempts),
     }
 }
 
@@ -763,14 +862,14 @@ where
 /// the per-tick body of the background failover loop for multi-host
 /// `mongodb://` URIs, which have no DNS to re-resolve.
 async fn reselect_seed_list<P>(
-    hosts: &[crate::srv::SrvHost],
+    hosts: &[SrvHost],
     probe: &P,
     probe_timeout: Duration,
-) -> Option<crate::srv::SrvHost>
+) -> Option<SrvHost>
 where
-    P: crate::serve::probe::PrimaryProbe + ?Sized,
+    P: PrimaryProbe + ?Sized,
 {
-    let picked = crate::serve::probe::select_primary(hosts, probe, probe_timeout)
+    let picked = select_primary(hosts, probe, probe_timeout)
         .await
         .into_primary();
     if picked.is_none() {
@@ -793,13 +892,13 @@ async fn resolve_and_select<P>(
     service_name: &str,
     probe: &P,
     probe_timeout: Duration,
-) -> Option<crate::srv::SrvHost>
+) -> Option<SrvHost>
 where
-    P: crate::serve::probe::PrimaryProbe + ?Sized,
+    P: PrimaryProbe + ?Sized,
 {
-    match crate::srv::resolve_with_service_name(hostname, service_name).await {
+    match resolve_with_service_name(hostname, service_name).await {
         Ok(hosts) => {
-            let picked = crate::serve::probe::select_primary(&hosts, probe, probe_timeout)
+            let picked = select_primary(&hosts, probe, probe_timeout)
                 .await
                 .into_primary();
             if picked.is_none() {
@@ -825,55 +924,71 @@ where
 /// Overwrites `target` with `primary` when it differs from the current
 /// value, returning whether a swap happened. The swap is logged at
 /// `info` so operators can see failovers in the proxy's own logs.
-fn apply_primary(target: &RwLock<Target>, primary: crate::srv::SrvHost) -> bool {
-    let mut guard = target.write().unwrap_or_else(PoisonError::into_inner);
-    if guard.host == primary.host && guard.port == primary.port {
-        return false;
-    }
-    info!(
-        old_host = %guard.host,
-        old_port = guard.port,
-        new_host = %primary.host,
-        new_port = primary.port,
-        "replica-set primary changed; swapping upstream target",
-    );
-    *guard = Target {
+///
+/// Reads the current value via a short synchronous `borrow()` (never held
+/// across an `.await`) and, when it differs, swaps it in with
+/// [`watch::Sender::send_replace`], which notifies any receivers.
+fn apply_primary(target: &watch::Sender<Target>, primary: SrvHost) -> bool {
+    let next = Target {
         host: primary.host,
         port: primary.port,
     };
+    {
+        let current = target.borrow();
+        if *current == next {
+            return false;
+        }
+        info!(
+            old_host = %current.host,
+            old_port = current.port,
+            new_host = %next.host,
+            new_port = next.port,
+            "replica-set primary changed; swapping upstream target",
+        );
+    }
+    target.send_replace(next);
     true
 }
 
-/// Spawns the background failover loop. It sleeps `interval`, then —
-/// while the `Proxy` is still alive (checked via a `Weak` upgrade) —
-/// runs `select` and applies any new primary, until the proxy is dropped.
+/// Spawns the background failover loop. Each iteration `tokio::select!`s
+/// between the interval sleep and the watch channel closing: it sleeps
+/// `interval`, runs `select`, and applies any new primary; but as soon as
+/// the [`Proxy`] is dropped (and with it the keepalive
+/// [`watch::Receiver`]), [`watch::Sender::closed`] resolves and the loop
+/// breaks near-immediately — without waiting out the rest of the interval.
+///
+/// The loop owns only a *cloned* [`watch::Sender`]. A clone keeps the
+/// channel writable for swaps but does **not** keep the [`Proxy`] alive,
+/// so `closed()` still fires the moment the proxy's receiver half drops.
 ///
 /// Generic over `select` so the loop's timing / lifecycle can be unit
 /// tested without real DNS or sockets; production passes a closure that
 /// calls [`resolve_and_select`].
 fn spawn_reprobe_loop<S, Fut>(
     interval: Duration,
-    target: &Arc<RwLock<Target>>,
+    target: &watch::Sender<Target>,
     mut select: S,
 ) -> tokio::task::JoinHandle<()>
 where
     S: FnMut() -> Fut + Send + 'static,
-    Fut: Future<Output = Option<crate::srv::SrvHost>> + Send,
+    Fut: Future<Output = Option<SrvHost>> + Send,
 {
-    let weak: Weak<RwLock<Target>> = Arc::downgrade(target);
+    let target = target.clone();
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(interval).await;
-            // Upgrade only momentarily: the loop must not itself keep the
-            // target (and thus the proxy) alive across the sleep above.
-            let Some(target) = weak.upgrade() else {
-                debug!("proxy dropped; stopping failover re-probe loop");
-                break;
-            };
+            tokio::select! {
+                // The proxy was dropped: its receiver half is gone, so
+                // `closed()` resolves. Stop promptly rather than waiting
+                // out the rest of the interval.
+                () = target.closed() => {
+                    debug!("proxy dropped; stopping failover re-probe loop");
+                    break;
+                }
+                () = tokio::time::sleep(interval) => {}
+            }
             if let Some(primary) = select().await {
                 apply_primary(&target, primary);
             }
-            drop(target);
         }
     })
 }
@@ -895,10 +1010,7 @@ enum UriRoute {
     },
     /// A `mongodb://h1,h2,h3/` seed list: probe every host and forward to
     /// the replica-set primary.
-    SeedList {
-        hosts: Vec<crate::srv::SrvHost>,
-        use_tls: bool,
-    },
+    SeedList { hosts: Vec<SrvHost>, use_tls: bool },
     /// A `mongodb+srv://hostname/` URI: resolve SRV, then probe.
     Srv {
         hostname: String,
@@ -913,18 +1025,18 @@ enum UriRoute {
 /// applying the per-scheme TLS default and the per-host default port.
 ///
 /// The only error is a defensive [`FromUriError::Parse`] for an empty
-/// host list — [`crate::uri::parse`] already rejects that, so it's
+/// host list — [`uri::parse`] already rejects that, so it's
 /// unreachable in practice, but routing without an `unwrap`/`expect`
 /// keeps the no-panic policy intact.
-fn route(parsed: crate::uri::ParsedConnectionUri) -> Result<UriRoute, FromUriError> {
-    let crate::uri::ParsedConnectionUri {
+fn route(parsed: uri::ParsedConnectionUri) -> Result<UriRoute, FromUriError> {
+    let uri::ParsedConnectionUri {
         scheme,
         hosts,
         tls,
         srv_service_name,
     } = parsed;
     match scheme {
-        crate::uri::Scheme::Mongodb => {
+        uri::Scheme::Mongodb => {
             // Spec default for non-SRV URIs: TLS off.
             let use_tls = tls.unwrap_or(false);
             if hosts.len() > 1 {
@@ -932,7 +1044,7 @@ fn route(parsed: crate::uri::ParsedConnectionUri) -> Result<UriRoute, FromUriErr
                 // the primary (default port 27017 per host).
                 let hosts = hosts
                     .into_iter()
-                    .map(|h| crate::srv::SrvHost {
+                    .map(|h| SrvHost {
                         host: h.host,
                         port: h.port.unwrap_or(27017),
                     })
@@ -946,13 +1058,11 @@ fn route(parsed: crate::uri::ParsedConnectionUri) -> Result<UriRoute, FromUriErr
                         port: h.port.unwrap_or(27017),
                         use_tls,
                     }),
-                    None => Err(FromUriError::Parse(
-                        crate::uri::ConnectionUriError::MissingHost,
-                    )),
+                    None => Err(FromUriError::Parse(uri::ConnectionUriError::MissingHost)),
                 }
             }
         }
-        crate::uri::Scheme::MongodbSrv => {
+        uri::Scheme::MongodbSrv => {
             // Spec default for SRV URIs: TLS on. The parser guarantees
             // exactly one host for the SRV scheme.
             let use_tls = tls.unwrap_or(true);
@@ -962,9 +1072,7 @@ fn route(parsed: crate::uri::ParsedConnectionUri) -> Result<UriRoute, FromUriErr
                     use_tls,
                     service_name: srv_service_name,
                 }),
-                None => Err(FromUriError::Parse(
-                    crate::uri::ConnectionUriError::MissingHost,
-                )),
+                None => Err(FromUriError::Parse(uri::ConnectionUriError::MissingHost)),
             }
         }
     }
@@ -972,39 +1080,40 @@ fn route(parsed: crate::uri::ParsedConnectionUri) -> Result<UriRoute, FromUriErr
 
 /// Failure modes for [`Proxy::from_uri`].
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum FromUriError {
     /// The URI did not parse: bad scheme, missing host, invalid port,
     /// invalid `tls=` value, etc. See
     /// [`ConnectionUriError`](crate::ConnectionUriError) for the full
     /// list.
     #[error("invalid connection string: {0}")]
-    Parse(#[from] crate::uri::ConnectionUriError),
+    Parse(#[from] uri::ConnectionUriError),
     /// The SRV lookup for a `mongodb+srv://` URI failed. See
-    /// [`SrvResolveError`](crate::SrvResolveError) for the full list.
+    /// [`SrvResolveError`] for the full list.
     #[error("SRV resolution failed: {0}")]
-    Srv(#[from] crate::srv::SrvResolveError),
+    Srv(#[from] SrvResolveError),
     /// A multi-host `mongodb://h1,h2,h3/` seed list parsed, but none of
     /// the listed hosts responded as the replica-set primary within the
     /// per-host probe timeout. The proxy is single-upstream — without a
     /// primary it can't safely forward writes (a secondary rejects
     /// anything lacking the `secondaryOk` flag the
     /// [`RewriteHelloLayer`] deliberately hides). Analogous to
-    /// [`SrvResolveError::NoPrimary`](crate::SrvResolveError::NoPrimary)
+    /// [`SrvResolveError::NoPrimary`]
     /// for the non-SRV case.
     ///
     /// `attempts` pairs every probed seed-list host with the reason it was
-    /// rejected (a [`ProbeOutcome`](crate::ProbeOutcome)), so the operator
+    /// rejected (a [`ProbeOutcome`]), so the operator
     /// can tell a refused connection from a healthy secondary from a probe
     /// timeout instead of seeing only a count.
     #[error(
         "no primary found among {} seed-list hosts ({})",
         attempts.len(),
-        crate::srv::summarise_attempts(attempts)
+        summarise_attempts(attempts)
     )]
     NoPrimary {
         /// Every probed seed-list host paired with why it was rejected, in
         /// probe-completion order. `attempts.len()` is the number tried.
-        attempts: Vec<(crate::srv::SrvHost, crate::serve::probe::ProbeOutcome)>,
+        attempts: Vec<(SrvHost, ProbeOutcome)>,
     },
 }
 
@@ -1017,6 +1126,7 @@ impl<L> Proxy<L> {
     pub fn layer<T>(self, layer: T) -> Proxy<Stack<T, L>> {
         Proxy {
             target: self.target,
+            _target_keepalive: self._target_keepalive,
             tls_connector: self.tls_connector,
             rewrite_hello: self.rewrite_hello,
 
@@ -1063,11 +1173,8 @@ impl<L> Proxy<L> {
     /// per-stage timing. No user-supplied sink is wired — use
     /// [`enable_explain_with_sink`](Self::enable_explain_with_sink) to
     /// consume typed [`ExplainEvent`](crate::ExplainEvent)s programmatically.
-    pub fn enable_explain(
-        self,
-    ) -> Proxy<Stack<crate::serve::explain::ExplainLayer<crate::serve::explain::TracingOnly>, L>>
-    {
-        self.layer(crate::serve::explain::ExplainLayer::new())
+    pub fn enable_explain(self) -> Proxy<Stack<ExplainLayer<TracingOnly>, L>> {
+        self.layer(ExplainLayer::new())
     }
 
     /// Convenience for `self.layer(ExplainLayer::with_sink(sink))`.
@@ -1077,14 +1184,11 @@ impl<L> Proxy<L> {
     /// [`ExplainError`](crate::ExplainError) for every failure. The sink
     /// `Clone`s once per accepted connection — keep it O(1) (refcount or
     /// `Copy`).
-    pub fn enable_explain_with_sink<Sk>(
-        self,
-        sink: Sk,
-    ) -> Proxy<Stack<crate::serve::explain::ExplainLayer<Sk>, L>>
+    pub fn enable_explain_with_sink<Sk>(self, sink: Sk) -> Proxy<Stack<ExplainLayer<Sk>, L>>
     where
         Sk: Clone,
     {
-        self.layer(crate::serve::explain::ExplainLayer::with_sink(sink))
+        self.layer(ExplainLayer::with_sink(sink))
     }
 }
 
@@ -1172,6 +1276,7 @@ struct ProxyClientInner {
 
 /// Failure modes for [`ProxyClient::forward_to`].
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ProxyClientForwardError {
     /// `TcpStream::connect` to the upstream failed (DNS, refused, etc.).
     #[error("failed to connect to proxied server: {0}")]
@@ -1339,6 +1444,7 @@ impl Service<Message> for ProxyClient {
 
 /// Failure modes for an in-flight request against [`ProxyClient`].
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ProxyClientRequestError {
     /// Underlying socket I/O failed.
     #[error("io error: {0}")]
@@ -1586,20 +1692,20 @@ mod tests {
     }
 
     #[test]
-    fn new_with_use_tls_true_matches_system() {
-        let proxy = Proxy::new("mongo.example.com", 27017, true);
+    fn with_tls_system_builds_connector() {
+        let proxy = Proxy::with_tls("mongo.example.com", 27017, TlsConfig::System);
         assert!(
             proxy.tls_connector.is_some(),
-            "Proxy::new(.., true) must still build a TLS connector"
+            "TlsConfig::System must build a TLS connector"
         );
     }
 
     #[test]
-    fn new_with_use_tls_false_matches_disabled() {
-        let proxy = Proxy::new("mongo.example.com", 27017, false);
+    fn new_is_plain_tcp() {
+        let proxy = Proxy::new("mongo.example.com", 27017);
         assert!(
             proxy.tls_connector.is_none(),
-            "Proxy::new(.., false) must still be plain TCP"
+            "Proxy::new must be plain TCP (no TLS connector)"
         );
     }
 
@@ -1623,20 +1729,97 @@ mod tests {
         );
     }
 
-    // ---------- failover: target cell + apply_primary ----------
+    // ---------- #49: from_srv_with_tls closes the TlsConfig × SRV gap ----------
+    //
+    // The initial SRV resolution runs before any TLS connector is built, so
+    // pointing at a hostname that can't resolve exercises the constructor's
+    // routing for each `TlsConfig` variant without needing a live cluster:
+    // a `SrvResolveError` (rather than a panic or type error) proves the
+    // variant is accepted and threaded through to `from_srv_inner`.
 
-    fn target_cell(host: &str, port: u16) -> Arc<RwLock<Target>> {
-        Arc::new(RwLock::new(Target {
-            host: host.into(),
-            port,
-        }))
+    #[tokio::test]
+    async fn from_srv_with_tls_accepts_system() {
+        let result = Proxy::from_srv_with_tls(
+            "srv-does-not-exist.invalid",
+            TlsConfig::System,
+            FailoverConfig::disabled(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "an unresolvable SRV host must fail rather than build a proxy"
+        );
     }
 
-    fn srv_host(host: &str, port: u16) -> crate::srv::SrvHost {
-        crate::srv::SrvHost {
+    #[tokio::test]
+    async fn from_srv_with_tls_accepts_with_roots() {
+        let result = Proxy::from_srv_with_tls(
+            "srv-does-not-exist.invalid",
+            TlsConfig::WithRoots(RootCertStore::empty()),
+            FailoverConfig::disabled(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "an unresolvable SRV host must fail rather than build a proxy"
+        );
+    }
+
+    #[cfg(feature = "dangerous-insecure-tls")]
+    #[tokio::test]
+    async fn from_srv_with_tls_accepts_insecure() {
+        // The previously-unreachable combination: SRV upstream + Insecure
+        // TLS. We only assert the constructor accepts the variant and routes
+        // it through resolution (which fails on the bogus host).
+        let result = Proxy::from_srv_with_tls(
+            "srv-does-not-exist.invalid",
+            TlsConfig::Insecure,
+            FailoverConfig::disabled(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "an unresolvable SRV host must fail rather than build a proxy"
+        );
+    }
+
+    // ---------- failover: target cell + apply_primary ----------
+
+    fn target_cell(host: &str, port: u16) -> watch::Sender<Target> {
+        watch::Sender::new(Target {
+            host: host.into(),
+            port,
+        })
+    }
+
+    fn srv_host(host: &str, port: u16) -> SrvHost {
+        SrvHost {
             host: host.into(),
             port,
         }
+    }
+
+    /// #52: the watch channel gives lock-free `borrow().clone()` reads and
+    /// `send_replace` swaps that hand back the *previous* `Target`.
+    #[test]
+    fn watch_send_replace_returns_previous_target() {
+        let cell = target_cell("old.example.com", 27017);
+        // Lock-free read of the current value.
+        assert_eq!(read_target(&cell), ("old.example.com".to_owned(), 27017));
+
+        let previous = cell.send_replace(Target {
+            host: "new.example.com".into(),
+            port: 27018,
+        });
+        assert_eq!(
+            previous,
+            Target {
+                host: "old.example.com".into(),
+                port: 27017,
+            },
+            "send_replace must return the swapped-out target"
+        );
+        assert_eq!(read_target(&cell), ("new.example.com".to_owned(), 27018));
     }
 
     #[test]
@@ -1671,7 +1854,7 @@ mod tests {
     // primary" wiring is verified without real sockets — the same gap
     // `from_uri` would otherwise only exercise against a live cluster.
 
-    use crate::serve::probe::{DEFAULT_PROBE_TIMEOUT, MockPrimaryProbe};
+    use crate::serve::probe::{MockPrimaryProbe, ProbeError};
 
     #[tokio::test]
     async fn select_target_builds_cell_for_the_probed_primary() {
@@ -1715,7 +1898,7 @@ mod tests {
         assert!(
             attempts
                 .iter()
-                .all(|(_, o)| matches!(o, crate::serve::probe::ProbeOutcome::NotPrimary)),
+                .all(|(_, o)| matches!(o, ProbeOutcome::NotPrimary)),
             "both secondaries must be reported as NotPrimary, got {attempts:?}",
         );
     }
@@ -1754,12 +1937,8 @@ mod tests {
         delay: Duration,
     }
 
-    impl crate::serve::probe::PrimaryProbe for ColdPrimaryProbe {
-        async fn is_primary(
-            &self,
-            _host: String,
-            _port: u16,
-        ) -> Result<bool, crate::serve::probe::ProbeError> {
+    impl PrimaryProbe for ColdPrimaryProbe {
+        async fn is_primary(&self, _host: String, _port: u16) -> Result<bool, ProbeError> {
             tokio::time::sleep(self.delay).await;
             Ok(true)
         }
@@ -1775,10 +1954,7 @@ mod tests {
             .await
             .expect_err("the 5s default must time out before the cold primary answers");
         assert!(
-            matches!(
-                attempts.as_slice(),
-                [(_, crate::serve::probe::ProbeOutcome::TimedOut)]
-            ),
+            matches!(attempts.as_slice(), [(_, ProbeOutcome::TimedOut)]),
             "the cold primary must be reported as a timeout, got {attempts:?}",
         );
     }
@@ -1860,7 +2036,7 @@ mod tests {
     // per-scheme TLS / per-host port defaults) without sockets or DNS.
 
     fn route_uri(uri: &str) -> UriRoute {
-        route(crate::uri::parse(uri).expect("uri parses")).expect("uri routes")
+        route(uri::parse(uri).expect("uri parses")).expect("uri routes")
     }
 
     #[test]
@@ -1986,7 +2162,7 @@ mod tests {
                 assert!(
                     attempts
                         .iter()
-                        .all(|(_, o)| matches!(o, crate::serve::probe::ProbeOutcome::Failed(_))),
+                        .all(|(_, o)| matches!(o, ProbeOutcome::Failed(_))),
                     "a refused TCP connect must be carried as Failed, got {attempts:?}",
                 );
                 // The refused-connect io::Error must remain reachable
@@ -2007,6 +2183,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn reprobe_loop_swaps_target_when_select_returns_new_primary() {
         let cell = target_cell("old.example.com", 27017);
+        // The keepalive receiver stands in for the one the `Proxy` holds:
+        // while it is alive the loop's `closed()` shutdown signal stays
+        // pending, so the loop keeps re-probing.
+        let _keepalive = cell.subscribe();
         let _handle = spawn_reprobe_loop(Duration::from_secs(60), &cell, || async {
             Some(srv_host("new.example.com", 27017))
         });
@@ -2024,6 +2204,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn reprobe_loop_keeps_target_when_select_returns_none() {
         let cell = target_cell("old.example.com", 27017);
+        let _keepalive = cell.subscribe();
         let _handle = spawn_reprobe_loop(Duration::from_secs(60), &cell, || async { None });
 
         tokio::task::yield_now().await;
@@ -2033,11 +2214,17 @@ mod tests {
         assert_eq!(read_target(&cell).0, "old.example.com");
     }
 
+    /// #53: a dropped proxy must end the loop *promptly*, without waiting out
+    /// the rest of the interval. We never advance the clock a full interval
+    /// after the drop, yet the task still joins.
     #[tokio::test(start_paused = true)]
     async fn reprobe_loop_stops_after_proxy_dropped() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let cell = target_cell("old.example.com", 27017);
+        // The keepalive receiver models the `Proxy`'s half: dropping it is
+        // what the loop observes via `closed()`.
+        let keepalive = cell.subscribe();
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_in_loop = calls.clone();
         let handle = spawn_reprobe_loop(Duration::from_secs(60), &cell, move || {
@@ -2050,15 +2237,15 @@ mod tests {
 
         // Let the task register its first sleep before advancing the clock.
         tokio::task::yield_now().await;
-        // One tick runs while the cell (the sole strong ref) is alive.
+        // One tick runs while the keepalive receiver is alive.
         tokio::time::advance(Duration::from_secs(61)).await;
         tokio::task::yield_now().await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        // Drop the only strong reference — the loop holds just a `Weak`.
-        drop(cell);
-        // Next wake fails to upgrade and the task returns.
-        tokio::time::advance(Duration::from_secs(61)).await;
+        // Drop the keepalive receiver — the proxy is gone. The loop's
+        // `closed()` arm fires immediately; we do NOT advance the clock a
+        // full interval, proving the loop notices the drop promptly.
+        drop(keepalive);
         handle.await.expect("loop task joins cleanly after drop");
         assert_eq!(
             calls.load(Ordering::SeqCst),

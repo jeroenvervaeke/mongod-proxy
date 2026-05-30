@@ -25,7 +25,9 @@ pub trait ExplainSink<E>
 where
     E: std::error::Error,
 {
+    /// Records a successfully captured explain event.
     fn record(&self, event: ExplainEvent);
+    /// Records an explain-branch failure. Defaults to a no-op.
     fn record_error(&self, _err: &ExplainError<E>) {}
 }
 
@@ -92,9 +94,10 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::ids::{ExplainRequestId, RequestId};
     use crate::serve::explain::model::{
-        AggregateTime, Command, Database, DocsExamined, DocsReturned, ExplainTotals, KeysExamined,
-        Namespace, NodeTime, PlanNode, Stage,
+        AggregateTime, Collection, Command, Database, DocsExamined, DocsReturned, ExplainTotals,
+        KeysExamined, Namespace, NodeTime, PlanNode, Stage,
     };
 
     /// Build a minimal `ExplainEvent` for tests.
@@ -103,7 +106,7 @@ mod tests {
             command: Command::Find,
             namespace: Namespace::new(
                 Database::try_new("test".to_owned()).unwrap(),
-                crate::serve::explain::model::Collection::try_new("movies".to_owned()).unwrap(),
+                Collection::try_new("movies".to_owned()).unwrap(),
             ),
             total: ExplainTotals {
                 n_returned: DocsReturned::try_new(0).unwrap(),
@@ -124,8 +127,8 @@ mod tests {
                 filter: None,
                 children: vec![],
             },
-            client_request_id: crate::ids::RequestId::new(1),
-            explain_request_id: Some(crate::ids::ExplainRequestId::try_new(-1).unwrap()),
+            client_request_id: RequestId::new(1),
+            explain_request_id: Some(ExplainRequestId::try_new(-1).unwrap()),
         }
     }
 

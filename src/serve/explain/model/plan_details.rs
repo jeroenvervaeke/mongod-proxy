@@ -29,9 +29,13 @@ pub enum IndexFieldKind {
     Ascending,
     /// Wire form: `-1` / `-1.0`.
     Descending,
+    /// Hashed index field. Wire form: `"hashed"`.
     Hashed,
+    /// Text index field. Wire form: `"text"`.
     Text,
+    /// 2dsphere geospatial index field. Wire form: `"2dsphere"`.
     TwoDSphere,
+    /// 2d geospatial index field. Wire form: `"2d"`.
     TwoD,
     /// Forward-compat fallback for any unknown index kind string.
     Other(OtherName),
@@ -61,9 +65,12 @@ impl IndexFieldKind {
     }
 }
 
+/// One `(field, kind)` entry of a decoded index key pattern.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct KeyPatternField {
+    /// Indexed field path (e.g. `"year"`).
     pub field: String,
+    /// How this field participates in the index (direction or special kind).
     pub kind: IndexFieldKind,
 }
 
@@ -141,9 +148,13 @@ impl<'de> serde::Deserialize<'de> for KeyPattern {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum BoundValue {
+    /// Positive infinity sentinel. Wire form: `"inf"`.
     Inf,
+    /// Negative infinity sentinel. Wire form: `"-inf"`.
     NegInf,
+    /// BSON `MinKey` sentinel (sorts below every value).
     MinKey,
+    /// BSON `MaxKey` sentinel (sorts above every value).
     MaxKey,
     /// Literal value, as the on-wire pretty-print rendered it. We
     /// preserve the textual form because the wire format is itself a
@@ -166,7 +177,9 @@ impl BoundValue {
 /// Whether a bound is inclusive (`[`/`]`) or exclusive (`(`/`)`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Inclusivity {
+    /// The bound includes its endpoint (`[` / `]`).
     Inclusive,
+    /// The bound excludes its endpoint (`(` / `)`).
     Exclusive,
 }
 
@@ -174,9 +187,13 @@ pub enum Inclusivity {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct IndexBoundRange {
+    /// Lower endpoint of the interval.
     pub lower: BoundValue,
+    /// Whether the lower endpoint is included.
     pub lower_inclusivity: Inclusivity,
+    /// Upper endpoint of the interval.
     pub upper: BoundValue,
+    /// Whether the upper endpoint is included.
     pub upper_inclusivity: Inclusivity,
 }
 
@@ -217,16 +234,30 @@ impl IndexBoundRange {
     }
 }
 
+/// Failure modes when parsing a single index-bound range string.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum IndexBoundsParseError {
+    /// The bound string was empty.
     #[error("empty bound string")]
     Empty,
+    /// The bound string did not begin with `[` or `(`.
     #[error("bound string {raw:?} must start with '[' or '('")]
-    BadOpen { raw: String },
+    BadOpen {
+        /// The offending bound string.
+        raw: String,
+    },
+    /// The bound string did not end with `]` or `)`.
     #[error("bound string {raw:?} must end with ']' or ')'")]
-    BadClose { raw: String },
+    BadClose {
+        /// The offending bound string.
+        raw: String,
+    },
+    /// The bound string had no `,` separating lower from upper.
     #[error("bound string {raw:?} has no ',' separator between lower and upper")]
-    NoSeparator { raw: String },
+    NoSeparator {
+        /// The offending bound string.
+        raw: String,
+    },
 }
 
 impl IndexBoundsParseError {

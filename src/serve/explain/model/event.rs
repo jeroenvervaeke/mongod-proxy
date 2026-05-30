@@ -19,20 +19,29 @@ use super::{
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct PlanNode {
+    /// The plan stage this node executes (e.g. `IXSCAN`, `FETCH`).
     pub stage: Stage,
     /// Per-stage execution time (server's `executionTimeMillisEstimate`).
     /// Optional because the wire field is optional; we never silently
     /// default to zero.
     pub execution_time: Option<NodeTime>,
+    /// Documents returned by this stage (`nReturned`).
     pub n_returned: DocsReturned,
+    /// Documents examined by this stage (`docsExamined`), when reported.
     pub docs_examined: Option<DocsExamined>,
+    /// Index keys examined by this stage (`keysExamined`), when reported.
     pub keys_examined: Option<KeysExamined>,
+    /// Name of the index this stage used, for index-backed stages.
     pub index_name: Option<IndexName>,
+    /// Key pattern of the index this stage used.
     pub key_pattern: Option<KeyPattern>,
+    /// Scanned index bounds, for index-scan stages.
     pub index_bounds: Option<IndexBounds>,
     /// Scan direction. Present on most scan stages.
     pub direction: Option<Direction>,
+    /// Residual filter applied by this stage, if any.
     pub filter: Option<Filter>,
+    /// Child plan nodes feeding into this stage (empty for leaves).
     pub children: Vec<PlanNode>,
 }
 
@@ -40,9 +49,13 @@ pub struct PlanNode {
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub struct ExplainTotals {
+    /// Total documents returned by the plan (`nReturned`).
     pub n_returned: DocsReturned,
+    /// Total documents examined across the plan (`totalDocsExamined`).
     pub docs_examined: DocsExamined,
+    /// Total index keys examined across the plan (`totalKeysExamined`).
     pub keys_examined: KeysExamined,
+    /// Total execution time for the plan (`executionTimeMillis`).
     pub execution_time: AggregateTime,
 }
 
@@ -50,9 +63,13 @@ pub struct ExplainTotals {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct ExplainEvent {
+    /// Command that was explained (e.g. `find`, `aggregate`).
     pub command: Command,
+    /// Collection the command ran against.
     pub namespace: Namespace,
+    /// Aggregate execution counters for the whole plan.
     pub total: ExplainTotals,
+    /// Root of the executed plan tree.
     pub plan: PlanNode,
     /// `request_id` from the original client OP_MSG that triggered this
     /// explain. Lets sinks correlate explain output with the wider
@@ -76,10 +93,15 @@ pub struct ExplainEvent {
 pub enum MalformedOkShape {
     /// `ok` field absent.
     Missing,
+    /// `ok` was BSON null.
     Null,
+    /// `ok` was a string.
     StringValue,
+    /// `ok` was a boolean.
     Bool,
+    /// `ok` was an array.
     Array,
+    /// `ok` was a sub-document.
     Document,
     /// `NaN`, `+Infinity` or `-Infinity` — any non-finite double.
     NonFinite,
@@ -112,6 +134,8 @@ impl MalformedOkShape {
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum UnsupportedShape {
+    /// Command carried multiple write ops; the server cannot explain a
+    /// bulk write batch, so no sideband explain is issued.
     #[error("multi-op write batch (server does not support explaining bulk writes)")]
     MultiOpWriteBatch,
 }

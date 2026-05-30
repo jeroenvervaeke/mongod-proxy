@@ -11,6 +11,8 @@ pub struct Namespace {
 }
 
 impl Namespace {
+    /// Build a namespace from already-validated database and collection
+    /// names.
     pub fn new(database: Database, collection: Collection) -> Self {
         Self {
             database,
@@ -48,9 +50,11 @@ impl Namespace {
         })
     }
 
+    /// The database half of the namespace.
     pub fn database(&self) -> &Database {
         &self.database
     }
+    /// The collection half of the namespace.
     pub fn collection(&self) -> &Collection {
         &self.collection
     }
@@ -90,18 +94,23 @@ impl NamespaceParseError {
     pub fn raw_input(&self) -> &str {
         &self.raw
     }
+    /// The typed reason parsing failed.
     pub fn kind(&self) -> &NamespaceParseErrorKind {
         &self.kind
     }
 }
 
+/// Typed reason a `database.collection` string failed to parse.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum NamespaceParseErrorKind {
+    /// The string contained no `.` separating database from collection.
     #[error("missing '.' separator")]
     NoDot,
+    /// The database half failed validation.
     #[error("invalid database: {0}")]
     BadDatabase(#[source] DatabaseError),
+    /// The collection half failed validation.
     #[error("invalid collection: {0}")]
     BadCollection(#[source] CollectionError),
 }

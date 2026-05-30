@@ -42,6 +42,7 @@ pub enum Operation {
 ///
 /// Each variant flattens the per-opcode parse error.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum OperationParseError {
     /// The OP_MSG body could not be parsed.
     #[error("failed to parse message: {0}")]
@@ -56,6 +57,7 @@ pub enum OperationParseError {
 
 /// Failure modes for [`Operation::write_bytes`].
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum OperationWriteError {
     /// Encoding an OP_MSG body failed (typically BSON serialisation).
     #[error("failed to write message operation: {0}")]

@@ -19,4 +19,4 @@ tokio-util = { workspace = true }
 tower-layer = { workspace = true }
 tower-service = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = "0.3.19"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }

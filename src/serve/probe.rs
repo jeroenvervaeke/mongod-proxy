@@ -41,6 +41,7 @@ use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use tokio_rustls::TlsConnector;
 use tower_service::Service;
+use tracing::{debug, info};
 
 use crate::ids::RequestId;
 use crate::message::Message;
@@ -184,17 +185,39 @@ impl HelloProbe {
 
 impl PrimaryProbe for HelloProbe {
     async fn is_primary(&self, host: String, port: u16) -> Result<bool, ProbeError> {
-        let mut client = ProxyClient::forward_to(host, port, self.tls_connector.clone()).await?;
+        // One event per branch keeps a 3-host startup readable while still
+        // pinning down *where* a probe failed: a refused connect, a TLS
+        // handshake error, a dropped socket, and a malformed reply all log
+        // distinctly so an operator can tell a network-policy problem from a
+        // cert mismatch without reconstructing the `Error::source` chain.
+        debug!(host, port, "probing for primary");
+        let mut client = ProxyClient::forward_to(host.clone(), port, self.tls_connector.clone())
+            .await
+            .inspect_err(|e| debug!(host, port, error = %e, "probe connect failed"))?;
         let req = build_hello_request();
         let mut stream = <ProxyClient as Service<Message>>::call(&mut client, req)
             .await
-            .map_err(ProbeError::Request)?;
+            .map_err(|e| {
+                debug!(host, port, error = %e, "probe request failed");
+                ProbeError::Request(e)
+            })?;
         let reply = stream
             .next()
             .await
-            .ok_or(ProbeError::NoReply)?
-            .map_err(ProbeError::Response)?;
-        extract_is_writable_primary(&reply).ok_or(ProbeError::MalformedReply)
+            .ok_or_else(|| {
+                debug!(host, port, "probe got no reply before the socket closed");
+                ProbeError::NoReply
+            })?
+            .map_err(|e| {
+                debug!(host, port, error = %e, "probe response failed");
+                ProbeError::Response(e)
+            })?;
+        let Some(is_primary) = extract_is_writable_primary(&reply) else {
+            debug!(host, port, "probe reply was malformed");
+            return Err(ProbeError::MalformedReply);
+        };
+        debug!(host, port, is_primary, "probe replied");
+        Ok(is_primary)
     }
 }
 
@@ -248,11 +271,18 @@ where
             // The first confirmed primary wins; remaining probes are
             // dropped, so their (now irrelevant) outcomes are never
             // gathered.
-            Ok(Ok(true)) => return Selection::Primary(host.clone()),
+            Ok(Ok(true)) => {
+                info!(host = %host.host, port = host.port, "selected primary");
+                return Selection::Primary(host.clone());
+            }
             Ok(Ok(false)) => ProbeOutcome::NotPrimary,
             Ok(Err(e)) => ProbeOutcome::Failed(e),
             Err(_elapsed) => ProbeOutcome::TimedOut,
         };
+        // One rejection event per settled probe — the per-host outcome an
+        // operator needs to read a no-primary startup, mirroring the reasons
+        // carried in the eventual `NoPrimary`.
+        debug!(host = %host.host, port = host.port, reason = %reason, "probe rejected");
         rejected.push((host.clone(), reason));
     }
     Selection::NoPrimary(rejected)
@@ -885,5 +915,122 @@ mod tests {
             Selection::Primary(host) => assert_eq!(host.host, "primary"),
             Selection::NoPrimary(attempts) => panic!("expected Primary, got {attempts:?}"),
         }
+    }
+
+    // ---------- tracing events (#19) ----------
+    //
+    // The probe path is best-effort observability, but operators rely on it
+    // to tell a no-primary startup apart from an unreachable cluster, so we
+    // pin down that the load-bearing events actually fire: a "selected
+    // primary" for the winner and a per-host "probe rejected" when none
+    // qualifies. We capture events with a tiny in-process `Layer` rather
+    // than scraping formatted text, so the assertions key off the event's
+    // `message` field directly.
+
+    use std::sync::Mutex;
+
+    use tracing::Subscriber;
+    use tracing::field::{Field, Visit};
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+    use tracing_subscriber::registry::Registry;
+
+    /// Collects the `message` of every event into a shared buffer. Only the
+    /// human-readable message is captured — enough to assert *which* branch
+    /// emitted, without coupling the test to field formatting.
+    #[derive(Clone, Default)]
+    struct CapturingLayer {
+        messages: Arc<Mutex<Vec<String>>>,
+    }
+
+    /// Pulls the `message` field (the macro's positional string) out of an
+    /// event, ignoring every structured field.
+    struct MessageVisitor<'a>(&'a mut Option<String>);
+
+    impl Visit for MessageVisitor<'_> {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                *self.0 = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    impl<S: Subscriber> Layer<S> for CapturingLayer {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            let mut message = None;
+            event.record(&mut MessageVisitor(&mut message));
+            if let Some(message) = message
+                && let Ok(mut buf) = self.messages.lock()
+            {
+                buf.push(message);
+            }
+        }
+    }
+
+    /// Runs `fut` with a capturing subscriber installed for the duration,
+    /// then returns every captured event message. `set_default` returns a
+    /// thread-scoped guard (rather than `with_default`, whose closure can't
+    /// hold an `.await`) so concurrent tests don't cross-talk.
+    async fn capture_events<Fut>(fut: Fut) -> Vec<String>
+    where
+        Fut: std::future::Future<Output = ()>,
+    {
+        let layer = CapturingLayer::default();
+        let messages = layer.messages.clone();
+        let subscriber = Registry::default().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+        fut.await;
+        let buf = messages.lock().expect("messages mutex poisoned");
+        buf.clone()
+    }
+
+    #[tokio::test]
+    async fn select_primary_emits_selected_primary_event_for_the_winner() {
+        let hosts = vec![host("a", 27017), host("primary", 27017)];
+        let messages = capture_events(async {
+            let mut probe = MockPrimaryProbe::new();
+            probe
+                .expect_is_primary()
+                .returning(|name, _| Ok(name == "primary"));
+            let picked = select_primary(&hosts, &probe, DEFAULT_PROBE_TIMEOUT)
+                .await
+                .into_primary()
+                .expect("primary");
+            assert_eq!(picked.host, "primary");
+        })
+        .await;
+
+        assert!(
+            messages.iter().any(|m| m.contains("selected primary")),
+            "the chosen winner must emit a `selected primary` event, got {messages:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn select_primary_emits_a_rejected_event_per_host_when_no_primary() {
+        let hosts = vec![host("a", 27017), host("b", 27017)];
+        let messages = capture_events(async {
+            let mut probe = MockPrimaryProbe::new();
+            probe.expect_is_primary().returning(|_, _| Ok(false));
+            assert!(
+                select_primary(&hosts, &probe, DEFAULT_PROBE_TIMEOUT)
+                    .await
+                    .into_primary()
+                    .is_none()
+            );
+        })
+        .await;
+
+        let rejected = messages
+            .iter()
+            .filter(|m| m.contains("probe rejected"))
+            .count();
+        assert_eq!(
+            rejected, 2,
+            "every rejected host must emit a `probe rejected` event, got {messages:?}",
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("selected primary")),
+            "no `selected primary` event must fire when no host qualifies, got {messages:?}",
+        );
     }
 }

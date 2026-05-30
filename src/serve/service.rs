@@ -44,7 +44,19 @@ use crate::{
     encoder::{WireEncoder, WireEncoderError},
     message::Message,
     operation::{Operation, op_msg::OperationMessageFlags},
-    serve::rewrite_hello::{RewriteHelloLayer, RewriteHelloService},
+    serve::{
+        explain::{ExplainLayer, TracingOnly},
+        probe::{
+            DEFAULT_PROBE_TIMEOUT, HelloProbe, PrimaryProbe, ProbeOutcome, Selection,
+            select_primary,
+        },
+        rewrite_hello::{RewriteHelloLayer, RewriteHelloService},
+    },
+    srv::{
+        DEFAULT_SRV_SERVICE_NAME, SrvHost, SrvResolveError, resolve_with_service_name,
+        summarise_attempts,
+    },
+    uri,
 };
 
 /// Ensures rustls has a usable [`CryptoProvider`](tokio_rustls::rustls::crypto::CryptoProvider).
@@ -448,8 +460,8 @@ impl Proxy<Identity> {
     ///
     /// # Errors
     ///
-    /// See [`crate::srv::SrvResolveError`]. New here:
-    /// [`SrvResolveError::NoPrimary`](crate::srv::SrvResolveError::NoPrimary)
+    /// See [`SrvResolveError`]. New here:
+    /// [`SrvResolveError::NoPrimary`]
     /// fires when every SRV-resolved host responds (or fails to
     /// respond) without identifying itself as the primary.
     ///
@@ -467,7 +479,7 @@ impl Proxy<Identity> {
     pub async fn from_srv(
         srv_hostname: impl Into<String>,
         use_tls: bool,
-    ) -> Result<Self, crate::srv::SrvResolveError> {
+    ) -> Result<Self, SrvResolveError> {
         Self::from_srv_with(srv_hostname, use_tls, FailoverConfig::default()).await
     }
 
@@ -483,7 +495,7 @@ impl Proxy<Identity> {
     /// # Errors
     ///
     /// Same as [`from_srv`](Self::from_srv): see
-    /// [`crate::srv::SrvResolveError`]. Only the *initial* selection can
+    /// [`SrvResolveError`]. Only the *initial* selection can
     /// fail here — once the proxy is built, later re-probe failures are
     /// logged via `tracing` and leave the current target in place rather
     /// than tearing the proxy down.
@@ -492,7 +504,7 @@ impl Proxy<Identity> {
         srv_hostname: impl Into<String>,
         use_tls: bool,
         failover: FailoverConfig,
-    ) -> Result<Self, crate::srv::SrvResolveError> {
+    ) -> Result<Self, SrvResolveError> {
         let tls = if use_tls {
             TlsConfig::System
         } else {
@@ -524,7 +536,7 @@ impl Proxy<Identity> {
     /// # Errors
     ///
     /// Same as [`from_srv_with`](Self::from_srv_with): see
-    /// [`crate::srv::SrvResolveError`]. Only the initial selection can
+    /// [`SrvResolveError`]. Only the initial selection can
     /// fail; later re-probe failures are logged and leave the current
     /// target in place.
     #[must_use = "a Proxy does nothing until passed to serve()"]
@@ -532,10 +544,10 @@ impl Proxy<Identity> {
         srv_hostname: impl Into<String>,
         tls: TlsConfig,
         failover: FailoverConfig,
-    ) -> Result<Self, crate::srv::SrvResolveError> {
+    ) -> Result<Self, SrvResolveError> {
         Self::from_srv_inner(
             &srv_hostname.into(),
-            crate::srv::DEFAULT_SRV_SERVICE_NAME,
+            DEFAULT_SRV_SERVICE_NAME,
             tls,
             failover,
         )
@@ -555,14 +567,14 @@ impl Proxy<Identity> {
         service_name: &str,
         tls: TlsConfig,
         failover: FailoverConfig,
-    ) -> Result<Self, crate::srv::SrvResolveError> {
-        let hosts = crate::srv::resolve_with_service_name(srv_hostname, service_name).await?;
+    ) -> Result<Self, SrvResolveError> {
+        let hosts = resolve_with_service_name(srv_hostname, service_name).await?;
         let tls_connector = build_tls_connector(tls);
-        let probe = crate::serve::probe::HelloProbe::new(tls_connector.clone());
+        let probe = HelloProbe::new(tls_connector.clone());
         let probe_timeout = failover.probe_timeout;
         let target = select_target(&hosts, &probe, probe_timeout)
             .await
-            .map_err(|attempts| crate::srv::SrvResolveError::NoPrimary {
+            .map_err(|attempts| SrvResolveError::NoPrimary {
                 hostname: srv_hostname.to_owned(),
                 attempts,
             })?;
@@ -584,7 +596,7 @@ impl Proxy<Identity> {
             spawn_reprobe_loop(interval, &proxy.target, move || {
                 let hostname = hostname.clone();
                 let service_name = service_name.clone();
-                let probe = crate::serve::probe::HelloProbe::new(tls.clone());
+                let probe = HelloProbe::new(tls.clone());
                 async move { resolve_and_select(&hostname, &service_name, &probe, probe_timeout).await }
             });
         }
@@ -632,7 +644,7 @@ impl Proxy<Identity> {
     /// # Errors
     ///
     /// Returns [`FromUriError::Parse`] for any URI shape rejected by
-    /// [`crate::uri::ConnectionUriError`], [`FromUriError::Srv`] if the
+    /// [`uri::ConnectionUriError`], [`FromUriError::Srv`] if the
     /// SRV lookup fails on a `mongodb+srv://` URI, or
     /// [`FromUriError::NoPrimary`] if a multi-host seed list resolves but
     /// none of its hosts responds as the primary.
@@ -652,7 +664,7 @@ impl Proxy<Identity> {
     /// ```
     #[must_use = "a Proxy does nothing until passed to serve()"]
     pub async fn from_uri(uri: &str) -> Result<Self, FromUriError> {
-        let parsed = crate::uri::parse(uri).map_err(FromUriError::Parse)?;
+        let parsed = uri::parse(uri).map_err(FromUriError::Parse)?;
         match route(parsed)? {
             UriRoute::Single {
                 host,
@@ -674,9 +686,7 @@ impl Proxy<Identity> {
                 use_tls,
                 service_name,
             } => {
-                let service_name = service_name
-                    .as_deref()
-                    .unwrap_or(crate::srv::DEFAULT_SRV_SERVICE_NAME);
+                let service_name = service_name.as_deref().unwrap_or(DEFAULT_SRV_SERVICE_NAME);
                 let tls = if use_tls {
                     TlsConfig::System
                 } else {
@@ -699,12 +709,12 @@ impl Proxy<Identity> {
     /// [`from_uri`](Self::from_uri). Single-host URIs don't come through
     /// here: with one named host there's nothing to select.
     async fn from_seed_list(
-        hosts: Vec<crate::srv::SrvHost>,
+        hosts: Vec<SrvHost>,
         use_tls: bool,
         failover: FailoverConfig,
     ) -> Result<Self, FromUriError> {
         let tls_connector = use_tls.then(default_tls_connector);
-        let probe = crate::serve::probe::HelloProbe::new(tls_connector.clone());
+        let probe = HelloProbe::new(tls_connector.clone());
         let probe_timeout = failover.probe_timeout;
         let target = select_target(&hosts, &probe, probe_timeout)
             .await
@@ -719,7 +729,7 @@ impl Proxy<Identity> {
             // The seed list is static — no DNS to re-resolve — so each
             // tick simply re-probes the same hosts for the current primary.
             spawn_reprobe_loop(interval, &proxy.target, move || {
-                let probe = crate::serve::probe::HelloProbe::new(tls.clone());
+                let probe = HelloProbe::new(tls.clone());
                 let hosts = hosts.clone();
                 async move { reselect_seed_list(&hosts, &probe, probe_timeout).await }
             });
@@ -745,7 +755,7 @@ impl Proxy<Identity> {
 /// startup selection and every background re-probe, so a deployment that
 /// cold-starts slowly (Atlas free-tier) or sits behind a high-latency
 /// link can widen the budget instead of failing startup with a spurious
-/// [`SrvResolveError::NoPrimary`](crate::srv::SrvResolveError::NoPrimary).
+/// [`SrvResolveError::NoPrimary`].
 ///
 /// Construct it via [`default`](Self::default), [`every`](Self::every), or
 /// [`disabled`](Self::disabled) and tune with the builder methods
@@ -773,7 +783,7 @@ impl Default for FailoverConfig {
     fn default() -> Self {
         Self {
             reprobe_interval: Some(DEFAULT_REPROBE_INTERVAL),
-            probe_timeout: crate::serve::probe::DEFAULT_PROBE_TIMEOUT,
+            probe_timeout: DEFAULT_PROBE_TIMEOUT,
         }
     }
 }
@@ -827,22 +837,22 @@ impl FailoverConfig {
 /// the primary. Generic over the probe so the multi-host selection wiring
 /// can be unit-tested with a mock instead of real sockets.
 async fn select_target<P>(
-    hosts: &[crate::srv::SrvHost],
+    hosts: &[SrvHost],
     probe: &P,
     probe_timeout: Duration,
-) -> Result<watch::Sender<Target>, Vec<(crate::srv::SrvHost, crate::serve::probe::ProbeOutcome)>>
+) -> Result<watch::Sender<Target>, Vec<(SrvHost, ProbeOutcome)>>
 where
-    P: crate::serve::probe::PrimaryProbe + ?Sized,
+    P: PrimaryProbe + ?Sized,
 {
-    match crate::serve::probe::select_primary(hosts, probe, probe_timeout).await {
-        crate::serve::probe::Selection::Primary(primary) => Ok(watch::Sender::new(Target {
+    match select_primary(hosts, probe, probe_timeout).await {
+        Selection::Primary(primary) => Ok(watch::Sender::new(Target {
             host: primary.host,
             port: primary.port,
         })),
         // No host is currently the primary: hand the per-host rejection
         // reasons back so the constructor can build a diagnostic
         // `NoPrimary` rather than collapsing them into a bare count.
-        crate::serve::probe::Selection::NoPrimary(attempts) => Err(attempts),
+        Selection::NoPrimary(attempts) => Err(attempts),
     }
 }
 
@@ -852,14 +862,14 @@ where
 /// the per-tick body of the background failover loop for multi-host
 /// `mongodb://` URIs, which have no DNS to re-resolve.
 async fn reselect_seed_list<P>(
-    hosts: &[crate::srv::SrvHost],
+    hosts: &[SrvHost],
     probe: &P,
     probe_timeout: Duration,
-) -> Option<crate::srv::SrvHost>
+) -> Option<SrvHost>
 where
-    P: crate::serve::probe::PrimaryProbe + ?Sized,
+    P: PrimaryProbe + ?Sized,
 {
-    let picked = crate::serve::probe::select_primary(hosts, probe, probe_timeout)
+    let picked = select_primary(hosts, probe, probe_timeout)
         .await
         .into_primary();
     if picked.is_none() {
@@ -882,13 +892,13 @@ async fn resolve_and_select<P>(
     service_name: &str,
     probe: &P,
     probe_timeout: Duration,
-) -> Option<crate::srv::SrvHost>
+) -> Option<SrvHost>
 where
-    P: crate::serve::probe::PrimaryProbe + ?Sized,
+    P: PrimaryProbe + ?Sized,
 {
-    match crate::srv::resolve_with_service_name(hostname, service_name).await {
+    match resolve_with_service_name(hostname, service_name).await {
         Ok(hosts) => {
-            let picked = crate::serve::probe::select_primary(&hosts, probe, probe_timeout)
+            let picked = select_primary(&hosts, probe, probe_timeout)
                 .await
                 .into_primary();
             if picked.is_none() {
@@ -918,7 +928,7 @@ where
 /// Reads the current value via a short synchronous `borrow()` (never held
 /// across an `.await`) and, when it differs, swaps it in with
 /// [`watch::Sender::send_replace`], which notifies any receivers.
-fn apply_primary(target: &watch::Sender<Target>, primary: crate::srv::SrvHost) -> bool {
+fn apply_primary(target: &watch::Sender<Target>, primary: SrvHost) -> bool {
     let next = Target {
         host: primary.host,
         port: primary.port,
@@ -961,7 +971,7 @@ fn spawn_reprobe_loop<S, Fut>(
 ) -> tokio::task::JoinHandle<()>
 where
     S: FnMut() -> Fut + Send + 'static,
-    Fut: Future<Output = Option<crate::srv::SrvHost>> + Send,
+    Fut: Future<Output = Option<SrvHost>> + Send,
 {
     let target = target.clone();
     tokio::spawn(async move {
@@ -1000,10 +1010,7 @@ enum UriRoute {
     },
     /// A `mongodb://h1,h2,h3/` seed list: probe every host and forward to
     /// the replica-set primary.
-    SeedList {
-        hosts: Vec<crate::srv::SrvHost>,
-        use_tls: bool,
-    },
+    SeedList { hosts: Vec<SrvHost>, use_tls: bool },
     /// A `mongodb+srv://hostname/` URI: resolve SRV, then probe.
     Srv {
         hostname: String,
@@ -1018,18 +1025,18 @@ enum UriRoute {
 /// applying the per-scheme TLS default and the per-host default port.
 ///
 /// The only error is a defensive [`FromUriError::Parse`] for an empty
-/// host list — [`crate::uri::parse`] already rejects that, so it's
+/// host list — [`uri::parse`] already rejects that, so it's
 /// unreachable in practice, but routing without an `unwrap`/`expect`
 /// keeps the no-panic policy intact.
-fn route(parsed: crate::uri::ParsedConnectionUri) -> Result<UriRoute, FromUriError> {
-    let crate::uri::ParsedConnectionUri {
+fn route(parsed: uri::ParsedConnectionUri) -> Result<UriRoute, FromUriError> {
+    let uri::ParsedConnectionUri {
         scheme,
         hosts,
         tls,
         srv_service_name,
     } = parsed;
     match scheme {
-        crate::uri::Scheme::Mongodb => {
+        uri::Scheme::Mongodb => {
             // Spec default for non-SRV URIs: TLS off.
             let use_tls = tls.unwrap_or(false);
             if hosts.len() > 1 {
@@ -1037,7 +1044,7 @@ fn route(parsed: crate::uri::ParsedConnectionUri) -> Result<UriRoute, FromUriErr
                 // the primary (default port 27017 per host).
                 let hosts = hosts
                     .into_iter()
-                    .map(|h| crate::srv::SrvHost {
+                    .map(|h| SrvHost {
                         host: h.host,
                         port: h.port.unwrap_or(27017),
                     })
@@ -1051,13 +1058,11 @@ fn route(parsed: crate::uri::ParsedConnectionUri) -> Result<UriRoute, FromUriErr
                         port: h.port.unwrap_or(27017),
                         use_tls,
                     }),
-                    None => Err(FromUriError::Parse(
-                        crate::uri::ConnectionUriError::MissingHost,
-                    )),
+                    None => Err(FromUriError::Parse(uri::ConnectionUriError::MissingHost)),
                 }
             }
         }
-        crate::uri::Scheme::MongodbSrv => {
+        uri::Scheme::MongodbSrv => {
             // Spec default for SRV URIs: TLS on. The parser guarantees
             // exactly one host for the SRV scheme.
             let use_tls = tls.unwrap_or(true);
@@ -1067,9 +1072,7 @@ fn route(parsed: crate::uri::ParsedConnectionUri) -> Result<UriRoute, FromUriErr
                     use_tls,
                     service_name: srv_service_name,
                 }),
-                None => Err(FromUriError::Parse(
-                    crate::uri::ConnectionUriError::MissingHost,
-                )),
+                None => Err(FromUriError::Parse(uri::ConnectionUriError::MissingHost)),
             }
         }
     }
@@ -1084,33 +1087,33 @@ pub enum FromUriError {
     /// [`ConnectionUriError`](crate::ConnectionUriError) for the full
     /// list.
     #[error("invalid connection string: {0}")]
-    Parse(#[from] crate::uri::ConnectionUriError),
+    Parse(#[from] uri::ConnectionUriError),
     /// The SRV lookup for a `mongodb+srv://` URI failed. See
-    /// [`SrvResolveError`](crate::SrvResolveError) for the full list.
+    /// [`SrvResolveError`] for the full list.
     #[error("SRV resolution failed: {0}")]
-    Srv(#[from] crate::srv::SrvResolveError),
+    Srv(#[from] SrvResolveError),
     /// A multi-host `mongodb://h1,h2,h3/` seed list parsed, but none of
     /// the listed hosts responded as the replica-set primary within the
     /// per-host probe timeout. The proxy is single-upstream — without a
     /// primary it can't safely forward writes (a secondary rejects
     /// anything lacking the `secondaryOk` flag the
     /// [`RewriteHelloLayer`] deliberately hides). Analogous to
-    /// [`SrvResolveError::NoPrimary`](crate::SrvResolveError::NoPrimary)
+    /// [`SrvResolveError::NoPrimary`]
     /// for the non-SRV case.
     ///
     /// `attempts` pairs every probed seed-list host with the reason it was
-    /// rejected (a [`ProbeOutcome`](crate::ProbeOutcome)), so the operator
+    /// rejected (a [`ProbeOutcome`]), so the operator
     /// can tell a refused connection from a healthy secondary from a probe
     /// timeout instead of seeing only a count.
     #[error(
         "no primary found among {} seed-list hosts ({})",
         attempts.len(),
-        crate::srv::summarise_attempts(attempts)
+        summarise_attempts(attempts)
     )]
     NoPrimary {
         /// Every probed seed-list host paired with why it was rejected, in
         /// probe-completion order. `attempts.len()` is the number tried.
-        attempts: Vec<(crate::srv::SrvHost, crate::serve::probe::ProbeOutcome)>,
+        attempts: Vec<(SrvHost, ProbeOutcome)>,
     },
 }
 
@@ -1170,11 +1173,8 @@ impl<L> Proxy<L> {
     /// per-stage timing. No user-supplied sink is wired — use
     /// [`enable_explain_with_sink`](Self::enable_explain_with_sink) to
     /// consume typed [`ExplainEvent`](crate::ExplainEvent)s programmatically.
-    pub fn enable_explain(
-        self,
-    ) -> Proxy<Stack<crate::serve::explain::ExplainLayer<crate::serve::explain::TracingOnly>, L>>
-    {
-        self.layer(crate::serve::explain::ExplainLayer::new())
+    pub fn enable_explain(self) -> Proxy<Stack<ExplainLayer<TracingOnly>, L>> {
+        self.layer(ExplainLayer::new())
     }
 
     /// Convenience for `self.layer(ExplainLayer::with_sink(sink))`.
@@ -1184,14 +1184,11 @@ impl<L> Proxy<L> {
     /// [`ExplainError`](crate::ExplainError) for every failure. The sink
     /// `Clone`s once per accepted connection — keep it O(1) (refcount or
     /// `Copy`).
-    pub fn enable_explain_with_sink<Sk>(
-        self,
-        sink: Sk,
-    ) -> Proxy<Stack<crate::serve::explain::ExplainLayer<Sk>, L>>
+    pub fn enable_explain_with_sink<Sk>(self, sink: Sk) -> Proxy<Stack<ExplainLayer<Sk>, L>>
     where
         Sk: Clone,
     {
-        self.layer(crate::serve::explain::ExplainLayer::with_sink(sink))
+        self.layer(ExplainLayer::with_sink(sink))
     }
 }
 
@@ -1795,8 +1792,8 @@ mod tests {
         })
     }
 
-    fn srv_host(host: &str, port: u16) -> crate::srv::SrvHost {
-        crate::srv::SrvHost {
+    fn srv_host(host: &str, port: u16) -> SrvHost {
+        SrvHost {
             host: host.into(),
             port,
         }
@@ -1857,7 +1854,7 @@ mod tests {
     // primary" wiring is verified without real sockets — the same gap
     // `from_uri` would otherwise only exercise against a live cluster.
 
-    use crate::serve::probe::{DEFAULT_PROBE_TIMEOUT, MockPrimaryProbe};
+    use crate::serve::probe::{MockPrimaryProbe, ProbeError};
 
     #[tokio::test]
     async fn select_target_builds_cell_for_the_probed_primary() {
@@ -1901,7 +1898,7 @@ mod tests {
         assert!(
             attempts
                 .iter()
-                .all(|(_, o)| matches!(o, crate::serve::probe::ProbeOutcome::NotPrimary)),
+                .all(|(_, o)| matches!(o, ProbeOutcome::NotPrimary)),
             "both secondaries must be reported as NotPrimary, got {attempts:?}",
         );
     }
@@ -1940,12 +1937,8 @@ mod tests {
         delay: Duration,
     }
 
-    impl crate::serve::probe::PrimaryProbe for ColdPrimaryProbe {
-        async fn is_primary(
-            &self,
-            _host: String,
-            _port: u16,
-        ) -> Result<bool, crate::serve::probe::ProbeError> {
+    impl PrimaryProbe for ColdPrimaryProbe {
+        async fn is_primary(&self, _host: String, _port: u16) -> Result<bool, ProbeError> {
             tokio::time::sleep(self.delay).await;
             Ok(true)
         }
@@ -1961,10 +1954,7 @@ mod tests {
             .await
             .expect_err("the 5s default must time out before the cold primary answers");
         assert!(
-            matches!(
-                attempts.as_slice(),
-                [(_, crate::serve::probe::ProbeOutcome::TimedOut)]
-            ),
+            matches!(attempts.as_slice(), [(_, ProbeOutcome::TimedOut)]),
             "the cold primary must be reported as a timeout, got {attempts:?}",
         );
     }
@@ -2046,7 +2036,7 @@ mod tests {
     // per-scheme TLS / per-host port defaults) without sockets or DNS.
 
     fn route_uri(uri: &str) -> UriRoute {
-        route(crate::uri::parse(uri).expect("uri parses")).expect("uri routes")
+        route(uri::parse(uri).expect("uri parses")).expect("uri routes")
     }
 
     #[test]
@@ -2172,7 +2162,7 @@ mod tests {
                 assert!(
                     attempts
                         .iter()
-                        .all(|(_, o)| matches!(o, crate::serve::probe::ProbeOutcome::Failed(_))),
+                        .all(|(_, o)| matches!(o, ProbeOutcome::Failed(_))),
                     "a refused TCP connect must be carried as Failed, got {attempts:?}",
                 );
                 // The refused-connect io::Error must remain reachable

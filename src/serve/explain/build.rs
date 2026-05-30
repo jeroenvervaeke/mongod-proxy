@@ -130,6 +130,7 @@ mod tests {
     use crate::ids::RequestId;
     use crate::message::Message;
     use crate::operation::op_msg::OpMsgSection;
+    use crate::serve::explain::model::Database;
     use bson::doc;
 
     fn classified<'a>(
@@ -140,7 +141,7 @@ mod tests {
     ) -> ClassifiedRequest<'a> {
         ClassifiedRequest {
             command: cmd,
-            database: crate::serve::explain::model::Database::try_new(db.to_owned()).unwrap(),
+            database: Database::try_new(db.to_owned()).unwrap(),
             body,
             doc_sequences: seqs,
         }

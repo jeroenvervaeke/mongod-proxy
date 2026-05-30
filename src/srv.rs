@@ -31,6 +31,8 @@
 
 use hickory_resolver::{TokioResolver, proto::rr::RData};
 
+use crate::serve::probe::ProbeOutcome;
+
 /// Default SRV service name per the [Initial DNS Seedlist Discovery spec]:
 /// the query is `_mongodb._tcp.<hostname>` unless the `srvServiceName` URI
 /// option overrides the `mongodb` prefix.
@@ -168,7 +170,7 @@ pub enum SrvResolveError {
     /// hides).
     ///
     /// `attempts` pairs every probed host with the reason it was rejected
-    /// (a [`ProbeOutcome`](crate::ProbeOutcome)) so an operator can tell apart "every host
+    /// (a [`ProbeOutcome`]) so an operator can tell apart "every host
     /// refused the TCP connect" (network policy), "the TLS handshake
     /// failed everywhere" (cert / SNI), and "every host answered but none
     /// is primary" (an election in progress). The
@@ -187,7 +189,7 @@ pub enum SrvResolveError {
         /// Every probed host paired with why it was rejected, in
         /// probe-completion order. `attempts.len()` is the number of
         /// hosts tried.
-        attempts: Vec<(SrvHost, crate::serve::probe::ProbeOutcome)>,
+        attempts: Vec<(SrvHost, ProbeOutcome)>,
     },
 }
 
@@ -195,11 +197,9 @@ pub enum SrvResolveError {
 /// summary for [`SrvResolveError::NoPrimary`]'s `Display`, e.g.
 /// `a:27017 timed out; b:27017 responded as a non-primary member`. The
 /// structured `attempts` field stays available for callers that want to
-/// inspect each [`ProbeOutcome`](crate::serve::probe::ProbeOutcome)
+/// inspect each [`ProbeOutcome`](ProbeOutcome)
 /// programmatically.
-pub(crate) fn summarise_attempts(
-    attempts: &[(SrvHost, crate::serve::probe::ProbeOutcome)],
-) -> String {
+pub(crate) fn summarise_attempts(attempts: &[(SrvHost, ProbeOutcome)]) -> String {
     if attempts.is_empty() {
         return "no hosts probed".to_owned();
     }

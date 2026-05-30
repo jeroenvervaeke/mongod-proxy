@@ -50,6 +50,7 @@ use crate::operation::{
     op_msg::{OpMsgSection, OperationMessage, OperationMessageFlags},
 };
 use crate::serve::service::{ProxyClient, ProxyClientForwardError, ProxyClientRequestError};
+use crate::srv::SrvHost;
 
 /// Default per-host budget for the dial + `hello` round-trip during
 /// primary selection. Hosts that don't reply in time are skipped rather
@@ -130,10 +131,10 @@ pub enum ProbeOutcome {
 pub(crate) enum Selection {
     /// A candidate reported `isWritablePrimary == true`; it becomes the
     /// upstream.
-    Primary(crate::srv::SrvHost),
+    Primary(SrvHost),
     /// No candidate did. Carries each probed host paired with the reason
     /// it was rejected, in probe-completion order.
-    NoPrimary(Vec<(crate::srv::SrvHost, ProbeOutcome)>),
+    NoPrimary(Vec<(SrvHost, ProbeOutcome)>),
 }
 
 impl Selection {
@@ -143,7 +144,7 @@ impl Selection {
     /// and logs its own "kept current target" message on `None` — the
     /// per-host rejection reasons matter only for the *startup* error the
     /// caller surfaces, not for a steady-state re-probe tick.
-    pub(crate) fn into_primary(self) -> Option<crate::srv::SrvHost> {
+    pub(crate) fn into_primary(self) -> Option<SrvHost> {
         match self {
             Selection::Primary(host) => Some(host),
             Selection::NoPrimary(_) => None,
@@ -250,11 +251,7 @@ impl PrimaryProbe for HelloProbe {
 /// failure ([`ProbeOutcome::Failed`]), or a timeout
 /// ([`ProbeOutcome::TimedOut`]) — so the caller can surface *why* startup
 /// found no primary rather than just *how many* hosts it tried.
-pub(crate) async fn select_primary<P>(
-    hosts: &[crate::srv::SrvHost],
-    probe: &P,
-    timeout: Duration,
-) -> Selection
+pub(crate) async fn select_primary<P>(hosts: &[SrvHost], probe: &P, timeout: Duration) -> Selection
 where
     P: PrimaryProbe + ?Sized,
 {
@@ -365,7 +362,7 @@ fn extract_is_writable_primary(msg: &Message) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use crate::srv::SrvHost;
+    use SrvHost;
 
     use super::*;
 

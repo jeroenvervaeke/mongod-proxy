@@ -28,6 +28,8 @@ use tower_service::Service;
 
 use crate::ids::{ExplainRequestId, RequestId};
 use crate::message::Message;
+use crate::operation::Operation;
+use crate::operation::op_msg::OpMsgSection;
 
 use super::build::{BuildExplainOutcome, build_explain};
 use super::classify::classify;
@@ -298,13 +300,13 @@ fn extract_body(mut replies: Replies) -> Result<bson::Document, ExplainParseErro
     let Some(first) = replies.pop_front() else {
         return Err(ExplainParseError::MissingBody);
     };
-    let crate::operation::Operation::Message(op_msg) = first.operation else {
+    let Operation::Message(op_msg) = first.operation else {
         return Err(ExplainParseError::MissingBody);
     };
     op_msg
         .sections
         .into_iter()
-        .find_map(crate::operation::op_msg::OpMsgSection::into_body)
+        .find_map(OpMsgSection::into_body)
         .ok_or(ExplainParseError::MissingBody)
 }
 

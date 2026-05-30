@@ -161,7 +161,7 @@ impl OpMsgSection {
 /// assert!(parsed.flags.contains(OperationMessageFlags::MORE_TO_COME));
 /// assert_eq!(parsed.command_name(), Some("find"));
 /// ```
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct OperationMessage {
     /// `flagBits` field controlling checksum, streaming, etc.
     pub flags: OperationMessageFlags,
@@ -171,21 +171,6 @@ pub struct OperationMessage {
     /// the wire. The proxy preserves it across round-trips; it does not
     /// currently validate the CRC against the rest of the message.
     pub checksum: Option<u32>,
-}
-
-impl std::fmt::Debug for OperationMessage {
-    /// Renders flags, section/command metadata, and the checksum. Every
-    /// embedded BSON document is redacted via [`OpMsgSection`]'s own
-    /// credential-aware [`Debug`] impl.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OperationMessage")
-            .field("flags", &self.flags)
-            .field("section_count", &self.sections.len())
-            .field("command_name", &self.command_name())
-            .field("sections", &self.sections)
-            .field("checksum", &self.checksum)
-            .finish()
-    }
 }
 
 /// Failure modes for [`OperationMessage::from_bytes`].

@@ -36,7 +36,7 @@ pub struct OperationReply {
 
 impl std::fmt::Debug for OperationReply {
     /// Renders cursor metadata and flags, routing every result document
-    /// through [`RedactedDoc`](crate::redact::RedactedDoc) so credential-bearing
+    /// through [`RedactedDoc`] so credential-bearing
     /// handshake replies never reach logs verbatim.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OperationReply")

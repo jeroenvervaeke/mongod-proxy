@@ -83,7 +83,7 @@ pub enum OpMsgSection {
 
 impl std::fmt::Debug for OpMsgSection {
     /// Renders structural metadata, routing every embedded BSON document
-    /// through [`RedactedDoc`](crate::redact::RedactedDoc) so credential-bearing
+    /// through [`RedactedDoc`] so credential-bearing
     /// payloads (e.g. `saslStart`) never reach logs.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

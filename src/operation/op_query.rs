@@ -49,7 +49,7 @@ pub struct OperationQuery {
 impl std::fmt::Debug for OperationQuery {
     /// Renders the namespace, pagination hints, and flags, routing the query
     /// and projection documents through
-    /// [`RedactedDoc`](crate::redact::RedactedDoc) so credential-bearing
+    /// [`RedactedDoc`] so credential-bearing
     /// handshake documents never reach logs verbatim.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OperationQuery")

@@ -39,3 +39,11 @@ updates:
           - major
           - minor
           - patch
+    ignore:
+      # The `msrv` CI job pins dtolnay/rust-toolchain to the crate's declared
+      # MSRV (rust-version in Cargo.toml), NOT to "the latest toolchain".
+      # Dependabot kept trying to bump it (e.g. @1.88 -> @1.100, a version
+      # that doesn't even exist yet), which breaks CI and defeats the job's
+      # purpose. The pin must only change when the MSRV itself changes, so
+      # exclude it from automated updates.
+      - dependency-name: dtolnay/rust-toolchain

@@ -22,6 +22,13 @@ use tokio::{
     net::TcpStream,
     sync::{Mutex, OwnedMutexGuard},
 };
+#[cfg(feature = "dangerous-insecure-tls")]
+use tokio_rustls::rustls::{
+    DigitallySignedStruct, SignatureScheme,
+    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    crypto::aws_lc_rs,
+    pki_types::{CertificateDer, ServerName as RustlsServerName, UnixTime},
+};
 use tokio_rustls::{
     TlsConnector,
     rustls::{ClientConfig, RootCertStore},
@@ -54,19 +61,182 @@ fn install_default_crypto_provider() {
     });
 }
 
-/// Builds the standard rustls client config used by every TLS upstream:
-/// `webpki-roots` trust anchors, no client cert, SNI on. Shared between
-/// [`Proxy::new`] and the SRV primary-selection probes in
-/// [`Proxy::from_srv`].
-pub(crate) fn default_tls_connector() -> Arc<TlsConnector> {
+/// How the proxy should establish (or skip) TLS to its upstream `mongod`.
+///
+/// Passed to [`Proxy::with_tls`] to pick a trust policy for the upstream
+/// socket. The legacy `use_tls: bool` of [`Proxy::new`] maps onto the two
+/// most common variants: `false` → [`TlsConfig::Disabled`], `true` →
+/// [`TlsConfig::System`].
+///
+/// # Examples
+///
+/// ```
+/// use mongod_proxy::{Proxy, TlsConfig};
+///
+/// // Forward to a TLS-terminating upstream using the OS-bundled
+/// // `webpki-roots` trust anchors (the same config `Proxy::new(.., true)`
+/// // builds).
+/// let proxy = Proxy::with_tls("mongo.example.com", 27017, TlsConfig::System);
+/// # let _ = proxy;
+/// ```
+#[non_exhaustive]
+pub enum TlsConfig {
+    /// Plain TCP — no TLS. Equivalent to `Proxy::new(.., false)`.
+    Disabled,
+    /// Standard `webpki-roots` trust anchors, no client cert, SNI on.
+    /// The default TLS behaviour and what `Proxy::new(.., true)` selects.
+    System,
+    /// Validate the upstream certificate against a caller-supplied
+    /// [`RootCertStore`] instead of the bundled `webpki-roots` anchors.
+    ///
+    /// Use this to forward to a deployment whose certificate chains to an
+    /// internal/private CA: load the CA into the store and hand it in.
+    /// Client auth stays off and SNI on, matching [`TlsConfig::System`].
+    WithRoots(RootCertStore),
+    /// **Dangerous.** Disable upstream certificate verification entirely —
+    /// any certificate (self-signed, expired, wrong host) is accepted.
+    ///
+    /// This defeats the authentication TLS provides and exposes the
+    /// connection to man-in-the-middle attacks; it exists only to forward
+    /// to throwaway self-signed test deployments. Constructing a proxy with
+    /// this variant emits a prominent [`tracing::warn!`].
+    ///
+    /// Gated behind the `dangerous-insecure-tls` cargo feature so it can't
+    /// be reached by accident — the variant does not even exist unless that
+    /// feature is enabled.
+    #[cfg(feature = "dangerous-insecure-tls")]
+    Insecure,
+}
+
+impl std::fmt::Debug for TlsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `RootCertStore` isn't `Debug`; render variants by name so a
+        // `Proxy`/`TlsConfig` can sit in `#[derive(Debug)]` contexts.
+        match self {
+            TlsConfig::Disabled => f.write_str("Disabled"),
+            TlsConfig::System => f.write_str("System"),
+            TlsConfig::WithRoots(_) => f.write_str("WithRoots(..)"),
+            #[cfg(feature = "dangerous-insecure-tls")]
+            TlsConfig::Insecure => f.write_str("Insecure"),
+        }
+    }
+}
+
+/// Builds the upstream rustls [`TlsConnector`] for a [`TlsConfig`], or
+/// `None` for [`TlsConfig::Disabled`] (plain TCP).
+///
+/// [`TlsConfig::System`] keeps the historical behaviour: `webpki-roots`
+/// trust anchors, no client cert, SNI on. [`TlsConfig::WithRoots`] swaps in
+/// the caller-supplied store. [`TlsConfig::Insecure`] installs a no-op
+/// certificate verifier and logs a loud warning. Every config runs
+/// [`install_default_crypto_provider`] first so rustls always has a usable
+/// provider.
+pub(crate) fn build_tls_connector(tls: TlsConfig) -> Option<Arc<TlsConnector>> {
+    let config = match tls {
+        TlsConfig::Disabled => return None,
+        TlsConfig::System => {
+            let mut root_cert_store = RootCertStore::empty();
+            root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            roots_config(root_cert_store)
+        }
+        TlsConfig::WithRoots(root_cert_store) => roots_config(root_cert_store),
+        #[cfg(feature = "dangerous-insecure-tls")]
+        TlsConfig::Insecure => insecure_config(),
+    };
+    Some(Arc::new(TlsConnector::from(Arc::new(config))))
+}
+
+/// Builds a verifying [`ClientConfig`] over `root_cert_store`: no client
+/// auth, SNI on. Shared by [`TlsConfig::System`] and
+/// [`TlsConfig::WithRoots`].
+fn roots_config(root_cert_store: RootCertStore) -> ClientConfig {
     install_default_crypto_provider();
-    let mut root_cert_store = RootCertStore::empty();
-    root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let mut config = ClientConfig::builder()
         .with_root_certificates(root_cert_store)
         .with_no_client_auth();
     config.enable_sni = true;
-    Arc::new(TlsConnector::from(Arc::new(config)))
+    config
+}
+
+/// Builds the standard verifying [`TlsConnector`] used by the SRV
+/// primary-selection probes and any caller that just wants the historical
+/// `webpki-roots` behaviour. Equivalent to
+/// `build_tls_connector(TlsConfig::System)` but infallible (always `Some`).
+pub(crate) fn default_tls_connector() -> Arc<TlsConnector> {
+    let mut root_cert_store = RootCertStore::empty();
+    root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    Arc::new(TlsConnector::from(Arc::new(roots_config(root_cert_store))))
+}
+
+/// Builds a [`ClientConfig`] that accepts *any* server certificate.
+///
+/// Logs a prominent warning before returning — see
+/// [`TlsConfig::Insecure`]. Wires the no-op [`InsecureServerVerifier`] via
+/// rustls's `dangerous()` builder; client auth stays off and SNI on so the
+/// only difference from [`roots_config`] is the dropped verification.
+#[cfg(feature = "dangerous-insecure-tls")]
+fn insecure_config() -> ClientConfig {
+    install_default_crypto_provider();
+    warn!(
+        "TLS certificate verification is DISABLED (TlsConfig::Insecure): the upstream \
+         connection is NOT authenticated and is vulnerable to man-in-the-middle attacks. \
+         Use this only against throwaway self-signed test deployments."
+    );
+    let mut config = ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(InsecureServerVerifier))
+        .with_no_client_auth();
+    config.enable_sni = true;
+    config
+}
+
+/// A [`ServerCertVerifier`] that accepts every certificate and signature
+/// without checking anything. Backs [`TlsConfig::Insecure`].
+///
+/// Signature *schemes* are still reported from the active crypto provider
+/// so the handshake can negotiate, but the signatures themselves are
+/// rubber-stamped as valid. Never construct this outside the explicit,
+/// feature-gated `Insecure` opt-in.
+#[cfg(feature = "dangerous-insecure-tls")]
+#[derive(Debug)]
+struct InsecureServerVerifier;
+
+#[cfg(feature = "dangerous-insecure-tls")]
+impl ServerCertVerifier for InsecureServerVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &RustlsServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, tokio_rustls::rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, tokio_rustls::rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, tokio_rustls::rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        aws_lc_rs::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
 }
 
 /// The upstream `host:port` the proxy currently forwards to.
@@ -164,7 +334,44 @@ impl Proxy<Identity> {
     /// only when you specifically need the upstream's topology visible to
     /// drivers.
     pub fn new(destination_name: impl Into<String>, destination_port: u16, use_tls: bool) -> Self {
-        let tls_connector = use_tls.then(default_tls_connector);
+        let tls = if use_tls {
+            TlsConfig::System
+        } else {
+            TlsConfig::Disabled
+        };
+        Self::with_tls(destination_name, destination_port, tls)
+    }
+
+    /// Creates a new proxy forwarding to `destination_name:destination_port`
+    /// with explicit control over the upstream TLS trust policy via
+    /// [`TlsConfig`].
+    ///
+    /// This is the general form of [`Proxy::new`]: `new(.., false)` is
+    /// [`TlsConfig::Disabled`] and `new(.., true)` is [`TlsConfig::System`].
+    /// Reach for `with_tls` to forward to an internal-CA deployment
+    /// ([`TlsConfig::WithRoots`]) or — when the `dangerous-insecure-tls`
+    /// feature is enabled — a throwaway self-signed test deployment
+    /// ([`TlsConfig::Insecure`]).
+    ///
+    /// The `hello` / `isMaster` rewrite is on by default exactly as in
+    /// [`Proxy::new`]; see that method for the rationale and
+    /// [`disable_rewrite_hello`](Proxy::disable_rewrite_hello) to opt out.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mongod_proxy::{Proxy, TlsConfig};
+    ///
+    /// // Plain TCP, equivalent to `Proxy::new(.., false)`.
+    /// let proxy = Proxy::with_tls("127.0.0.1", 27017, TlsConfig::Disabled);
+    /// # let _ = proxy;
+    /// ```
+    pub fn with_tls(
+        destination_name: impl Into<String>,
+        destination_port: u16,
+        tls: TlsConfig,
+    ) -> Self {
+        let tls_connector = build_tls_connector(tls);
         let target = Arc::new(RwLock::new(Target {
             host: destination_name.into(),
             port: destination_port,
@@ -1293,6 +1500,80 @@ mod tests {
             .expect("stream yields the EOF before terminating");
         assert!(matches!(eof, Err(ProxyClientRequestError::EndOfStream)));
         assert!(stream.next().await.is_none());
+    }
+
+    // ---------- TLS config -> connector wiring ----------
+
+    #[test]
+    fn with_tls_disabled_yields_no_connector() {
+        let proxy = Proxy::with_tls("mongo.example.com", 27017, TlsConfig::Disabled);
+        assert!(
+            proxy.tls_connector.is_none(),
+            "TlsConfig::Disabled must produce a plain-TCP proxy with no connector"
+        );
+    }
+
+    #[test]
+    fn with_tls_system_builds_a_connector() {
+        let proxy = Proxy::with_tls("mongo.example.com", 27017, TlsConfig::System);
+        assert!(
+            proxy.tls_connector.is_some(),
+            "TlsConfig::System must build a TLS connector"
+        );
+    }
+
+    #[test]
+    fn with_tls_with_roots_builds_a_connector() {
+        // An empty custom store is still a valid (if unusable) verifying
+        // config — what we assert here is that the connector is built, not
+        // that any particular chain verifies.
+        let proxy = Proxy::with_tls(
+            "mongo.example.com",
+            27017,
+            TlsConfig::WithRoots(RootCertStore::empty()),
+        );
+        assert!(
+            proxy.tls_connector.is_some(),
+            "TlsConfig::WithRoots must build a TLS connector"
+        );
+    }
+
+    #[test]
+    fn new_with_use_tls_true_matches_system() {
+        let proxy = Proxy::new("mongo.example.com", 27017, true);
+        assert!(
+            proxy.tls_connector.is_some(),
+            "Proxy::new(.., true) must still build a TLS connector"
+        );
+    }
+
+    #[test]
+    fn new_with_use_tls_false_matches_disabled() {
+        let proxy = Proxy::new("mongo.example.com", 27017, false);
+        assert!(
+            proxy.tls_connector.is_none(),
+            "Proxy::new(.., false) must still be plain TCP"
+        );
+    }
+
+    #[test]
+    fn build_tls_connector_disabled_is_none() {
+        assert!(build_tls_connector(TlsConfig::Disabled).is_none());
+    }
+
+    #[test]
+    fn build_tls_connector_system_is_some() {
+        assert!(build_tls_connector(TlsConfig::System).is_some());
+    }
+
+    #[cfg(feature = "dangerous-insecure-tls")]
+    #[test]
+    fn with_tls_insecure_builds_a_connector() {
+        let proxy = Proxy::with_tls("mongo.example.com", 27017, TlsConfig::Insecure);
+        assert!(
+            proxy.tls_connector.is_some(),
+            "TlsConfig::Insecure must build a TLS connector"
+        );
     }
 
     // ---------- failover: target cell + apply_primary ----------

@@ -48,6 +48,13 @@ default = []
 # Off by default; opt-in for development/testing scenarios where
 # backpressure is undesirable and the OOM risk is acceptable.
 unbounded-sink = []
+# Off by default; opt-in to unlock `TlsConfig::Insecure`, which disables
+# upstream TLS certificate verification. Gated behind its own feature so a
+# downstream typo can't silently turn off authentication — it must be
+# enabled deliberately, and even then `TlsConfig::Insecure` logs a loud
+# warning at construction. Use only against throwaway self-signed test
+# deployments.
+dangerous-insecure-tls = []
 
 [workspace]
 members = [".", "logger"]

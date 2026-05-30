@@ -32,8 +32,10 @@
 //!   timeouts.
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
+use bson::Document;
 use bson::doc;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
@@ -256,6 +258,41 @@ where
     Selection::NoPrimary(rejected)
 }
 
+/// The `client` sub-document advertised on the primary-probe `hello`.
+///
+/// Real MongoDB drivers identify themselves on the handshake `hello` so
+/// the server can log who's connecting; without it the proxy's probes
+/// show up anonymously in Atlas monitoring and server ops logs. We send
+/// the same shape a driver does — driver name/version, OS type/arch, and
+/// platform — so those probes are attributable to `mongod-proxy`.
+///
+/// The doc is constant for the life of the process (the version, OS, and
+/// arch are all compile-time constants), so it's built once and reused.
+fn client_metadata() -> &'static Document {
+    static CLIENT_METADATA: OnceLock<Document> = OnceLock::new();
+    CLIENT_METADATA.get_or_init(|| {
+        doc! {
+            "driver": {
+                "name": "mongod-proxy",
+                "version": env!("CARGO_PKG_VERSION"),
+            },
+            "os": {
+                "type": std::env::consts::OS,
+                "architecture": std::env::consts::ARCH,
+            },
+            "platform": "Rust",
+        }
+    })
+}
+
+/// Builds the `hello` probe sent to each SRV candidate during primary
+/// selection.
+///
+/// Unlike forwarded client `hello`s — which carry the originating
+/// driver's own `client` metadata — this probe is issued by the proxy
+/// itself, so it attaches [`client_metadata`] to identify `mongod-proxy`
+/// as the client. This is observability-only: servers don't reject a
+/// probe that omits it.
 fn build_hello_request() -> Message {
     Message {
         request_id: RequestId::new(1),
@@ -265,6 +302,7 @@ fn build_hello_request() -> Message {
             sections: vec![OpMsgSection::Body(doc! {
                 "hello": 1,
                 "$db": "admin",
+                "client": client_metadata().clone(),
             })],
             checksum: None,
         }),
@@ -366,6 +404,68 @@ mod tests {
             }),
         };
         assert_eq!(extract_is_writable_primary(&msg), None);
+    }
+
+    // ---------- build_hello_request client metadata (#24) ----------
+
+    /// Pull the body section out of the probe request so the assertions
+    /// can read the `hello`'s fields directly.
+    fn hello_body(msg: &Message) -> &bson::Document {
+        let Operation::Message(op_msg) = &msg.operation else {
+            panic!("probe request must be an OP_MSG");
+        };
+        op_msg
+            .sections
+            .iter()
+            .find_map(|section| match section {
+                OpMsgSection::Body(doc) => Some(doc),
+                _ => None,
+            })
+            .expect("probe request must have a body section")
+    }
+
+    #[test]
+    fn build_hello_request_includes_client_metadata() {
+        let msg = build_hello_request();
+        let body = hello_body(&msg);
+
+        // The bare probe fields stay intact alongside the new client doc.
+        assert_eq!(body.get_i32("hello"), Ok(1));
+        assert_eq!(body.get_str("$db"), Ok("admin"));
+
+        let client = body
+            .get_document("client")
+            .expect("probe hello must carry a client sub-document");
+
+        let driver = client
+            .get_document("driver")
+            .expect("client must carry a driver sub-document");
+        assert_eq!(driver.get_str("name"), Ok("mongod-proxy"));
+        assert_eq!(
+            driver.get_str("version"),
+            Ok(env!("CARGO_PKG_VERSION")),
+            "driver version must be the crate version",
+        );
+        assert!(
+            !driver.get_str("version").unwrap().is_empty(),
+            "driver version must be non-empty",
+        );
+
+        let os = client
+            .get_document("os")
+            .expect("client must carry an os sub-document");
+        assert_eq!(os.get_str("type"), Ok(std::env::consts::OS));
+        assert!(
+            !os.get_str("type").unwrap().is_empty(),
+            "os.type must be present and non-empty",
+        );
+        assert_eq!(os.get_str("architecture"), Ok(std::env::consts::ARCH));
+        assert!(
+            !os.get_str("architecture").unwrap().is_empty(),
+            "os.architecture must be present and non-empty",
+        );
+
+        assert_eq!(client.get_str("platform"), Ok("Rust"));
     }
 
     // ---------- select_primary ----------
